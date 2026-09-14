@@ -1,0 +1,64 @@
+syntax = "proto3";
+package queue.v1;
+
+service QueueService {
+  rpc AddJob (AddJobRequest) returns (AddJobResponse);
+  rpc GetNextJob (GetNextJobRequest) returns (GetNextJobResponse);
+  rpc CompleteJob (CompleteJobRequest) returns (CompleteJobResponse);
+  rpc FailJob (FailJobRequest) returns (FailJobResponse);
+}
+
+message JobMetadata {
+  string parent_id = 1;
+  string trace_id = 2;
+  uint32 execution_depth = 3;
+}
+
+message AddJobRequest {
+  string name = 1;
+  bytes payload = 2;
+  int32 priority = 3;
+  JobMetadata metadata = 4;
+  uint32 max_attempts = 5;
+  int64 delay_ms = 6;
+  string rate_limit_facet = 7;
+}
+
+message AddJobResponse {
+  string id = 1;
+  string state = 2;
+}
+
+message GetNextJobRequest {
+  string worker_id = 1;
+  repeated string queue_names = 2;
+}
+
+message GetNextJobResponse {
+  bool found = 1;
+  string id = 2;
+  string name = 3;
+  bytes payload = 4;
+  JobMetadata metadata = 5;
+  uint32 attempts = 6;
+}
+
+message CompleteJobRequest {
+  string id = 1;
+  string worker_id = 2;
+}
+
+message CompleteJobResponse {
+  bool success = 1;
+}
+
+message FailJobRequest {
+  string id = 1;
+  string worker_id = 2;
+  string error_message = 3;
+}
+
+message FailJobResponse {
+  bool success = 1;
+  bool moved_to_failed_state = 2;
+}

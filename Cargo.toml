@@ -1,0 +1,17 @@
+[package]
+name = "rusty-queue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+prost-types = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+thiserror = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[build-dependencies]
+tonic-build = "0.11"
