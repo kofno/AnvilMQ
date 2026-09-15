@@ -1,0 +1,675 @@
+use super::*;
+
+async fn heartbeat(
+    service: &MyQueueService,
+    id: &str,
+    worker: &str,
+    attempt: u32,
+) -> Result<Response<queue::v1::HeartbeatResponse>, Status> {
+    service
+        .heartbeat(Request::new(queue::v1::HeartbeatRequest {
+            id: id.into(),
+            worker_id: worker.into(),
+            attempt,
+        }))
+        .await
+}
+
+#[tokio::test]
+async fn heartbeat_renews_only_valid_claims() {
+    let (service, id) = setup(3).await;
+    let job = claim(&service).await;
+    assert!(job.lease_expires_at_ms > 0);
+    assert_eq!(
+        heartbeat(&service, &id, "worker", 0)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        heartbeat(&service, &id, "other", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        heartbeat(&service, &id, "worker", 2)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    sql(
+        &service,
+        "UPDATE jobs SET lease_expires_at_ms = lease_expires_at_ms - 10000",
+    )
+    .await;
+    let renewed = heartbeat(&service, &id, "worker", 1)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(renewed.lease_expires_at_ms >= job.lease_expires_at_ms);
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    complete(&service, &id, "worker", 1).await.unwrap();
+    assert_eq!(
+        heartbeat(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn expiration_requeues_and_fences_previous_attempt() {
+    let (service, id) = setup(2).await;
+    claim(&service).await;
+    sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0").await;
+    assert_eq!(
+        heartbeat(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        complete(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        fail(&service, &id, "worker", 1).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let (recovered, late) = tokio::join!(
+        leases::recover_expired(service.db_manager.clone()),
+        complete(&service, &id, "worker", 1)
+    );
+    assert_eq!(recovered.unwrap(), 1);
+    assert_eq!(late.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.1, stored.2),
+        ("Waiting", None, 1)
+    );
+    assert_eq!(claim(&service).await.attempts, 2);
+    assert_eq!(
+        heartbeat(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        complete(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0").await;
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.2, stored.3.as_deref()),
+        ("Failed", 2, Some("Worker lease expired"))
+    );
+}
+
+#[tokio::test]
+async fn recovery_and_heartbeat_serialize_without_losing_renewal() {
+    let (service, id) = setup(2).await;
+    claim(&service).await;
+    let (renewed, recovered) = tokio::join!(
+        heartbeat(&service, &id, "worker", 1),
+        leases::recover_expired(service.db_manager.clone())
+    );
+    renewed.unwrap();
+    assert_eq!(recovered.unwrap(), 0);
+    assert_eq!(snapshot(&service).await.0, "Active");
+}
+
+#[tokio::test]
+async fn recovery_transfer_rolls_back_on_failure() {
+    let (service, _) = setup(1).await;
+    claim(&service).await;
+    sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0; CREATE TRIGGER reject_recovery BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Internal
+    );
+    assert_eq!(snapshot(&service).await.0, "Active");
+    sql(&service, "DROP TRIGGER reject_recovery").await;
+    // A leaked history insert would make this retry fail its unique constraint.
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(snapshot(&service).await.0, "Failed");
+}
+
+#[tokio::test]
+async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
+    let path = format!("target/lease-test-{}.db", uuid::Uuid::new_v4());
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    let id = service
+        .add_job(Request::new(AddJobRequest {
+            name: "email".into(),
+            max_attempts: 2,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    let job = claim(&service).await;
+    drop(service);
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        heartbeat(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .lease_expires_at_ms
+            >= job.lease_expires_at_ms
+    );
+    // Simulate an old database whose Active claim has no persisted lease.
+    sql(&service, "UPDATE jobs SET lease_expires_at_ms = NULL").await;
+    drop(service);
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    assert_eq!(
+        leases::recover_expired(service.db_manager.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(claim(&service).await.attempts, 2);
+    complete(&service, &id, "worker", 2).await.unwrap();
+    drop(service);
+    tokio::fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_completion_and_failure_commit_only_one_outcome() {
+    let (service, id) = setup(1).await;
+    claim(&service).await;
+    let (completed, failed) = tokio::join!(
+        complete(&service, &id, "worker", 1),
+        fail(&service, &id, "worker", 1),
+    );
+    assert_ne!(completed.is_ok(), failed.is_ok());
+    if let Err(error) = completed {
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    if let Err(error) = failed {
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    let conn = service.db_manager.get_shared_connection();
+    let counts = tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM job_history)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 1));
+}
+
+async fn setup(max_attempts: u32) -> (MyQueueService, String) {
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
+        max_execution_depth: 10,
+    };
+    let id = service
+        .add_job(Request::new(AddJobRequest {
+            name: "email".into(),
+            payload: vec![1, 2],
+            max_attempts,
+            rate_limit_facet: "tenant:a".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    (service, id)
+}
+
+async fn claim(service: &MyQueueService) -> GetNextJobResponse {
+    service
+        .get_next_job(Request::new(GetNextJobRequest {
+            worker_id: "worker".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+async fn complete(
+    service: &MyQueueService,
+    id: &str,
+    worker: &str,
+    attempt: u32,
+) -> Result<Response<CompleteJobResponse>, Status> {
+    service
+        .complete_job(Request::new(CompleteJobRequest {
+            id: id.into(),
+            worker_id: worker.into(),
+            attempt,
+        }))
+        .await
+}
+
+async fn fail(
+    service: &MyQueueService,
+    id: &str,
+    worker: &str,
+    attempt: u32,
+) -> Result<Response<FailJobResponse>, Status> {
+    service
+        .fail_job(Request::new(FailJobRequest {
+            id: id.into(),
+            worker_id: worker.into(),
+            attempt,
+            error_message: format!("failure {attempt}"),
+        }))
+        .await
+}
+
+async fn sql(service: &MyQueueService, sql: &'static str) {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || conn.blocking_lock().execute_batch(sql).unwrap())
+        .await
+        .unwrap();
+}
+
+// Read both tables so tests assert durable state rather than only RPC responses.
+async fn snapshot(
+    service: &MyQueueService,
+) -> (String, Option<String>, u32, Option<String>, String, i64) {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock().query_row(
+            "SELECT state, worker_id, attempts, last_error, rate_limit_facet, updated_at FROM jobs
+             UNION ALL SELECT state, worker_id, attempts, last_error, rate_limit_facet, finished_at FROM job_history",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap()
+    }).await.unwrap()
+}
+
+#[tokio::test]
+async fn completion_archives_and_rejects_duplicate_or_conflicting_ack() {
+    let (service, id) = setup(3).await;
+    claim(&service).await;
+    assert!(
+        complete(&service, &id, "worker", 0)
+            .await
+            .unwrap()
+            .into_inner()
+            .success
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (
+            stored.0.as_str(),
+            stored.1.as_deref(),
+            stored.2,
+            stored.4.as_str()
+        ),
+        ("Completed", Some("worker"), 1, "tenant:a")
+    );
+    assert!(stored.5 > 0);
+    assert_eq!(
+        complete(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        fail(&service, &id, "worker", 1).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(!claim(&service).await.found);
+}
+
+#[tokio::test]
+async fn retries_exhaust_limit_and_preserve_error() {
+    let (service, id) = setup(2).await;
+    assert_eq!(claim(&service).await.attempts, 1);
+    assert!(
+        !fail(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.1, stored.2, stored.3.as_deref()),
+        ("Waiting", None, 1, Some("failure 1"))
+    );
+    assert_eq!(
+        fail(&service, &id, "worker", 1).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(claim(&service).await.attempts, 2);
+    for stale in [0, 1] {
+        assert_eq!(
+            complete(&service, &id, "worker", stale)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            fail(&service, &id, "worker", stale)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    assert!(
+        fail(&service, &id, "worker", 2)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.2, stored.3.as_deref()),
+        ("Failed", 2, Some("failure 2"))
+    );
+    assert!(!claim(&service).await.found);
+    assert_eq!(
+        fail(&service, &id, "worker", 2).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn validates_input_state_and_ownership_for_both_handlers() {
+    let (service, id) = setup(1).await;
+    for (job, worker, code) in [
+        ("", "worker", tonic::Code::InvalidArgument),
+        (id.as_str(), " ", tonic::Code::InvalidArgument),
+        ("missing", "worker", tonic::Code::NotFound),
+        (id.as_str(), "worker", tonic::Code::FailedPrecondition),
+    ] {
+        assert_eq!(
+            complete(&service, job, worker, 1).await.unwrap_err().code(),
+            code
+        );
+        assert_eq!(
+            fail(&service, job, worker, 1).await.unwrap_err().code(),
+            code
+        );
+    }
+    claim(&service).await;
+    assert_eq!(
+        complete(&service, &id, "other", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        fail(&service, &id, "other", 1).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(snapshot(&service).await.0, "Active");
+    assert!(
+        fail(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+}
+
+#[tokio::test]
+async fn terminal_transfer_rolls_back_history_insert_when_delete_fails() {
+    for failure in [false, true] {
+        let (service, id) = setup(1).await;
+        claim(&service).await;
+        sql(&service, "CREATE TRIGGER reject_delete BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
+        let code = if failure {
+            fail(&service, &id, "worker", 1).await.unwrap_err().code()
+        } else {
+            complete(&service, &id, "worker", 1)
+                .await
+                .unwrap_err()
+                .code()
+        };
+        assert_eq!(code, tonic::Code::Internal);
+        assert_eq!(snapshot(&service).await.0, "Active");
+        let conn = service.db_manager.get_shared_connection();
+        let count: i64 = tokio::task::spawn_blocking(move || {
+            conn.blocking_lock()
+                .query_row("SELECT COUNT(*) FROM job_history", [], |r| r.get(0))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        sql(&service, "DROP TRIGGER reject_delete").await;
+        if failure {
+            fail(&service, &id, "worker", 1).await.unwrap();
+        } else {
+            complete(&service, &id, "worker", 1).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_retry_update_rolls_back_and_completion_preserves_prior_error() {
+    let (service, id) = setup(0).await; // Default limit is three.
+    claim(&service).await;
+    sql(&service, "CREATE TRIGGER reject_retry AFTER UPDATE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
+    assert_eq!(
+        fail(&service, &id, "worker", 1).await.unwrap_err().code(),
+        tonic::Code::Internal
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.1.as_deref(), stored.3),
+        ("Active", Some("worker"), None)
+    );
+    sql(&service, "DROP TRIGGER reject_retry").await;
+    fail(&service, &id, "worker", 1).await.unwrap();
+    assert_eq!(claim(&service).await.attempts, 2);
+    complete(&service, &id, "worker", 2).await.unwrap();
+    let stored = snapshot(&service).await;
+    assert_eq!(
+        (stored.0.as_str(), stored.2, stored.3.as_deref()),
+        ("Completed", 2, Some("failure 1"))
+    );
+}
+
+#[tokio::test]
+async fn delayed_jobs_and_backoff_wait_until_due() {
+    let (service, _) = setup(1).await;
+    claim(&service).await;
+    let id = service
+        .add_job(Request::new(AddJobRequest {
+            name: "scheduled".into(),
+            delay_ms: 60000,
+            max_attempts: 3,
+            retry_backoff_ms: 10000,
+            retry_backoff_max_ms: 15000,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    assert!(!claim(&service).await.found);
+    sql(
+        &service,
+        "UPDATE jobs SET available_at = 0 WHERE state = 'Delayed'",
+    )
+    .await;
+    let job = claim(&service).await;
+    assert_eq!(job.id, id);
+    fail(&service, &id, "worker", 1).await.unwrap();
+    assert!(!claim(&service).await.found);
+    let conn = service.db_manager.get_shared_connection();
+    let delay: i64 = tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(
+                "SELECT available_at - updated_at FROM jobs WHERE state = 'Delayed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!((9900..=10000).contains(&delay));
+    sql(
+        &service,
+        "UPDATE jobs SET available_at = 0 WHERE state = 'Delayed'",
+    )
+    .await;
+    assert_eq!(claim(&service).await.attempts, 2);
+    sql(
+        &service,
+        "UPDATE jobs SET lease_expires_at_ms = 0 WHERE name = 'scheduled'",
+    )
+    .await;
+    leases::recover_expired(service.db_manager.clone())
+        .await
+        .unwrap();
+    assert!(!claim(&service).await.found);
+    let conn = service.db_manager.get_shared_connection();
+    let delay: i64 = tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(
+                "SELECT available_at - updated_at FROM jobs WHERE state = 'Delayed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(delay, 15000);
+    sql(
+        &service,
+        "UPDATE jobs SET available_at = 0 WHERE state = 'Delayed'",
+    )
+    .await;
+    assert_eq!(claim(&service).await.attempts, 3);
+    assert!(
+        fail(&service, &id, "worker", 3)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+}
+
+#[tokio::test]
+async fn invalid_schedules_are_rejected() {
+    let (service, _) = setup(1).await;
+    for (delay, base, cap) in [
+        (-1, 0, 0),
+        (0, -1, 0),
+        (0, 0, -1),
+        (0, 100, 50),
+        (i64::MAX, 0, 0),
+    ] {
+        assert_eq!(
+            service
+                .add_job(Request::new(AddJobRequest {
+                    delay_ms: delay,
+                    retry_backoff_ms: base,
+                    retry_backoff_max_ms: cap,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+}
+
+#[tokio::test]
+async fn schedule_and_policy_survive_restart() {
+    let path = format!("target/schedule-test-{}.db", uuid::Uuid::new_v4());
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    service
+        .add_job(Request::new(AddJobRequest {
+            name: "later".into(),
+            delay_ms: 60000,
+            retry_backoff_ms: 1000,
+            retry_backoff_max_ms: 5000,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    drop(service);
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    assert!(!claim(&service).await.found);
+    let conn = service.db_manager.get_shared_connection();
+    let policy = tokio::task::spawn_blocking(move || conn.blocking_lock().query_row("SELECT retry_backoff_ms, retry_backoff_max_ms, available_at - created_at FROM jobs", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap()).await.unwrap();
+    assert_eq!(policy, (1000, 5000, 60000));
+    sql(&service, "UPDATE jobs SET available_at = 0").await;
+    assert!(claim(&service).await.found);
+    drop(service);
+    tokio::fs::remove_file(path).await.unwrap();
+}

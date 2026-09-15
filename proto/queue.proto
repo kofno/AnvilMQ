@@ -6,6 +6,7 @@ service QueueService {
   rpc GetNextJob (GetNextJobRequest) returns (GetNextJobResponse);
   rpc CompleteJob (CompleteJobRequest) returns (CompleteJobResponse);
   rpc FailJob (FailJobRequest) returns (FailJobResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 message JobMetadata {
@@ -22,6 +23,9 @@ message AddJobRequest {
   uint32 max_attempts = 5;
   int64 delay_ms = 6;
   string rate_limit_facet = 7;
+  int64 retry_backoff_ms = 8;
+  // Zero selects a 60-second cap (or the base delay, if larger).
+  int64 retry_backoff_max_ms = 9;
 }
 
 message AddJobResponse {
@@ -41,11 +45,24 @@ message GetNextJobResponse {
   bytes payload = 4;
   JobMetadata metadata = 5;
   uint32 attempts = 6;
+  int64 lease_expires_at_ms = 7;
+}
+
+message HeartbeatRequest {
+  string id = 1;
+  string worker_id = 2;
+  uint32 attempt = 3;
+}
+
+message HeartbeatResponse {
+  int64 lease_expires_at_ms = 1;
 }
 
 message CompleteJobRequest {
   string id = 1;
   string worker_id = 2;
+  // Use attempts returned by GetNextJob. Zero is accepted only for attempt one.
+  uint32 attempt = 3;
 }
 
 message CompleteJobResponse {
@@ -56,6 +73,7 @@ message FailJobRequest {
   string id = 1;
   string worker_id = 2;
   string error_message = 3;
+  uint32 attempt = 4;
 }
 
 message FailJobResponse {

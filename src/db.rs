@@ -17,6 +17,15 @@ mod tests {
         DatabaseManager::run_migrations(&mut conn).unwrap();
         conn.execute("ALTER TABLE jobs DROP COLUMN worker_id", [])
             .unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_jobs_active_lease;
+            ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
+            ALTER TABLE jobs DROP COLUMN last_error;
+            ALTER TABLE job_history DROP COLUMN worker_id;
+            ALTER TABLE job_history DROP COLUMN last_error;
+            ALTER TABLE job_history DROP COLUMN rate_limit_facet;",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO jobs (id, name, state, priority, payload, trace_id, execution_depth, created_at, updated_at)
              VALUES ('existing', 'email', 'Waiting', 0, X'01', 'trace', 0, 1, 1)", [],
@@ -31,6 +40,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("Waiting".into(), None));
+        let error: Option<String> = conn
+            .query_row(
+                "SELECT last_error FROM jobs WHERE id = 'existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, None);
+        conn.prepare("SELECT worker_id, last_error, rate_limit_facet FROM job_history")
+            .unwrap();
     }
 }
 
@@ -131,6 +150,65 @@ impl DatabaseManager {
         if !has_worker_id {
             tx.execute("ALTER TABLE jobs ADD COLUMN worker_id TEXT", [])?;
         }
+        // These identifiers are fixed migration definitions, never request input.
+        for (table, column) in [
+            ("jobs", "last_error"),
+            ("job_history", "worker_id"),
+            ("job_history", "last_error"),
+            ("job_history", "rate_limit_facet"),
+        ] {
+            let exists = {
+                let mut statement = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == column)
+            };
+            if !exists {
+                tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+        let has_lease = {
+            let mut statement = tx.prepare("PRAGMA table_info(jobs)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            columns
+                .collect::<SqlResult<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "lease_expires_at_ms")
+        };
+        if !has_lease {
+            tx.execute(
+                "ALTER TABLE jobs ADD COLUMN lease_expires_at_ms INTEGER",
+                [],
+            )?;
+        }
+        // Legacy Active jobs with no lease are eligible for recovery immediately.
+        tx.execute("UPDATE jobs SET lease_expires_at_ms = 0 WHERE state = 'Active' AND lease_expires_at_ms IS NULL", [])?;
+        tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_active_lease ON jobs(lease_expires_at_ms) WHERE state = 'Active'", [])?;
+        for (column, definition) in [
+            ("available_at", "INTEGER"),
+            ("retry_backoff_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("retry_backoff_max_ms", "INTEGER NOT NULL DEFAULT 60000"),
+        ] {
+            let exists = {
+                let mut statement = tx.prepare("PRAGMA table_info(jobs)")?;
+                let columns = statement.query_map([], |r| r.get::<_, String>(1))?;
+                columns
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == column)
+            };
+            if !exists {
+                tx.execute(
+                    &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        // Old Delayed jobs have no recoverable deadline; leave them unscheduled.
+        tx.execute("UPDATE jobs SET available_at = created_at WHERE available_at IS NULL AND state != 'Delayed'", [])?;
+        tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedulable ON jobs(priority, created_at, id, available_at) WHERE state IN ('Waiting', 'Delayed')", [])?;
         tx.commit()?;
         println!("Database migrations completed successfully.");
         Ok(())
