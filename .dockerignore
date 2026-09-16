@@ -1,0 +1,9 @@
+.git
+target
+**/node_modules
+harness/artifacts
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*

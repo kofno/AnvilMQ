@@ -21,3 +21,6 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Container harness reports and seed manifests.
+/harness/artifacts/

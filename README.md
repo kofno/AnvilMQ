@@ -213,3 +213,11 @@ bun run test
 The integration test launches its own daemon and worker processes and takes roughly 40 seconds. For an interactive demo, run `cargo run` from the repository root, then `bun run demo worker` and `bun run demo seed` in separate terminals in `client`.
 
 The package/binary name is currently `rusty-queue`. Source files are `src/main.rs` (RPC handlers and server), `src/db.rs` (connection/schema), and `proto/queue.proto` (wire contract).
+
+### Container reliability harness
+
+Run `./harness/smoke.ps1` to build the Linux images and verify lifecycle behavior plus broker process-crash persistence in an isolated Compose deployment. See [harness/README.md](harness/README.md) for prerequisites, ports, JSON reports, and cleanup. This first slice is a smoke/restart check, not a performance or power-loss benchmark.
+
+Run `./harness/load.ps1 -Producers 4 -Workers 4 -DurationSeconds 30` for a configurable container load scenario. Timestamped reports and `harness/artifacts/latest.md` show throughput, p50/p95/p99 latency, errors, and drain time. See the harness documentation for pacing, payload options, and measurement limits.
+
+See [the initial local performance baseline](harness/BASELINE.md) for the first measured throughput and latency results.

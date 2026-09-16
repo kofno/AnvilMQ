@@ -87,3 +87,5 @@ limits.close();
 ```
 
 Each upsert resets the facet's usage window; zero quota pauses dispatch. Limits are shared across queue names and count retries as new claims. Wildcards are not supported. Management RPCs assume trusted-network access. Workers continue polling when all eligible work is throttled.
+
+`WorkerOptions.onCompleted(id)` is called only after a successful completion acknowledgment. The load harness uses it to measure end-to-end latency; handler return alone is not counted as completion. Keep this callback synchronous and lightweight.

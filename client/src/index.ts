@@ -66,6 +66,7 @@ export class Queue<T = unknown> {
 export interface WorkerOptions extends ConnectionOptions {
   workerId?: string; pollIntervalMs?: number; heartbeatIntervalMs?: number;
   onError?: (error: unknown) => void;
+  onCompleted?: (id: string) => void;
 }
 export type Processor<T> = (job: Job<T>, signal: AbortSignal) => Promise<void>;
 
@@ -129,7 +130,10 @@ export class Worker<T = unknown> {
     if (failed) {
       this.report(failure);
       await this.connection.call("failJob", { ...identity, errorMessage: failure instanceof Error ? failure.message : String(failure) });
-    } else { await this.connection.call("completeJob", identity); }
+    } else {
+      await this.connection.call("completeJob", identity);
+      this.options.onCompleted?.(claim.id);
+    }
   }
   async close(): Promise<void> {
     this.stopping.abort();
