@@ -673,3 +673,273 @@ async fn schedule_and_policy_survive_restart() {
     drop(service);
     tokio::fs::remove_file(path).await.unwrap();
 }
+
+#[tokio::test]
+async fn metrics_follow_commits_not_rollbacks() {
+    let (service, id) = setup(2).await;
+    let metrics = service.db_manager.metrics.clone();
+    assert!(metrics
+        .render()
+        .contains("anvilmq_jobs{state=\"Waiting\"} 1"));
+    claim(&service).await;
+    let before = metrics.render();
+    sql(&service, "CREATE TRIGGER reject_metrics BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
+    complete(&service, &id, "worker", 1).await.unwrap_err();
+    let after = metrics.render();
+    for line in before
+        .lines()
+        .filter(|l| l.starts_with("anvilmq_jobs") || l.starts_with("anvilmq_transitions"))
+    {
+        assert!(after.lines().any(|v| v == line));
+    }
+    sql(&service, "DROP TRIGGER reject_metrics").await;
+    fail(&service, &id, "worker", 1).await.unwrap();
+    assert!(metrics
+        .render()
+        .contains("anvilmq_transitions_total{event=\"retried\"} 1"));
+    claim(&service).await;
+    complete(&service, &id, "worker", 2).await.unwrap();
+    let output = metrics.render();
+    assert!(output.contains("anvilmq_jobs{state=\"Completed\"} 1"));
+    assert!(output.contains("anvilmq_jobs{state=\"Active\"} 0"));
+    assert!(output.contains("anvilmq_rpc_duration_seconds_count{method=\"CompleteJob\"} 2"));
+    assert!(!output.contains(&id));
+}
+
+#[tokio::test]
+async fn rate_limits_skip_blocked_facets_and_reset_windows() {
+    use queue::v1::*;
+    let (service, _) = setup(1).await;
+    claim(&service).await;
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "tenant:a".into(),
+            max_jobs: 1,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    for (name, facet, priority) in [
+        ("limited", "tenant:a", 0),
+        ("limited", "tenant:a", 0),
+        ("other", "tenant:b", 10),
+    ] {
+        service
+            .add_job(Request::new(AddJobRequest {
+                name: name.into(),
+                rate_limit_facet: facet.into(),
+                priority,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+    assert_eq!(claim(&service).await.name, "limited");
+    assert_eq!(claim(&service).await.name, "other");
+    assert!(!claim(&service).await.found);
+    let status = service
+        .get_rate_limit_status(Request::new(GetRateLimitStatusRequest {
+            facet_key: "tenant:a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.current_count, 1);
+    assert!(status.is_throttled);
+    sql(
+        &service,
+        "UPDATE rate_limit_counters SET window_expires_at = 0",
+    )
+    .await;
+    let status = service
+        .get_rate_limit_status(Request::new(GetRateLimitStatusRequest {
+            facet_key: "tenant:a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.current_count, 0);
+    assert!(!status.is_throttled);
+    assert_eq!(claim(&service).await.name, "limited");
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_throttled_polls_total 2"));
+}
+
+#[tokio::test]
+async fn concurrent_claims_do_not_exceed_quota_and_failed_claim_refunds() {
+    use queue::v1::*;
+    let (service, _) = setup(1).await;
+    claim(&service).await;
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "limited".into(),
+            max_jobs: 2,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        service
+            .add_job(Request::new(AddJobRequest {
+                name: "limited".into(),
+                rate_limit_facet: "limited".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+    sql(&service, "CREATE TRIGGER reject_limited BEFORE UPDATE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
+    service
+        .get_next_job(Request::new(GetNextJobRequest {
+            worker_id: "worker".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    let status = service
+        .get_rate_limit_status(Request::new(GetRateLimitStatusRequest {
+            facet_key: "limited".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.current_count, 0);
+    sql(&service, "DROP TRIGGER reject_limited").await;
+    let service = Arc::new(service);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let service = service.clone();
+        tasks.spawn(async move { claim(&service).await.found });
+    }
+    let mut claimed = 0;
+    while let Some(result) = tasks.join_next().await {
+        if result.unwrap() {
+            claimed += 1;
+        }
+    }
+    assert_eq!(claimed, 2);
+}
+
+#[tokio::test]
+async fn rate_rule_validation_pause_update_and_delete() {
+    use queue::v1::*;
+    let (service, _) = setup(1).await;
+    for (key, duration) in [
+        ("", 1000),
+        ("a*", 1000),
+        (" a", 1000),
+        ("a", 0),
+        ("a", i64::MAX),
+    ] {
+        assert_eq!(
+            service
+                .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+                    facet_pattern: key.into(),
+                    max_jobs: 1,
+                    window_duration_ms: duration
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "tenant:a".into(),
+            max_jobs: 0,
+            window_duration_ms: 1000,
+        }))
+        .await
+        .unwrap();
+    assert!(!claim(&service).await.found);
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "tenant:a".into(),
+            max_jobs: 1,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    assert!(claim(&service).await.found);
+    for expected in [true, false] {
+        assert_eq!(
+            service
+                .delete_rate_limit_rule(Request::new(DeleteRateLimitRuleRequest {
+                    facet_key: "tenant:a".into()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .deleted,
+            expected
+        );
+    }
+    assert!(
+        !service
+            .get_rate_limit_status(Request::new(GetRateLimitStatusRequest {
+                facet_key: "tenant:a".into()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .rule_exists
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
+    use queue::v1::*;
+    let path = format!("target/rate-test-{}.db", uuid::Uuid::new_v4());
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "a".into(),
+            max_jobs: 1,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    for name in ["one", "two"] {
+        service
+            .add_job(Request::new(AddJobRequest {
+                name: name.into(),
+                rate_limit_facet: "a".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+    }
+    claim(&service).await;
+    drop(service);
+    let service = MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
+        max_execution_depth: 10,
+    };
+    assert!(!claim(&service).await.found);
+    let status = service
+        .get_rate_limit_status(Request::new(GetRateLimitStatusRequest {
+            facet_key: "a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.current_count, 1);
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "a".into(),
+            max_jobs: 1,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    assert!(claim(&service).await.found);
+    drop(service);
+    tokio::fs::remove_file(path).await.unwrap();
+}

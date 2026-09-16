@@ -67,9 +67,9 @@ Acknowledgments return success only after commit. Blank IDs return InvalidArgume
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
-- Rate-limit tables and facets exist, but enforcement and management RPCs do not.
-- The server binds to loopback, so it is not yet reachable through a normal Kubernetes Service.
-- No Raft replication, Prometheus endpoint, global telemetry, or TypeScript/Bun client exists yet.
+- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented.
+- The server defaults to loopback. A non-loopback bind requires an explicit `ANVILMQ_ADDR`; transport authentication/TLS are not implemented.
+- No Raft replication or global telemetry exists yet.
 
 ## Roadmap
 
@@ -88,7 +88,7 @@ Acknowledgments return success only after commit. Blank IDs return InvalidArgume
 - [x] Immediate retries up to the attempt limit and stale-acknowledgment protection.
 - [x] Persisted worker leases, heartbeat renewal, and abandoned-job recovery.
 - [x] Retry backoff and persisted delayed scheduling.
-- [ ] TypeScript/Bun client with a BullMQ-style API.
+- [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. Not BullMQ-compatible.
 
 ### Phase 3: Safety controls
 
@@ -99,7 +99,7 @@ Acknowledgments return success only after commit. Blank IDs return InvalidArgume
 ### Phase 4: Faceted rate limiting
 
 - [x] Rule/counter tables and stored job facet.
-- [ ] Management RPCs and atomic enforcement during dequeue.
+- [x] Exact-match rule management/usage RPCs and atomic fixed-window enforcement during dequeue.
 - [ ] Fairness across tenants/departments.
 
 ### Phase 5: Regional high availability
@@ -109,9 +109,72 @@ Acknowledgments return success only after commit. Blank IDs return InvalidArgume
 
 ### Phase 6: Observability
 
-- [ ] Atomic counters and an axum Prometheus endpoint.
+- [x] Atomic lifecycle metrics, RPC latency histograms, and an axum Prometheus endpoint.
+- [x] Structured transition logs and health/readiness probes.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
+
+## Faceted rate limits
+
+`UpsertRateLimitRule(facet_pattern, max_jobs, window_duration_ms)` creates or replaces an exact-match rule. Wildcards (`*`, `?`), blank keys, surrounding whitespace, and nonpositive/overflowing durations are rejected. `max_jobs=0` pauses claims for that facet. **Every upsert resets usage**, including an identical update; do not repeatedly upsert rules as a reconciliation heartbeat.
+
+`DeleteRateLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetRateLimitStatus(facet_key)` reports rule existence, effective count, limit, duration, window expiration, and throttling. An expired or unstarted window reports count/deadline zero without writing to the database. Missing rules mean unrestricted claims.
+
+Windows start on the first claim and remain fixed until expiry (`expires <= now` resets on the next claim). Quota is shared across all queue names with the same `rate_limit_facet`. Each claim consumes one unit, including retries and recovered jobs. Completion/failure does not refund usage. Counter changes and the claim commit together; failed claims roll back quota consumption. Rules and counters persist across restarts. These are dispatch-rate limits, not concurrency limits or enqueue admission controls.
+
+Dequeue skips throttled candidates and preserves priority/age ordering among eligible jobs; a blocked tenant cannot prevent an eligible different facet from progressing. This is not a round-robin fairness guarantee. If all matching jobs are throttled, polling returns `found=false`; the client continues normal polling. Jobs without a matching rule remain unrestricted. Limits depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
+
+The TypeScript client exports `RateLimits`:
+
+```typescript
+const limits = new RateLimits();
+await limits.upsert("practice:123", 100, 60000);
+console.log(await limits.status("practice:123"));
+await queue.add(data, { rateLimitFacet: "practice:123" });
+// await limits.delete("practice:123");
+limits.close();
+```
+
+`anvilmq_throttled_polls_total` counts committed polls that encounter at least one due, queue-matching throttled job, even if another job is dispatched. It has no tenant/facet labels and does not count rejected jobs individually. The three administrative RPCs also have bounded latency labels.
+
+## Observability
+
+The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR`. A bind failure stops startup. These endpoints are unauthenticated; expose them only on a trusted network.
+
+- `GET /metrics`: Prometheus text exposition from in-memory atomics; no database access or storage locks during scrapes.
+- `GET /healthz`: HTTP 200 while the HTTP server is responsive; no database dependency.
+- `GET /readyz`: HTTP 200 after opening a database write transaction, reading the jobs table, and rolling back. Returns 503 for contention, database errors, or a one-second timeout. It deliberately fails fast if the shared connection is busy; use a failure threshold for deployment probes. A timed-out SQLite call can continue on its blocking thread, with subsequent probes failing fast until it releases the connection. This is an access check, not a disk durability or capacity test.
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:9090/healthz
+Invoke-WebRequest http://127.0.0.1:9090/readyz
+(Invoke-WebRequest http://127.0.0.1:9090/metrics).Content
+```
+
+Metrics have only fixed state, event, method, and histogram-bound labels:
+
+| Metric | Meaning |
+| --- | --- |
+| `anvilmq_jobs{state}` | Current Waiting, Delayed, Active, Completed, Failed counts; terminal states count retained history |
+| `anvilmq_transitions_total{event}` | Committed enqueued, claimed, completed, failed, retried, and lease_expired events since startup |
+| `anvilmq_rpc_duration_seconds{method}` | Histogram with `_bucket`, `_sum`, `_count`; handler latency includes validation failures and database waits, excludes network transport |
+| `anvilmq_recovery_errors_total` | Recovery batches that failed and will be retried |
+
+The `failed` event counts accepted FailJob calls, including those scheduled for retry. Lease expiry has its own event and increments `retried` when attempts remain. State gauges initialize from jobs/history at startup; cumulative counters reset on restart. Updates occur after successful commits while the writer lock is held. Scrapes may see brief intermediate values across independent atomics and are not a transactional snapshot. Counts assume this daemon owns database writes; external SQL changes or a second process writing the same database are not reflected automatically.
+
+JSON logs include committed transitions with job ID, attempt, source/destination state, and worker ID for claims and acknowledgments. Payloads and arbitrary error messages are not logged in transition events. Set `RUST_LOG` (default `info`) to control verbosity. The background log queue is bounded and may drop logs under sustained overload; logs are diagnostic, not an audit record.
+
+Example Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: anvilmq
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+```
+
+The client integration test checks health/readiness and confirms five completed jobs, zero Active jobs, two retries, and one expired lease after its success/backoff/crash-recovery flow.
 
 ## Local development
 
@@ -134,6 +197,19 @@ winget install --id Google.Protobuf --exact --source winget
 
 Restart the terminal after installation to refresh PATH. `cargo fmt --check` can be used when the Rust formatting component is installed.
 
-The daemon listens on `[::1]:50051` and opens `anvil.db` in the working directory. SQLite also creates WAL/SHM sidecar files. Tests use isolated databases, not the local daemon database.
+The daemon defaults to `[::1]:50051` and `anvil.db` in the working directory. Override these with `ANVILMQ_ADDR` and `ANVILMQ_DB_PATH`. SQLite also creates WAL/SHM sidecar files. Tests use isolated databases, not the local daemon database.
+
+### TypeScript client and demo
+
+See [client/README.md](client/README.md) for the API, shutdown behavior, and crash-recovery demo. After building the daemon:
+
+```powershell
+cd client
+bun install --frozen-lockfile
+bun run check
+bun run test
+```
+
+The integration test launches its own daemon and worker processes and takes roughly 40 seconds. For an interactive demo, run `cargo run` from the repository root, then `bun run demo worker` and `bun run demo seed` in separate terminals in `client`.
 
 The package/binary name is currently `rusty-queue`. Source files are `src/main.rs` (RPC handlers and server), `src/db.rs` (connection/schema), and `proto/queue.proto` (wire contract).

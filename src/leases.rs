@@ -52,6 +52,7 @@ impl MyQueueService {
 }
 
 pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> {
+    let metrics = db.metrics.clone();
     let conn = db.get_shared_connection();
     tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
         let mut conn = conn.blocking_lock();
@@ -74,6 +75,13 @@ pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> 
             }
         }
         tx.commit()?;
+        for (id, attempts, max_attempts, base, cap) in &jobs {
+            let retry = attempts < max_attempts;
+            let to = if !retry { "Failed" } else if crate::scheduling::retry_delay(*base, *cap, *attempts) == 0 { "Waiting" } else { "Delayed" };
+            metrics.transition(Some("Active"), to, "lease_expired");
+            if retry { metrics.event("retried"); }
+            tracing::info!(job_id = %id, attempt = attempts, from = "Active", to, reason = "lease_expired", "job transition");
+        }
         Ok(jobs.len())
     }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(|e| Status::internal(e.to_string()))
 }

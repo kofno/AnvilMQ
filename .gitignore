@@ -1,5 +1,6 @@
 # Rust build output (keep Cargo.lock tracked for this application).
 /target/
+**/node_modules/
 **/*.rs.bk
 
 # Local daemon database and SQLite sidecar files.

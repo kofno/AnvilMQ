@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 pub struct DatabaseManager {
     // Wrap connection in an Arc<Mutex> for safe concurrent async access
     conn: Arc<Mutex<Connection>>,
+    pub metrics: Arc<crate::telemetry::Metrics>,
 }
 
 #[cfg(test)]
@@ -58,7 +59,7 @@ impl DatabaseManager {
         let path = path.to_string();
 
         // SQLite operations are blocking, so we initialize and migrate on a blocking thread
-        let conn = tokio::task::spawn_blocking(move || {
+        let (conn, metrics) = tokio::task::spawn_blocking(move || {
             let mut conn = Connection::open(&path)?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
@@ -71,13 +72,15 @@ impl DatabaseManager {
             )?;
 
             Self::run_migrations(&mut conn)?;
-            Ok::<Connection, rusqlite::Error>(conn)
+            let metrics = crate::telemetry::Metrics::initialize(&conn)?;
+            Ok::<_, rusqlite::Error>((conn, metrics))
         })
         .await
         .unwrap()?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            metrics: Arc::new(metrics),
         })
     }
 
@@ -210,7 +213,7 @@ impl DatabaseManager {
         tx.execute("UPDATE jobs SET available_at = created_at WHERE available_at IS NULL AND state != 'Delayed'", [])?;
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedulable ON jobs(priority, created_at, id, available_at) WHERE state IN ('Waiting', 'Delayed')", [])?;
         tx.commit()?;
-        println!("Database migrations completed successfully.");
+        tracing::info!("Database migrations completed successfully");
         Ok(())
     }
 }

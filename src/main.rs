@@ -6,7 +6,9 @@ mod db;
 mod leases;
 #[cfg(test)]
 mod lifecycle_tests;
+mod rate_limit;
 mod scheduling;
+mod telemetry;
 use db::DatabaseManager;
 
 pub mod queue {
@@ -32,6 +34,7 @@ impl QueueService for MyQueueService {
         &self,
         request: Request<AddJobRequest>,
     ) -> Result<Response<AddJobResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("AddJob");
         let req = request.into_inner();
         if req.delay_ms < 0 || req.retry_backoff_ms < 0 || req.retry_backoff_max_ms < 0 {
             return Err(Status::invalid_argument("delays must not be negative"));
@@ -71,6 +74,7 @@ impl QueueService for MyQueueService {
         } else {
             "Waiting"
         };
+        let metrics = self.db_manager.metrics.clone();
         let conn_arc = self.db_manager.get_shared_connection();
         let id_clone = job_id.clone();
         let name_clone = req.name.clone();
@@ -121,15 +125,13 @@ impl QueueService for MyQueueService {
                     now,
                     facet, available_at, backoff, cap,
                 ],
-            )
+            )?;
+            metrics.transition(None, &state_clone, "enqueued");
+            tracing::info!(job_id = %id_clone, attempt = 0, to = %state_clone, "job transition");
+            Ok::<_, rusqlite::Error>(())
         }).await
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(|e| Status::internal(e.to_string()))?;
-
-        println!(
-            "Successfully enqueued job ID: {} (State: {})",
-            job_id, state
-        );
 
         Ok(Response::new(AddJobResponse {
             id: job_id,
@@ -141,6 +143,7 @@ impl QueueService for MyQueueService {
         &self,
         request: Request<GetNextJobRequest>,
     ) -> Result<Response<GetNextJobResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("GetNextJob");
         let req = request.into_inner();
         if req.worker_id.trim().is_empty() {
             return Err(Status::invalid_argument("worker_id must not be blank"));
@@ -150,6 +153,7 @@ impl QueueService for MyQueueService {
                 "queue_names must not contain blank names",
             ));
         }
+        let metrics = self.db_manager.metrics.clone();
         let conn_arc = self.db_manager.get_shared_connection();
         let job = tokio::task::spawn_blocking(move || -> rusqlite::Result<GetNextJobResponse> {
             let mut conn = conn_arc.blocking_lock();
@@ -157,14 +161,18 @@ impl QueueService for MyQueueService {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = leases::now_ms(&tx)?;
             let mut sql = String::from(
-                "SELECT id, name, payload, parent_id, trace_id, execution_depth, attempts
-                 FROM jobs WHERE state IN ('Waiting', 'Delayed') AND available_at <= ?",
+                "SELECT id, name, payload, parent_id, trace_id, execution_depth, attempts, state
+                 FROM jobs WHERE state IN ('Waiting', 'Delayed') AND available_at <= ?1",
             );
             if !req.queue_names.is_empty() {
                 sql.push_str(" AND name IN (");
                 sql.push_str(&vec!["?"; req.queue_names.len()].join(","));
                 sql.push(')');
             }
+            let parameters: Vec<rusqlite::types::Value> = std::iter::once(rusqlite::types::Value::Integer(now)).chain(req.queue_names.iter().cloned().map(rusqlite::types::Value::Text)).collect();
+            let blocked = "EXISTS (SELECT 1 FROM rate_limit_rules r LEFT JOIN rate_limit_counters c ON c.facet_key = r.facet_pattern WHERE r.facet_pattern = jobs.rate_limit_facet AND (r.max_jobs = 0 OR (c.window_expires_at > ?1 AND c.current_count >= r.max_jobs)))";
+            let throttled: bool = tx.query_row(&format!("SELECT EXISTS({sql} AND {blocked})"), rusqlite::params_from_iter(parameters.iter()), |r| r.get(0))?;
+            sql.push_str(&format!(" AND NOT {blocked}"));
             sql.push_str(" ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1");
             let job = tx
                 .query_row(
@@ -196,8 +204,11 @@ impl QueueService for MyQueueService {
                 .optional()?;
             let Some(mut job) = job else {
                 tx.commit()?;
+                if throttled { metrics.throttled(); }
                 return Ok(GetNextJobResponse::default());
             };
+            rate_limit::consume(&tx, &job.id, now)?;
+            let prior_state: String = tx.query_row("SELECT state FROM jobs WHERE id = ?1", [&job.id], |r| r.get(0))?;
             job.attempts = job
                 .attempts
                 .checked_add(1)
@@ -217,6 +228,9 @@ impl QueueService for MyQueueService {
                 ],
             )?;
             tx.commit()?;
+            if throttled { metrics.throttled(); }
+            metrics.transition(Some(&prior_state), "Active", "claimed");
+            tracing::info!(job_id = %job.id, worker_id = %req.worker_id, attempt = job.attempts, from = %prior_state, to = "Active", "job transition");
             Ok(job)
         })
         .await
@@ -229,16 +243,48 @@ impl QueueService for MyQueueService {
         &self,
         request: Request<CompleteJobRequest>,
     ) -> Result<Response<CompleteJobResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("CompleteJob");
         let req = request.into_inner();
         self.finish_job(req.id, req.worker_id, req.attempt, None)
             .await?;
         Ok(Response::new(CompleteJobResponse { success: true }))
     }
 
+    async fn upsert_rate_limit_rule(
+        &self,
+        request: Request<queue::v1::UpsertRateLimitRuleRequest>,
+    ) -> Result<Response<queue::v1::UpsertRateLimitRuleResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("UpsertRateLimitRule");
+        rate_limit::upsert(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete_rate_limit_rule(
+        &self,
+        request: Request<queue::v1::DeleteRateLimitRuleRequest>,
+    ) -> Result<Response<queue::v1::DeleteRateLimitRuleResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("DeleteRateLimitRule");
+        rate_limit::delete(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_rate_limit_status(
+        &self,
+        request: Request<queue::v1::GetRateLimitStatusRequest>,
+    ) -> Result<Response<queue::v1::GetRateLimitStatusResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("GetRateLimitStatus");
+        rate_limit::status(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     async fn heartbeat(
         &self,
         request: Request<queue::v1::HeartbeatRequest>,
     ) -> Result<Response<queue::v1::HeartbeatResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("Heartbeat");
         self.renew_lease(request.into_inner())
             .await
             .map(Response::new)
@@ -248,6 +294,7 @@ impl QueueService for MyQueueService {
         &self,
         request: Request<FailJobRequest>,
     ) -> Result<Response<FailJobResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("FailJob");
         let req = request.into_inner();
         let moved_to_failed_state = self
             .finish_job(req.id, req.worker_id, req.attempt, Some(req.error_message))
@@ -273,6 +320,7 @@ impl MyQueueService {
                 "id and worker_id must not be blank",
             ));
         }
+        let metrics = self.db_manager.metrics.clone();
         let conn = self.db_manager.get_shared_connection();
         tokio::task::spawn_blocking(move || {
             let internal = |e: rusqlite::Error| Status::internal(e.to_string());
@@ -302,10 +350,12 @@ impl MyQueueService {
                 return Err(Status::failed_precondition("claim lease has expired"));
             }
             let failed = error.is_some();
+            let mut next_state = if failed { "Failed" } else { "Completed" };
             if failed && attempts < max_attempts {
                 let (base, cap): (i64, i64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(internal)?;
                 let delay = scheduling::retry_delay(base, cap, attempts);
                 let available_at = now.saturating_add(delay);
+                next_state = if delay == 0 { "Waiting" } else { "Delayed" };
                 tx.execute(
                     "UPDATE jobs SET state = ?3, available_at = ?4, worker_id = NULL, lease_expires_at_ms = NULL, last_error = ?1,
                      updated_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = ?2",
@@ -324,6 +374,9 @@ impl MyQueueService {
                 tx.execute("DELETE FROM jobs WHERE id = ?1", [&id]).map_err(internal)?;
             }
             tx.commit().map_err(internal)?;
+            metrics.transition(Some("Active"), next_state, if failed { "failed" } else { "completed" });
+            if failed && attempts < max_attempts { metrics.event("retried"); }
+            tracing::info!(job_id = %id, worker_id = %worker_id, attempt = attempts, from = "Active", to = next_state, "job transition");
             Ok(failed && attempts >= max_attempts)
         }).await.map_err(|e| Status::internal(e.to_string()))?
     }
@@ -331,8 +384,22 @@ impl MyQueueService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(log_writer)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
     // Initialize embedded libSQL/SQLite database file
-    let db_manager = Arc::new(DatabaseManager::new("anvil.db").await?);
+    let database_path = std::env::var("ANVILMQ_DB_PATH").unwrap_or_else(|_| "anvil.db".into());
+    let db_manager = Arc::new(DatabaseManager::new(&database_path).await?);
+    let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9090".into())
+        .parse()?;
+    let http = axum::Server::try_bind(&http_addr)?
+        .serve(telemetry::router(db_manager.clone()).into_make_service());
     let recovery_db = db_manager.clone();
     let recovery = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -340,25 +407,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             match leases::recover_expired(recovery_db.clone()).await {
-                Ok(count) if count > 0 => println!("Recovered {count} expired job claims"),
+                Ok(count) if count > 0 => tracing::info!(count, "expired claims recovered"),
                 Ok(_) => {}
-                Err(error) => eprintln!("Lease recovery failed; retrying next tick: {error}"),
+                Err(error) => {
+                    recovery_db
+                        .metrics
+                        .recovery_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(%error, "lease recovery failed; retrying next tick");
+                }
             }
         }
     });
 
-    let addr = "[::1]:50051".parse()?;
+    let addr = std::env::var("ANVILMQ_ADDR")
+        .unwrap_or_else(|_| "[::1]:50051".into())
+        .parse()?;
     let service = MyQueueService {
         db_manager,
         max_execution_depth: 10, // Max recursion depth guardrail
     };
 
-    println!("AnvilMQ daemon listening on {}", addr);
+    tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
 
-    let result = Server::builder()
+    let grpc = Server::builder()
         .add_service(QueueServiceServer::new(service))
-        .serve(addr)
-        .await;
+        .serve(addr);
+    let result: Result<(), Box<dyn std::error::Error>> = tokio::select! { result = grpc => result.map_err(Into::into), result = http => result.map_err(Into::into) };
     recovery.abort();
     result?;
 

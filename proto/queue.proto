@@ -6,6 +6,9 @@ service QueueService {
   rpc GetNextJob (GetNextJobRequest) returns (GetNextJobResponse);
   rpc CompleteJob (CompleteJobRequest) returns (CompleteJobResponse);
   rpc FailJob (FailJobRequest) returns (FailJobResponse);
+  rpc UpsertRateLimitRule (UpsertRateLimitRuleRequest) returns (UpsertRateLimitRuleResponse);
+  rpc DeleteRateLimitRule (DeleteRateLimitRuleRequest) returns (DeleteRateLimitRuleResponse);
+  rpc GetRateLimitStatus (GetRateLimitStatusRequest) returns (GetRateLimitStatusResponse);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -79,4 +82,23 @@ message FailJobRequest {
 message FailJobResponse {
   bool success = 1;
   bool moved_to_failed_state = 2;
+}
+
+message UpsertRateLimitRuleRequest {
+  string facet_pattern = 1; // Exact key only; wildcards are rejected.
+  uint32 max_jobs = 2; // Zero pauses this facet.
+  int64 window_duration_ms = 3;
+}
+message UpsertRateLimitRuleResponse { bool success = 1; }
+message DeleteRateLimitRuleRequest { string facet_key = 1; }
+message DeleteRateLimitRuleResponse { bool deleted = 1; }
+message GetRateLimitStatusRequest { string facet_key = 1; }
+message GetRateLimitStatusResponse {
+  string facet_key = 1;
+  uint32 current_count = 2;
+  uint32 max_jobs = 3;
+  int64 window_expires_at = 4;
+  bool is_throttled = 5;
+  bool rule_exists = 6;
+  int64 window_duration_ms = 7;
 }
