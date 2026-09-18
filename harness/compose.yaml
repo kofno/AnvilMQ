@@ -6,7 +6,8 @@ services:
     environment:
       ANVILMQ_ADDR: 0.0.0.0:50051
       ANVILMQ_HTTP_ADDR: 0.0.0.0:9090
-      ANVILMQ_DB_PATH: /data/anvil.db
+      ANVILMQ_DB_PATH: /data/${ANVILMQ_HARNESS_DB_FILE:-anvil.db}
+      ANVILMQ_DURABILITY: ${ANVILMQ_DURABILITY-NORMAL}
       RUST_LOG: info
     ports:
       - "127.0.0.1:${ANVILMQ_HARNESS_GRPC_PORT:-50061}:50051"

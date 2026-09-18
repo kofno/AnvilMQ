@@ -1,9 +1,11 @@
 import * as grpc from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
 import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const definition = loadSync(fileURLToPath(new URL("../../proto/queue.proto", import.meta.url)), {
+const bundledProto = new URL("../proto/queue.proto", import.meta.url);
+const definition = loadSync(fileURLToPath(existsSync(bundledProto) ? bundledProto : new URL("../../proto/queue.proto", import.meta.url)), {
   longs: Number, defaults: true, bytes: Buffer,
 });
 const api = grpc.loadPackageDefinition(definition) as unknown as {
@@ -131,7 +133,16 @@ export class Worker<T = unknown> {
       this.report(failure);
       await this.connection.call("failJob", { ...identity, errorMessage: failure instanceof Error ? failure.message : String(failure) });
     } else {
-      await this.connection.call("completeJob", identity);
+      // Only completion is idempotent. Keep the same claim token on every retry;
+      // never rerun the handler or turn an ambiguous result into FailJob.
+      for (let attempt = 0; ; attempt++) {
+        try { await this.connection.call("completeJob", identity); break; }
+        catch (error) {
+          const code = (error as grpc.ServiceError).code;
+          if (attempt >= 2 || (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED)) throw error;
+          await sleep(100 * 2 ** attempt);
+        }
+      }
       this.options.onCompleted?.(claim.id);
     }
   }

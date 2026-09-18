@@ -1,0 +1,24 @@
+name: Validate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt && rustup default 1.94.1
+      - run: cargo fmt --check && cargo test --locked && cargo build --locked
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.14
+      - working-directory: client
+        run: bun install --frozen-lockfile && bun run check && bun run test
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+      - run: helm lint charts/anvilmq --strict && helm template eval charts/anvilmq -f deploy/aks-evaluation.yaml > /tmp/anvilmq.yaml

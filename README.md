@@ -4,10 +4,12 @@ AnvilMQ is an early-stage Rust queue engine intended for autonomous regional Kub
 
 ## Current architecture
 
+For a versioned container, Helm chart, and packaged Bun client, see [evaluation releases and Azure deployment](docs/release-and-deploy.md). The chart deploys one broker with FULL durability and a dedicated PVC; it does not provide HA yet.
+
 - Rust Edition 2021, Tokio, and Tonic/Protocol Buffers.
 - Bundled SQLite through `rusqlite`. The target architecture in AGENTS.md specifies libSQL; that migration remains open.
 - Database work runs in `spawn_blocking`, with one shared connection protected by a mutex.
-- WAL mode with `synchronous=NORMAL`: application-crash recovery is supported by SQLite, but acknowledged writes can be lost after an OS crash or power failure. Stronger durability requires a deliberate configuration change and performance validation.
+- WAL with configurable `ANVILMQ_DURABILITY=NORMAL|FULL` (default NORMAL). NORMAL permits loss of recent acknowledged writes after OS/power failure; FULL requests commit synchronization on retained storage. Startup logs the applied settings. See the [durability contract](docs/durability.md) for storage assumptions and operational guidance.
 - Initial schema creation and additive ownership/error-history migrations run in a transaction. Existing jobs are preserved.
 
 ## Implemented behavior
@@ -44,7 +46,7 @@ The response includes `lease_expires_at_ms` (Unix epoch milliseconds). Workers m
 
 Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue. A successful heartbeat returns the renewed `lease_expires_at_ms`, at least 30 seconds from server time when the transaction obtains its write lock. Send heartbeats approximately every 10 seconds while executing; clients must regenerate protobuf bindings to use this RPC.
 
-Heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
+For live jobs, heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Already committed completions can be replayed as described below. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
 
 The daemon runs recovery immediately on startup and every five seconds thereafter. Each immediate transaction handles up to 100 expired claims. Jobs with attempts remaining are rescheduled using their backoff policy with ownership and lease cleared; exhausted jobs move atomically to Failed history. Recovery records `Worker lease expired`, preserves the attempt count, and logs recovered counts or errors. Failed batches roll back and retry on the next tick. Large backlogs may take multiple ticks to drain.
 
@@ -62,7 +64,9 @@ On upgrade, stop old workers before starting this version. The additive migratio
 
 Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker. The new protobuf fields use previously unused tags. For older callers, omitted/zero `attempt` is accepted only on the first attempt; retry-aware clients must regenerate their bindings and send the attempt number.
 
-Acknowledgments return success only after commit. Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect Active-job owner returns PermissionDenied. Non-Active jobs, stale attempts, and already archived jobs return FailedPrecondition without mutation. Duplicate terminal acknowledgments are rejected rather than replayed as success. These ownership checks compare caller-provided identifiers; they are not authentication.
+Acknowledgments return success only after commit. If a completion response is lost, repeating `CompleteJob` with the same job ID, worker ID, and successful attempt returns success from the Completed history record, including after restart. Zero remains an alias for attempt one. Replays do not change history or increment transition/state metrics; RPC latency metrics still count each request. The original lease need not remain valid once completion has committed.
+
+Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect Active-job owner returns PermissionDenied. Non-Active live jobs, stale attempts, and archived records with a different owner, attempt, or outcome return FailedPrecondition without mutation. `FailJob` replays remain rejected. Completion receipts last as long as the history record is retained; legacy records without worker identity cannot prove a match. These ownership checks compare caller-provided identifiers; they are not authentication, and completion idempotency does not deduplicate external handler side effects.
 
 ## Known limitations
 
@@ -220,4 +224,8 @@ Run `./harness/smoke.ps1` to build the Linux images and verify lifecycle behavio
 
 Run `./harness/load.ps1 -Producers 4 -Workers 4 -DurationSeconds 30` for a configurable container load scenario. Timestamped reports and `harness/artifacts/latest.md` show throughput, p50/p95/p99 latency, errors, and drain time. See the harness documentation for pacing, payload options, and measurement limits.
 
+Run `./harness/crash-active.ps1` to kill the broker with active claims and concurrent producers, restart on the same volume, and verify acknowledged-job recovery plus stale-attempt fencing. Reports separate expected redeliveries from ambiguous enqueue outcomes; see the harness documentation for scope and timing details.
+
 See [the initial local performance baseline](harness/BASELINE.md) for the first measured throughput and latency results.
+
+Raft is evaluated against pod/node failure tolerance and failover time, independently of single-node throughput. See [availability requirements](docs/availability.md).

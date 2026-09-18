@@ -1,0 +1,31 @@
+# Single-node only. Additional replicas would be independent queues, not HA.
+replicaCount: 1
+image:
+  repository: anvilmq
+  tag: "" # Defaults to Chart.appVersion; override with the release tag.
+  digest: "" # If supplied, takes precedence over tag.
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+durability: FULL
+logLevel: info
+persistence:
+  size: 10Gi
+  storageClass: "" # Empty uses the cluster default; AKS example uses managed-csi.
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+networkPolicy:
+  enabled: true
+  # Same-namespace callers must have this label. Override peers for cross-namespace access.
+  allowedFrom:
+    - podSelector:
+        matchLabels:
+          anvilmq-client: "true"

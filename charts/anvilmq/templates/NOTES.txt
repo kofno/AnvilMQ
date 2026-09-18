@@ -1,0 +1,9 @@
+AnvilMQ is running as ONE broker. There is no replication or automatic broker failover.
+
+gRPC: {{ include "anvilmq.name" . }}.{{ .Release.Namespace }}.svc.cluster.local:50051
+Metrics/readiness: http://{{ include "anvilmq.name" . }}.{{ .Release.Namespace }}.svc.cluster.local:9090
+Durability: {{ .Values.durability }}
+
+Default NetworkPolicy permits same-namespace pods labelled anvilmq-client=true.
+RPCs are plaintext and unauthenticated. Only allow trusted evaluation workloads.
+PVCs are retained on uninstall. A single-pod upgrade causes an interruption.

@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Queue, Worker, RateLimits } from "../src/index";
+import { verifyCompletionAmbiguity } from "./completion-proxy";
 
 async function until(check: () => boolean, timeout = 60000) {
   const end = Date.now() + timeout;
@@ -18,7 +19,7 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-test("real gRPC: success, delayed/retried jobs, heartbeat drain and killed-worker recovery", async () => {
+test("real gRPC: lifecycle, lease recovery, and ambiguous completion retries", async () => {
   const dir = await mkdtemp(join(tmpdir(), "anvil-client-"));
   const address = `127.0.0.1:${await freePort()}`;
   const httpAddress = `127.0.0.1:${await freePort()}`;
@@ -84,6 +85,7 @@ test("real gRPC: success, delayed/retried jobs, heartbeat drain and killed-worke
     expect(metrics).toContain('anvilmq_transitions_total{event="retried"} 2');
     expect(metrics).toContain('anvilmq_transitions_total{event="lease_expired"} 1');
     expect(metrics).toContain('anvilmq_rpc_duration_seconds_bucket{method="Heartbeat"');
+    await verifyCompletionAmbiguity(address, httpAddress);
   } finally {
     if (crash && crash.exitCode === null) { crash.kill(); await crash.exited; }
     await Promise.all(workers.map(w => w.close()));

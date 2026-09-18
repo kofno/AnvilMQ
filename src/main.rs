@@ -171,7 +171,9 @@ impl QueueService for MyQueueService {
             }
             let parameters: Vec<rusqlite::types::Value> = std::iter::once(rusqlite::types::Value::Integer(now)).chain(req.queue_names.iter().cloned().map(rusqlite::types::Value::Text)).collect();
             let blocked = "EXISTS (SELECT 1 FROM rate_limit_rules r LEFT JOIN rate_limit_counters c ON c.facet_key = r.facet_pattern WHERE r.facet_pattern = jobs.rate_limit_facet AND (r.max_jobs = 0 OR (c.window_expires_at > ?1 AND c.current_count >= r.max_jobs)))";
-            let throttled: bool = tx.query_row(&format!("SELECT EXISTS({sql} AND {blocked})"), rusqlite::params_from_iter(parameters.iter()), |r| r.get(0))?;
+            // CASE is lazy: with no rules, avoid scanning the backlog solely for telemetry.
+            // Read this inside the claim transaction so concurrent rule changes stay serialized.
+            let throttled: bool = tx.query_row(&rate_limit::throttled_poll_sql(&sql, blocked), rusqlite::params_from_iter(parameters.iter()), |r| r.get(0))?;
             sql.push_str(&format!(" AND NOT {blocked}"));
             sql.push_str(" ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1");
             let job = tx
@@ -331,8 +333,18 @@ impl MyQueueService {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?)),
             ).optional().map_err(internal)?;
             let Some((state, owner, attempts, max_attempts)) = job else {
-                let archived: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM job_history WHERE id = ?1)", [&id], |row| row.get(0)).map_err(internal)?;
-                return Err(if archived { Status::failed_precondition("job already finished") } else { Status::not_found("job not found") });
+                let archived = tx.query_row("SELECT state, worker_id, attempts FROM job_history WHERE id = ?1", [&id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?))).optional().map_err(internal)?;
+                if let Some((state, owner, attempts)) = archived {
+                    // Replay only the exact successful completion. History is the durable receipt;
+                    // do not repeat transitions, increment metrics, or accept a FailJob replay.
+                    if error.is_none() && state == "Completed" && owner.as_deref() == Some(worker_id.as_str()) && attempts == attempt.max(1) {
+                        tx.commit().map_err(internal)?;
+                        return Ok(false);
+                    }
+                    return Err(Status::failed_precondition("job already finished with a different outcome or claim"));
+                }
+                return Err(Status::not_found("job not found"));
             };
             if state != "Active" {
                 return Err(Status::failed_precondition("job is not Active"));
@@ -394,7 +406,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     // Initialize embedded libSQL/SQLite database file
     let database_path = std::env::var("ANVILMQ_DB_PATH").unwrap_or_else(|_| "anvil.db".into());
-    let db_manager = Arc::new(DatabaseManager::new(&database_path).await?);
+    let durability = match std::env::var("ANVILMQ_DURABILITY") {
+        Ok(value) => db::Durability::parse(&value)?,
+        Err(std::env::VarError::NotPresent) => db::Durability::Normal,
+        Err(error) => return Err(error.into()),
+    };
+    let db_manager = Arc::new(DatabaseManager::with_durability(&database_path, durability).await?);
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9090".into())
         .parse()?;

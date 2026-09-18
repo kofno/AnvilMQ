@@ -16,6 +16,8 @@ bun run test
 
 The integration test starts an isolated daemon on a temporary port/database. It takes roughly 40 seconds because it exercises real lease expiry, kills a worker process, and keeps another handler alive beyond the 30-second lease while draining. It does not touch `anvil.db`.
 
+It also runs a test-only gRPC proxy that forwards completion to the real broker, then discards the committed response. Both injected `Unavailable` and a silent response loss causing `DeadlineExceeded` must recover with the same completion token and one handler invocation. Further cases verify three-call retry exhaustion, no retry on permission errors, no FailJob fallback, no redelivery of completed jobs, and exactly one completion transition despite repeated successful RPCs. The broker has no production fault-injection switch.
+
 ## API
 
 ```typescript
@@ -45,7 +47,11 @@ Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (d
 
 Workers poll immediately, send heartbeats during async processing, and acknowledge with the claimed attempt number. Handler errors, including JSON decoding errors, invoke FailJob. If heartbeat fails or times out, the handler's signal aborts and the client sends no acknowledgment. Handlers must honor cancellation; the client cannot undo external side effects. Avoid blocking the event loop, which prevents heartbeats.
 
-`await worker.close()` stops polling and drains an in-flight claim, including a claim returned while shutdown begins. Heartbeats continue until the handler settles. A handler that never settles will prevent graceful shutdown; force-killing the process leaves recovery to the server. No automatic RPC retries are performed for enqueue/acknowledgment because a timeout may follow a successful commit. Errors are reported through `onError`; polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment.
+`await worker.close()` stops polling and drains an in-flight claim, including a claim returned while shutdown begins. Heartbeats continue until the handler settles. A handler that never settles will prevent graceful shutdown; force-killing the process leaves recovery to the server.
+
+Completion retries use the exact same job/worker/attempt token: up to three total RPC calls for `Unavailable` or `DeadlineExceeded`, with 100ms then 200ms waits. Each call has `rpcTimeoutMs`; shutdown waits for this bounded completion sequence (about 15.3 seconds at the default timeout). Other status codes are not retried. The handler is not rerun, and `onCompleted` fires once only after a successful acknowledgment. Intermediate retryable errors are suppressed; terminal/exhausted errors reach `onError`. Exhaustion still leaves the completion outcome uncertain. Heartbeats stop when the handler settles; an uncommitted completion that outlives its lease is rejected by the broker.
+
+Enqueue and FailJob are not automatically retried. Polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
 

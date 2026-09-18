@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "anvilmq.name" . }}
+  labels:
+    {{- include "anvilmq.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "anvilmq.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "anvilmq.name" . }}-headless
+  labels:
+    {{- include "anvilmq.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "anvilmq.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc

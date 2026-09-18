@@ -2,6 +2,39 @@ use rusqlite::{Connection, Result as SqlResult};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+    Normal,
+    Full,
+}
+
+impl Durability {
+    pub fn parse(value: &str) -> Result<Self, std::io::Error> {
+        match value.to_ascii_uppercase().as_str() {
+            "NORMAL" => Ok(Self::Normal),
+            "FULL" => Ok(Self::Full),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ANVILMQ_DURABILITY must be NORMAL or FULL",
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+        }
+    }
+
+    fn synchronous(self) -> i64 {
+        match self {
+            Self::Normal => 1,
+            Self::Full => 2,
+        }
+    }
+}
+
 pub struct DatabaseManager {
     // Wrap connection in an Arc<Mutex> for safe concurrent async access
     conn: Arc<Mutex<Connection>>,
@@ -11,6 +44,35 @@ pub struct DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durability_is_validated_and_applied_on_each_open() {
+        assert_eq!(Durability::parse("full").unwrap(), Durability::Full);
+        assert_eq!(Durability::parse("NORMAL").unwrap(), Durability::Normal);
+        for invalid in ["", "OFF", "EXTRA", "1", "typo"] {
+            assert!(Durability::parse(invalid).is_err());
+        }
+        let path =
+            std::env::temp_dir().join(format!("anvil-durability-{}.db", uuid::Uuid::new_v4()));
+        for durability in [Durability::Normal, Durability::Full, Durability::Normal] {
+            let db = DatabaseManager::with_durability(path.to_str().unwrap(), durability)
+                .await
+                .unwrap();
+            let conn = db.get_shared_connection();
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                let mode: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0)).unwrap();
+                let sync: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0)).unwrap();
+                assert_eq!(mode, "wal");
+                assert_eq!(sync, durability.synchronous());
+                conn.execute_batch("CREATE TABLE IF NOT EXISTS durability_probe(id INTEGER PRIMARY KEY); INSERT OR IGNORE INTO durability_probe VALUES(1);").unwrap();
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM durability_probe", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            }).await.unwrap();
+        }
+        tokio::task::spawn_blocking(move || std::fs::remove_file(path).unwrap())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn migration_preserves_legacy_jobs_and_is_repeatable() {
@@ -55,7 +117,12 @@ mod tests {
 }
 
 impl DatabaseManager {
+    #[cfg(test)]
     pub async fn new(path: &str) -> SqlResult<Self> {
+        Self::with_durability(path, Durability::Normal).await
+    }
+
+    pub async fn with_durability(path: &str, durability: Durability) -> SqlResult<Self> {
         let path = path.to_string();
 
         // SQLite operations are blocking, so we initialize and migrate on a blocking thread
@@ -63,13 +130,15 @@ impl DatabaseManager {
             let mut conn = Connection::open(&path)?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
-            // Enable WAL mode for high-concurrency read/write performance
-            conn.execute_batch(
-                "
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-            ",
-            )?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", durability.synchronous())?;
+            let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+            let synchronous: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0))?;
+            // In-memory unit tests use MEMORY journaling. File-backed brokers require WAL.
+            if synchronous != durability.synchronous() || (path != ":memory:" && journal != "wal") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tracing::info!(durability = durability.name(), journal_mode = %journal, synchronous, "database durability configured");
 
             Self::run_migrations(&mut conn)?;
             let metrics = crate::telemetry::Metrics::initialize(&conn)?;

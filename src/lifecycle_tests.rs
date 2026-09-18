@@ -1,5 +1,81 @@
 use super::*;
 
+#[tokio::test]
+async fn completion_replay_requires_the_successful_claim_and_is_mutation_free() {
+    let (service, id) = setup(2).await;
+    claim(&service).await;
+    fail(&service, &id, "worker", 1).await.unwrap();
+    claim(&service).await;
+    let (a, b) = tokio::join!(
+        complete(&service, &id, "worker", 2),
+        complete(&service, &id, "worker", 2)
+    );
+    a.unwrap();
+    b.unwrap();
+    let before = snapshot(&service).await;
+    complete(&service, &id, "worker", 2).await.unwrap();
+    assert_eq!(snapshot(&service).await, before);
+    assert!(!claim(&service).await.found);
+    for (worker, attempt) in [("other", 2), ("worker", 0), ("worker", 1), ("worker", 3)] {
+        assert_eq!(
+            complete(&service, &id, worker, attempt)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    assert_eq!(
+        fail(&service, &id, "worker", 2).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let (service, id) = setup(1).await;
+    claim(&service).await;
+    fail(&service, &id, "worker", 1).await.unwrap();
+    assert_eq!(
+        complete(&service, &id, "worker", 1)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn completion_receipt_survives_reopening_database() {
+    let path = std::env::temp_dir().join(format!("anvil-completion-{}.db", uuid::Uuid::new_v4()));
+    let id;
+    {
+        let service = MyQueueService {
+            db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
+            max_execution_depth: 10,
+        };
+        id = service
+            .add_job(Request::new(AddJobRequest {
+                name: "receipt".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+        claim(&service).await;
+        complete(&service, &id, "worker", 0).await.unwrap();
+    }
+    {
+        let service = MyQueueService {
+            db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
+            max_execution_depth: 10,
+        };
+        complete(&service, &id, "worker", 1).await.unwrap();
+        complete(&service, &id, "worker", 0).await.unwrap();
+        assert!(!claim(&service).await.found);
+    }
+    tokio::task::spawn_blocking(move || std::fs::remove_file(path).unwrap())
+        .await
+        .unwrap();
+}
+
 async fn heartbeat(
     service: &MyQueueService,
     id: &str,
@@ -343,7 +419,7 @@ async fn snapshot(
 }
 
 #[tokio::test]
-async fn completion_archives_and_rejects_duplicate_or_conflicting_ack() {
+async fn completion_archives_replays_duplicate_and_rejects_conflicting_ack() {
     let (service, id) = setup(3).await;
     claim(&service).await;
     assert!(
@@ -364,13 +440,7 @@ async fn completion_archives_and_rejects_duplicate_or_conflicting_ack() {
         ("Completed", Some("worker"), 1, "tenant:a")
     );
     assert!(stored.5 > 0);
-    assert_eq!(
-        complete(&service, &id, "worker", 1)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
+    complete(&service, &id, "worker", 1).await.unwrap();
     assert_eq!(
         fail(&service, &id, "worker", 1).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition

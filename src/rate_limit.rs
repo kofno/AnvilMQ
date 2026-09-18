@@ -97,3 +97,46 @@ pub fn consume(tx: &Transaction<'_>, id: &str, now: i64) -> rusqlite::Result<()>
     }
     Ok(())
 }
+
+// SQLite evaluates CASE branches lazily; an empty rule table must not scan queued jobs.
+pub fn throttled_poll_sql(candidates: &str, blocked: &str) -> String {
+    format!("SELECT CASE WHEN EXISTS(SELECT 1 FROM rate_limit_rules) THEN EXISTS({candidates} AND {blocked}) ELSE 0 END")
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use rusqlite::{Connection, StatementStatus};
+
+    #[test]
+    fn no_rules_probe_cost_does_not_grow_with_backlog() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE rate_limit_rules(facet_pattern TEXT PRIMARY KEY); CREATE TABLE jobs(facet TEXT);
+            INSERT INTO jobs VALUES ('limited');").unwrap();
+        let sql = throttled_poll_sql(
+            "SELECT 1 FROM jobs WHERE 1=1",
+            "EXISTS(SELECT 1 FROM rate_limit_rules WHERE facet_pattern = jobs.facet)",
+        );
+        fn run(conn: &Connection, sql: &str) -> (bool, i32) {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let result = stmt.query_row([], |r| r.get(0)).unwrap();
+            (result, stmt.get_status(StatementStatus::VmStep))
+        }
+        let small = run(&conn, &sql);
+        conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 10000) INSERT INTO jobs SELECT 'limited' FROM n;").unwrap();
+        let large = run(&conn, &sql);
+        assert!(!small.0 && !large.0);
+        assert_eq!(
+            small.1, large.1,
+            "empty-rule probe must not visit backlog rows"
+        );
+        conn.execute("INSERT INTO rate_limit_rules VALUES ('limited')", [])
+            .unwrap();
+        assert!(
+            run(&conn, &sql).0,
+            "adding a rule must enable the full probe"
+        );
+        conn.execute("DELETE FROM rate_limit_rules", []).unwrap();
+        assert_eq!(run(&conn, &sql), small);
+    }
+}

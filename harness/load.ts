@@ -61,6 +61,9 @@ async function phase(seconds: number, name: string) {
   } }));
   const queues = Array.from({ length: config.producers }, () => new Queue(name, { address }));
   const padding = "x".repeat(config.payloadBytes);
+  const timeline: { elapsedSeconds: number; submitted: number; acknowledged: number; completed: number; backlog: number }[] = [];
+  const sample = () => timeline.push({ elapsedSeconds: (performance.now() - begin) / 1000, submitted, acknowledged, completed, backlog: Math.max(0, acknowledged - completed) });
+  const sampler = setInterval(sample, 1000);
   let drainTimedOut = false;
   try {
     await Promise.all(queues.map(async queue => {
@@ -82,11 +85,12 @@ async function phase(seconds: number, name: string) {
   } finally {
     queues.forEach(q => q.close());
     await Promise.all(workers.map(w => w.close()));
+    clearInterval(sampler); sample();
   }
   const elapsedSeconds = (performance.now() - begin) / 1000;
   return {
     passed: !drainTimedOut && !producerErrors && !workerErrors && !duplicates && completed === acknowledged,
-    submitted, acknowledged, completed, completedDuringWindow: duringWindow, producerErrors, workerErrors, duplicates, drainTimedOut, errorExamples: examples,
+    timeline, submitted, acknowledged, completed, completedDuringWindow: duringWindow, producerErrors, workerErrors, duplicates, drainTimedOut, errorExamples: examples,
     measurementSeconds: seconds, elapsedIncludingDrainSeconds: elapsedSeconds, drainSeconds: Math.max(0, elapsedSeconds - seconds),
     enqueuePerSecond: acknowledged / seconds, completionsPerSecondDuringWindow: duringWindow / seconds, completionsPerSecondIncludingDrain: completed / elapsedSeconds,
     latencyMs: { enqueueRpc: enqueue.report(), submissionToHandler: startLatency.report(), submissionToCompletionAck: completion.report() },

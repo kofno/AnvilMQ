@@ -1,0 +1,13 @@
+# Set image.repository and image.tag (or digest) to your published release.
+durability: FULL
+persistence:
+  storageClass: managed-csi
+  size: 10Gi
+# Use identical requests/limits when comparing releases; record any changes.
+resources:
+  requests:
+    cpu: "1"
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
