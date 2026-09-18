@@ -51,7 +51,26 @@ Workers poll immediately, send heartbeats during async processing, and acknowled
 
 Completion retries use the exact same job/worker/attempt token: up to three total RPC calls for `Unavailable` or `DeadlineExceeded`, with 100ms then 200ms waits. Each call has `rpcTimeoutMs`; shutdown waits for this bounded completion sequence (about 15.3 seconds at the default timeout). Other status codes are not retried. The handler is not rerun, and `onCompleted` fires once only after a successful acknowledgment. Intermediate retryable errors are suppressed; terminal/exhausted errors reach `onError`. Exhaustion still leaves the completion outcome uncertain. Heartbeats stop when the handler settles; an uncommitted completion that outlives its lease is rejected by the broker.
 
-Enqueue and FailJob are not automatically retried. Polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
+Enqueue without a key and FailJob are not automatically retried. Keyed enqueue uses the bounded retry policy below. Polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
+
+## Safe enqueue retries
+
+```typescript
+// Create/store this key once per intended operation, outside the retry loop.
+const result = await queue.add(
+  { invoiceId: "123" },
+  { idempotencyKey: "tenant-a:generate-invoice:123:v1" }
+);
+console.log(result.id, result.replayed);
+```
+
+Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. A matching replay returns the original enqueue state, which can be Waiting/Delayed even if the job has since completed.
+
+Only keyed enqueue automatically retries `Unavailable` and `DeadlineExceeded`: three calls maximum, 100ms then 200ms waits, each with `rpcTimeoutMs`. Request data is serialized and options copied once before retrying. After exhaustion, the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work. This is not a durable producer buffer: use an outbox if submissions must survive producer-process loss before acknowledgment.
+
+Receipts are retained indefinitely for now, including after job completion/failure. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
+
+**Upgrade the broker before using this client feature. Published v0.1.0-rc.1 does not support enqueue idempotency.** Older protobuf servers silently ignore unknown request fields, so keyed retries against an older broker can create duplicates. This feature requires a subsequent broker release; ordinary unkeyed callers remain compatible.
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
 

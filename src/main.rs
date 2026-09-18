@@ -3,6 +3,9 @@ use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
 mod db;
+mod enqueue;
+#[cfg(test)]
+mod enqueue_tests;
 mod leases;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -35,108 +38,9 @@ impl QueueService for MyQueueService {
         request: Request<AddJobRequest>,
     ) -> Result<Response<AddJobResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("AddJob");
-        let req = request.into_inner();
-        if req.delay_ms < 0 || req.retry_backoff_ms < 0 || req.retry_backoff_max_ms < 0 {
-            return Err(Status::invalid_argument("delays must not be negative"));
-        }
-        let backoff = req.retry_backoff_ms;
-        let cap = if req.retry_backoff_max_ms == 0 {
-            60_000.max(backoff)
-        } else {
-            req.retry_backoff_max_ms
-        };
-        if cap < backoff {
-            return Err(Status::invalid_argument(
-                "backoff cap must be at least the base",
-            ));
-        }
-        let metadata = req.metadata.unwrap_or_default();
-
-        // 1. Enforce Circuit Breaker Check on Ancestry Depth
-        if metadata.execution_depth > self.max_execution_depth {
-            return Err(Status::resource_exhausted(format!(
-                "Circuit breaker tripped: execution depth {} exceeds max allowed {}",
-                metadata.execution_depth, self.max_execution_depth
-            )));
-        }
-
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let _available_at = now
-            .checked_add(req.delay_ms)
-            .ok_or_else(|| Status::invalid_argument("delay timestamp overflows"))?;
-        let state = if req.delay_ms > 0 {
-            "Delayed"
-        } else {
-            "Waiting"
-        };
-        let metrics = self.db_manager.metrics.clone();
-        let conn_arc = self.db_manager.get_shared_connection();
-        let id_clone = job_id.clone();
-        let name_clone = req.name.clone();
-        let state_clone = state.to_string();
-        let priority = req.priority;
-        let payload = req.payload;
-        let parent_id = if metadata.parent_id.is_empty() {
-            None
-        } else {
-            Some(metadata.parent_id)
-        };
-        let trace_id = if metadata.trace_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            metadata.trace_id
-        };
-        let exec_depth = metadata.execution_depth;
-        let max_attempts = if req.max_attempts == 0 {
-            3
-        } else {
-            req.max_attempts
-        };
-        let facet = if req.rate_limit_facet.is_empty() {
-            None
-        } else {
-            Some(req.rate_limit_facet)
-        };
-
-        // 2. Perform blocking SQLite write inside spawn_blocking to keep Tokio async loop clean
-        tokio::task::spawn_blocking(move || {
-            let conn = conn_arc.blocking_lock();
-            let now = leases::now_ms(&conn)?;
-            let available_at = now.saturating_add(req.delay_ms);
-            conn.execute(
-                "INSERT INTO jobs (id, name, state, priority, payload, parent_id, trace_id, execution_depth, max_attempts, created_at, updated_at, rate_limit_facet, available_at, retry_backoff_ms, retry_backoff_max_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                rusqlite::params![
-                    id_clone,
-                    name_clone,
-                    state_clone,
-                    priority,
-                    payload,
-                    parent_id,
-                    trace_id,
-                    exec_depth,
-                    max_attempts,
-                    now,
-                    now,
-                    facet, available_at, backoff, cap,
-                ],
-            )?;
-            metrics.transition(None, &state_clone, "enqueued");
-            tracing::info!(job_id = %id_clone, attempt = 0, to = %state_clone, "job transition");
-            Ok::<_, rusqlite::Error>(())
-        }).await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(AddJobResponse {
-            id: job_id,
-            state: state.to_string(),
-        }))
+        enqueue::enqueue(self, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn get_next_job(

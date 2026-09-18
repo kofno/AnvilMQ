@@ -36,6 +36,9 @@ struct Latency {
 }
 #[derive(Default)]
 pub struct Metrics {
+    enqueue_replays: AtomicU64,
+    enqueue_conflicts: AtomicU64,
+    enqueue_receipts: AtomicI64,
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
@@ -45,6 +48,10 @@ pub struct Metrics {
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
         let metrics = Self::default();
+        metrics.enqueue_receipts.store(
+            conn.query_row("SELECT COUNT(*) FROM enqueue_receipts", [], |r| r.get(0))?,
+            Relaxed,
+        );
         let mut statement = conn.prepare("SELECT state, COUNT(*) FROM (SELECT state FROM jobs UNION ALL SELECT state FROM job_history) GROUP BY state")?;
         let rows =
             statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -80,6 +87,15 @@ impl Metrics {
     pub fn throttled(&self) {
         self.throttled_polls.fetch_add(1, Relaxed);
     }
+    pub fn enqueue_replay(&self) {
+        self.enqueue_replays.fetch_add(1, Relaxed);
+    }
+    pub fn enqueue_conflict(&self) {
+        self.enqueue_conflicts.fetch_add(1, Relaxed);
+    }
+    pub fn enqueue_receipt_created(&self) {
+        self.enqueue_receipts.fetch_add(1, Relaxed);
+    }
     pub fn render(&self) -> String {
         let mut out = String::from("# HELP anvilmq_jobs Persisted jobs by state including retained history.\n# TYPE anvilmq_jobs gauge\n");
         for (i, state) in STATES.iter().enumerate() {
@@ -113,6 +129,7 @@ impl Metrics {
             self.recovery_errors.load(Relaxed)
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
+        out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
         out
     }
 }
@@ -195,7 +212,7 @@ mod tests {
     #[test]
     fn initializes_state_counts_but_not_event_counters() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE jobs(state TEXT); CREATE TABLE job_history(state TEXT); INSERT INTO jobs VALUES ('Waiting'),('Active'),('Delayed'); INSERT INTO job_history VALUES ('Completed'),('Completed'),('Failed');").unwrap();
+        conn.execute_batch("CREATE TABLE jobs(state TEXT); CREATE TABLE job_history(state TEXT); CREATE TABLE enqueue_receipts(id TEXT); INSERT INTO jobs VALUES ('Waiting'),('Active'),('Delayed'); INSERT INTO job_history VALUES ('Completed'),('Completed'),('Failed');").unwrap();
         let output = Metrics::initialize(&conn).unwrap().render();
         assert!(output.contains("anvilmq_jobs{state=\"Completed\"} 2"));
         assert!(output.contains("anvilmq_jobs{state=\"Active\"} 1"));

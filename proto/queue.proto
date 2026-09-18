@@ -29,11 +29,15 @@ message AddJobRequest {
   int64 retry_backoff_ms = 8;
   // Zero selects a 60-second cap (or the base delay, if larger).
   int64 retry_backoff_max_ms = 9;
+  // Scoped to name. Empty disables deduplication; otherwise at most 256 UTF-8 bytes.
+  string idempotency_key = 10;
 }
 
 message AddJobResponse {
   string id = 1;
   string state = 2;
+  // True when returning the original enqueue receipt, not the current job state.
+  bool replayed = 3;
 }
 
 message GetNextJobRequest {

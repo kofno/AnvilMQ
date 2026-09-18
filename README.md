@@ -16,7 +16,13 @@ For a versioned container, Helm chart, and packaged Bun client, see [evaluation 
 
 ### Enqueue
 
-`AddJob` persists a UUID, payload, priority, ancestry metadata, attempts limit, timestamps, and optional rate-limit facet. Missing trace IDs are generated. Execution depth greater than 10 is rejected before persistence; ancestry is not verified against a parent record. A single INSERT provides atomic enqueue.
+`AddJob` persists a UUID, payload, priority, ancestry metadata, attempts limit, timestamps, and optional rate-limit facet. Missing trace IDs are generated. Execution depth greater than 10 is rejected before persistence; ancestry is not verified against a parent record. An immediate transaction atomically inserts the job and, when requested, its idempotency receipt.
+
+Optional `idempotency_key` (protobuf tag 10) deduplicates within the exact job/queue `name`. Empty/omitted means ordinary enqueue; nonempty keys must be nonblank and at most 256 UTF-8 bytes. Matching retries return the original ID and initial enqueue state with `replayed=true` (response tag 3), even after completion or failure. This is an enqueue receipt, not a current-state query. Replays do not reset delays, create another job, consume attempts, or increment the enqueued counter.
+
+The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate.
+
+Receipts survive restart and terminal job transitions and are retained indefinitely in this first version, independently of job history. They contain the normalized request including payload, so keyed jobs add storage overhead. There is no TTL or cleanup endpoint yet; deleting receipts removes the corresponding deduplication guarantee. Monitor receipt count and PVC usage. Use a new key for intentionally new work and retain the same key/request across producer retries/restarts. Handler side effects remain at least once. See [client usage](client/README.md).
 
 ### Delays and retry backoff
 
@@ -163,8 +169,11 @@ Metrics have only fixed state, event, method, and histogram-bound labels:
 | `anvilmq_transitions_total{event}` | Committed enqueued, claimed, completed, failed, retried, and lease_expired events since startup |
 | `anvilmq_rpc_duration_seconds{method}` | Histogram with `_bucket`, `_sum`, `_count`; handler latency includes validation failures and database waits, excludes network transport |
 | `anvilmq_recovery_errors_total` | Recovery batches that failed and will be retried |
+| `anvilmq_enqueue_replays_total` | Matching keyed enqueue retries since startup; rising rates can indicate lost responses or producer retry pressure |
+| `anvilmq_enqueue_conflicts_total` | Key reuse with different request contents since startup; investigate producer identity/serialization mistakes |
+| `anvilmq_enqueue_receipts` | Retained idempotency records, initialized from storage; monitor alongside PVC usage |
 
-The `failed` event counts accepted FailJob calls, including those scheduled for retry. Lease expiry has its own event and increments `retried` when attempts remain. State gauges initialize from jobs/history at startup; cumulative counters reset on restart. Updates occur after successful commits while the writer lock is held. Scrapes may see brief intermediate values across independent atomics and are not a transactional snapshot. Counts assume this daemon owns database writes; external SQL changes or a second process writing the same database are not reflected automatically.
+The `failed` event counts accepted FailJob calls, including those scheduled for retry. Lease expiry has its own event and increments `retried` when attempts remain. State gauges initialize from jobs/history at startup; cumulative counters reset on restart. Lifecycle/receipt counts update after successful commits while the writer lock is held; conflict counters count rejected requests without mutations. Scrapes may see brief intermediate values across independent atomics and are not a transactional snapshot. Counts assume this daemon owns database writes; external SQL changes or a second process writing the same database are not reflected automatically. Idempotency metrics have no queue, key, or job-ID labels; replay/conflict logs identify the original job ID without logging keys or payloads.
 
 JSON logs include committed transitions with job ID, attempt, source/destination state, and worker ID for claims and acknowledgments. Payloads and arbitrary error messages are not logged in transition events. Set `RUST_LOG` (default `info`) to control verbosity. The background log queue is bounded and may drop logs under sustained overload; logs are diagnostic, not an audit record.
 

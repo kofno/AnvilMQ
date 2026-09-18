@@ -18,6 +18,7 @@ export interface AddOptions {
   priority?: number; delayMs?: number; maxAttempts?: number;
   retryBackoffMs?: number; retryBackoffMaxMs?: number;
   metadata?: Partial<JobMetadata>; rateLimitFacet?: string;
+  idempotencyKey?: string;
 }
 export interface Job<T> {
   id: string; name: string; data: T; attempts: number;
@@ -51,7 +52,8 @@ export class Queue<T = unknown> {
     if (!name.trim()) throw new Error("queue name must not be blank");
     this.connection = new Connection(options);
   }
-  async add(data: T, options: AddOptions = {}): Promise<{ id: string; state: string }> {
+  async add(data: T, options: AddOptions = {}): Promise<{ id: string; state: string; replayed: boolean }> {
+    if (options.idempotencyKey !== undefined && (typeof options.idempotencyKey !== "string" || !options.idempotencyKey.trim() || Buffer.byteLength(options.idempotencyKey, "utf8") > 256)) throw new Error("idempotencyKey must be nonblank and at most 256 UTF-8 bytes");
     for (const key of ["delayMs", "retryBackoffMs", "retryBackoffMaxMs", "maxAttempts"] as const) {
       const value = options[key];
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`${key} must be a nonnegative safe integer`);
@@ -60,7 +62,16 @@ export class Queue<T = unknown> {
     if (options.priority !== undefined && (!Number.isInteger(options.priority) || options.priority < -2147483648 || options.priority > 2147483647)) throw new Error("priority exceeds int32");
     const json = JSON.stringify(data);
     if (json === undefined) throw new Error("payload must be JSON serializable");
-    return this.connection.call("addJob", { ...options, name: this.name, payload: Buffer.from(json) });
+    // Freeze the request once; a retry must not pick up mutated caller options/data.
+    const request = { ...options, metadata: options.metadata ? { ...options.metadata } : undefined, name: this.name, payload: Buffer.from(json) };
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.connection.call("addJob", request); }
+      catch (error) {
+        const code = (error as grpc.ServiceError).code;
+        if (!request.idempotencyKey || attempt >= 2 || (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED)) throw error;
+        await sleep(100 * 2 ** attempt);
+      }
+    }
   }
   close() { this.connection.close(); }
 }
@@ -133,7 +144,7 @@ export class Worker<T = unknown> {
       this.report(failure);
       await this.connection.call("failJob", { ...identity, errorMessage: failure instanceof Error ? failure.message : String(failure) });
     } else {
-      // Only completion is idempotent. Keep the same claim token on every retry;
+      // Completion is idempotent. Keep the same claim token on every retry;
       // never rerun the handler or turn an ambiguous result into FailJob.
       for (let attempt = 0; ; attempt++) {
         try { await this.connection.call("completeJob", identity); break; }

@@ -2,6 +2,8 @@
 
 Raft is being considered for redundancy and availability within a regional Kubernetes cluster, not as a throughput optimization. Single-node performance measurements establish a baseline and headroom; they do not decide whether redundancy is needed.
 
+Current priority: defer Raft while validating acceptable recovery time on Azure and improving throughput, durability, correctness, safety controls, and observability. Brief interruptions may be acceptable for this workload; node/volume recovery time still needs measurement. Enqueue idempotency now provides safe same-request retries on supporting broker versions, but producers still need an outbox if they cannot lose pending submissions during their own restart. This does not claim availability parity with the existing Sentinel deployment.
+
 ## Intended requirement
 
 Continue queue service through the loss or recycling of one broker pod or its Kubernetes node, with a bounded failover interruption and no loss of acknowledged jobs within the stated failure model. The acceptable interruption (RTO) still needs a concrete target. Worker side effects remain at least once; broker replication cannot make arbitrary external effects exactly once.

@@ -202,6 +202,16 @@ impl DatabaseManager {
                 window_duration_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS enqueue_receipts (
+                queue_name TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request BLOB NOT NULL,
+                job_id TEXT NOT NULL,
+                initial_state TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (queue_name, idempotency_key)
+            );
+
             CREATE TABLE IF NOT EXISTS rate_limit_counters (
                 facet_key TEXT PRIMARY KEY,
                 current_count INTEGER NOT NULL,
