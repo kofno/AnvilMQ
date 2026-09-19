@@ -121,6 +121,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 - [x] Atomic lifecycle metrics, RPC latency histograms, and an axum Prometheus endpoint.
 - [x] Structured transition logs and health/readiness probes.
+- [x] Cached queue-pressure depth/age, claim-wait histograms, and Grafana dashboard/Prometheus alert examples. See [queue-pressure observability](docs/observability.md).
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 

@@ -6,6 +6,7 @@
     "replicaCount": { "type": "integer", "enum": [1] },
     "durability": { "type": "string", "enum": ["NORMAL", "FULL"] },
     "logLevel": { "type": "string", "minLength": 1 },
+    "metricsQueues": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^,\\s](?:[^,]*[^,\\s])?$" } },
     "image": {
       "type": "object", "required": ["repository", "tag", "digest", "pullPolicy"],
       "properties": {

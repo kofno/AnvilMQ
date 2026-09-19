@@ -1,0 +1,11 @@
+# Example for Prometheus on the same host as a locally running broker.
+# Use the broker Service DNS:9090 in Kubernetes and explicitly allow the scraper
+# through the Helm NetworkPolicy. host.docker.internal is useful in Docker Desktop.
+global:
+  scrape_interval: 15s
+rule_files:
+  - alerts.yaml
+scrape_configs:
+  - job_name: anvilmq
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

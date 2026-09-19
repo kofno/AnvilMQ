@@ -81,7 +81,8 @@ mod tests {
         conn.execute("ALTER TABLE jobs DROP COLUMN worker_id", [])
             .unwrap();
         conn.execute_batch(
-            "DROP INDEX idx_jobs_active_lease;
+            "DROP INDEX idx_jobs_pressure;
+            DROP INDEX idx_jobs_active_lease;
             ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
             ALTER TABLE jobs DROP COLUMN last_error;
             ALTER TABLE job_history DROP COLUMN worker_id;
@@ -291,6 +292,8 @@ impl DatabaseManager {
         // Old Delayed jobs have no recoverable deadline; leave them unscheduled.
         tx.execute("UPDATE jobs SET available_at = created_at WHERE available_at IS NULL AND state != 'Delayed'", [])?;
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedulable ON jobs(priority, created_at, id, available_at) WHERE state IN ('Waiting', 'Delayed')", [])?;
+        // Keep periodic pressure scans away from payload pages; adds write/storage cost.
+        tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pressure ON jobs(name, state, available_at, created_at, lease_expires_at_ms)", [])?;
         tx.commit()?;
         tracing::info!("Database migrations completed successfully");
         Ok(())

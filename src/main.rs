@@ -9,6 +9,7 @@ mod enqueue_tests;
 mod leases;
 #[cfg(test)]
 mod lifecycle_tests;
+mod pressure;
 mod rate_limit;
 mod scheduling;
 mod telemetry;
@@ -114,7 +115,7 @@ impl QueueService for MyQueueService {
                 return Ok(GetNextJobResponse::default());
             };
             rate_limit::consume(&tx, &job.id, now)?;
-            let prior_state: String = tx.query_row("SELECT state FROM jobs WHERE id = ?1", [&job.id], |r| r.get(0))?;
+            let (prior_state, created_at, available_at): (String, i64, i64) = tx.query_row("SELECT state, created_at, available_at FROM jobs WHERE id = ?1", [&job.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             job.attempts = job
                 .attempts
                 .checked_add(1)
@@ -136,6 +137,7 @@ impl QueueService for MyQueueService {
             tx.commit()?;
             if throttled { metrics.throttled(); }
             metrics.transition(Some(&prior_state), "Active", "claimed");
+            metrics.pressure.claimed(created_at, available_at, now, job.attempts);
             tracing::info!(job_id = %job.id, worker_id = %req.worker_id, attempt = job.attempts, from = %prior_state, to = "Active", "job transition");
             Ok(job)
         })
@@ -315,7 +317,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(std::env::VarError::NotPresent) => db::Durability::Normal,
         Err(error) => return Err(error.into()),
     };
-    let db_manager = Arc::new(DatabaseManager::with_durability(&database_path, durability).await?);
+    let pressure = pressure::Pressure::configured(
+        &std::env::var("ANVILMQ_METRICS_QUEUES").unwrap_or_default(),
+    )?;
+    let mut manager = DatabaseManager::with_durability(&database_path, durability).await?;
+    Arc::get_mut(&mut manager.metrics)
+        .expect("metrics not yet shared")
+        .pressure = pressure;
+    let db_manager = Arc::new(manager);
+    let sampler = pressure::spawn(database_path, db_manager.metrics.clone());
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9090".into())
         .parse()?;
@@ -356,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(addr);
     let result: Result<(), Box<dyn std::error::Error>> = tokio::select! { result = grpc => result.map_err(Into::into), result = http => result.map_err(Into::into) };
     recovery.abort();
+    sampler.abort();
     result?;
 
     Ok(())
@@ -499,6 +510,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(service
+            .db_manager
+            .metrics
+            .render()
+            .contains("anvilmq_due_wait_seconds_count 0\n"));
         let conn = service.db_manager.get_shared_connection();
         tokio::task::spawn_blocking(move || {
             conn.blocking_lock()
@@ -510,6 +526,11 @@ mod tests {
         let job = claim(&service, &[]).await;
         assert_eq!(job.id, id);
         assert_eq!(job.attempts, 1);
+        assert!(service
+            .db_manager
+            .metrics
+            .render()
+            .contains("anvilmq_due_wait_seconds_count 1\n"));
     }
 
     #[tokio::test]

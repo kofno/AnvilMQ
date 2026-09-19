@@ -1,5 +1,5 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$')][string]$Version = '0.1.0-rc.1',
+    [ValidatePattern('^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$')][string]$Version = '0.1.0-rc.2',
     [string]$ImageRepository = 'anvilmq',
     [switch]$SkipImageBuild
 )
@@ -37,6 +37,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Client packaging failed' }
     Copy-Item proto/queue.proto $output
     Copy-Item deploy/aks-evaluation.yaml $output
+    & tar -czf (Join-Path $output "anvilmq-observability-$Version.tgz") -C $root observability docs/observability.md
+    if ($LASTEXITCODE -ne 0) { throw 'Observability packaging failed' }
     @{version=$Version; image="${ImageRepository}:$Version"; platform='linux/amd64'; revision=$revision; dirtyWorkingTree=$dirty; imageBuiltLocally=(-not $SkipImageBuild)} | ConvertTo-Json | Set-Content (Join-Path $output 'release.json')
     Get-ChildItem $output -File | Sort-Object Name | ForEach-Object {
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

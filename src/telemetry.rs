@@ -36,6 +36,7 @@ struct Latency {
 }
 #[derive(Default)]
 pub struct Metrics {
+    pub pressure: crate::pressure::Pressure,
     enqueue_replays: AtomicU64,
     enqueue_conflicts: AtomicU64,
     enqueue_receipts: AtomicI64,
@@ -130,6 +131,7 @@ impl Metrics {
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
+        self.pressure.render(&mut out);
         out
     }
 }

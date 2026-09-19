@@ -8,6 +8,8 @@ image:
 imagePullSecrets: []
 durability: FULL
 logLevel: info
+# Explicit queue names for pressure metrics; global metrics always include all queues.
+metricsQueues: [] # At most 32 names. Never use tenant IDs or dynamically generated queue names.
 persistence:
   size: 10Gi
   storageClass: "" # Empty uses the cluster default; AKS example uses managed-csi.

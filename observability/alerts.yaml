@@ -1,0 +1,42 @@
+groups:
+  - name: anvilmq-pressure
+    rules:
+      - alert: AnvilMQPressureSampleStale
+        expr: time() - anvilmq_pressure_sample_timestamp_seconds > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnvilMQ pressure metrics are stale on {{ $labels.instance }}"
+          description: "Backlog metrics may no longer describe current pressure. Check sampling errors, disk/CPU load, and query budget before trusting age/depth panels."
+      - alert: AnvilMQDueBacklogAging
+        expr: anvilmq_oldest_due_age_seconds{scope="all"} > 60 and on(job, instance) (time() - anvilmq_pressure_sample_timestamp_seconds < 30)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnvilMQ due work is aging on {{ $labels.instance }}"
+          description: "Due work has waited over 60 seconds for five minutes. Check worker capacity, rate limits, and arrival/completion rates. Intentional future delays are excluded."
+      - alert: AnvilMQBacklogGrowing
+        expr: deriv(anvilmq_backlog_jobs{scope="all",kind="due"}[10m]) > 1 and on(job, instance) (time() - anvilmq_pressure_sample_timestamp_seconds < 30)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnvilMQ due backlog is growing on {{ $labels.instance }}"
+          description: "Due backlog has grown faster than one job/second for ten minutes. Inspect due-wait latency, processing throughput, and throttling."
+      - alert: AnvilMQExpiredClaimsNotRecovering
+        expr: anvilmq_backlog_jobs{scope="all",kind="expired_leases"} > 0 and on(job, instance) (time() - anvilmq_pressure_sample_timestamp_seconds < 30)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnvilMQ expired claims persist on {{ $labels.instance }}"
+          description: "Check recovery errors and worker health. Recovery handles bounded batches; a large outage backlog may take several ticks to drain."
+      - alert: AnvilMQRecoveryErrors
+        expr: increase(anvilmq_recovery_errors_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnvilMQ lease recovery failed on {{ $labels.instance }}"
+          description: "Inspect broker logs and database/storage health."

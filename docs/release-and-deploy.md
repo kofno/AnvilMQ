@@ -2,33 +2,33 @@
 
 This release packages a **single-node** broker. It provides no Raft replication, authentication, TLS, or rolling-upgrade availability. Use a dedicated evaluation namespace and PVC. The chart defaults to FULL durability, one replica, internal services, and ingress restricted to labelled clients. Helm rejects replica counts above one because independent broker databases would split the queue.
 
-## Put the repository on GitHub
+## GitHub release workflow
 
-Create an empty GitHub repository under the intended account/organization. Choose its visibility deliberately. Review and commit the local changes, then add its URL as `origin` and push your branch. The existing local repository currently has no configured remote. No GitHub repository or release is created by the local packaging script.
+The repository is [kofno/AnvilMQ](https://github.com/kofno/AnvilMQ). Commit and push the intended changes to main before publishing a new version tag. No GitHub release is created by the local packaging script.
 
-The included workflows validate pushes to `main` and pull requests. Pushing a version tag such as `v0.1.0-rc.1` triggers the release workflow:
+The included workflows validate pushes to `main` and pull requests. Pushing a version tag such as `v0.1.0-rc.2` triggers the release workflow:
 
 1. Run Rust formatting/tests/build and TypeScript checks/integration tests.
 2. Lint/package the Helm chart and package the Bun client with its protobuf.
-3. Publish `ghcr.io/<owner>/<repository>:0.1.0-rc.1` for Linux amd64, labelled with source/version/revision.
-4. Create a GitHub prerelease with chart, client, protobuf, AKS values, image digest, source metadata, and SHA-256 checksums.
+3. Publish `ghcr.io/<owner>/<repository>:0.1.0-rc.2` for Linux amd64, labelled with source/version/revision.
+4. Create a GitHub prerelease with chart, client, observability bundle, protobuf, AKS values, image digest, source metadata, and SHA-256 checksums.
 
 GitHub Actions needs permission to write packages and releases; the workflow requests those permissions using `GITHUB_TOKEN`. Organization policy can still restrict them. GHCR package visibility/access must be configured for your cluster. The workflow does not deploy Kubernetes resources. Do not move/reuse published version tags; use a new version for changes. Source Cargo/package versions describe the development base; the release tag sets image, chart, and packaged client versions.
 
 After reviewing and committing the intended source, publish the tag explicitly:
 
 ```powershell
-git tag v0.1.0-rc.1
-git push origin v0.1.0-rc.1
+git tag v0.1.0-rc.2
+git push origin v0.1.0-rc.2
 ```
 
 ## Local packaging
 
 ```powershell
-./scripts/release.ps1 -Version 0.1.0-rc.1
+./scripts/release.ps1 -Version 0.1.0-rc.2
 ```
 
-Requires Docker, Helm, PowerShell 7, Git, and tar. Builds `anvilmq:0.1.0-rc.1` locally and writes packages/checksums to `dist/0.1.0-rc.1/`; it does not push images or tags. The manifest records the commit and whether the working tree was dirty. Existing output directories are rejected to avoid accidentally replacing release artifacts. `-ImageRepository` changes the image name; `-SkipImageBuild` only packages files and marks that fact in `release.json`.
+Requires Docker, Helm, PowerShell 7, Git, and tar. Builds `anvilmq:0.1.0-rc.2` locally and writes packages/checksums to `dist/0.1.0-rc.2/`; it does not push images or tags. The manifest records the commit and whether the working tree was dirty. Existing output directories are rejected to avoid accidentally replacing release artifacts. `-ImageRepository` changes the image name; `-SkipImageBuild` only packages files and marks that fact in `release.json`.
 
 The client archive is npm-compatible and includes the canonical protobuf. It exports TypeScript and is intended for Bun applications; a compiled Node.js distribution is not included. No npm registry publication is required.
 
@@ -38,11 +38,11 @@ Download the assets from the GitHub release and verify `SHA256SUMS`. Replace the
 
 ```powershell
 kubectl config current-context
-helm upgrade --install eval ./anvilmq-0.1.0-rc.1.tgz `
+helm upgrade --install eval ./anvilmq-0.1.0-rc.2.tgz `
   --namespace anvilmq-eval --create-namespace `
   -f ./aks-evaluation.yaml `
-  --set image.repository=ghcr.io/OWNER/REPOSITORY `
-  --set-string image.tag=0.1.0-rc.1 `
+  --set image.repository=ghcr.io/kofno/anvilmq `
+  --set-string image.tag=0.1.0-rc.2 `
   --wait --timeout 5m
 ```
 
@@ -69,7 +69,7 @@ The NetworkPolicy requires a policy-enforcing CNI. Same-namespace client pods ne
 Install the client asset in a Bun application:
 
 ```powershell
-bun add ./anvilmq-client-0.1.0-rc.1.tgz
+bun add ./anvilmq-client-0.1.0-rc.2.tgz
 ```
 
 ```typescript

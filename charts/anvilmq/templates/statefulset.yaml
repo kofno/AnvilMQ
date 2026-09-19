@@ -59,6 +59,8 @@ spec:
               value: {{ .Values.durability | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            - name: ANVILMQ_METRICS_QUEUES
+              value: {{ join "," .Values.metricsQueues | quote }}
           ports:
             - name: grpc
               containerPort: 50051

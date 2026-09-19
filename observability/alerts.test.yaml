@@ -1,0 +1,25 @@
+rule_files:
+  - alerts.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'anvilmq_pressure_sample_timestamp_seconds{job="anvilmq",instance="fresh"}'
+        values: '0+60x10'
+      - series: 'anvilmq_oldest_due_age_seconds{job="anvilmq",instance="fresh",scope="all",queue=""}'
+        values: '120+0x10'
+      - series: 'anvilmq_pressure_sample_timestamp_seconds{job="anvilmq",instance="stale"}'
+        values: '0+0x10'
+      - series: 'anvilmq_oldest_due_age_seconds{job="anvilmq",instance="stale",scope="all",queue=""}'
+        values: '120+0x10'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="AnvilMQDueBacklogAging",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AnvilMQDueBacklogAging",alertstate="firing",job="anvilmq",instance="fresh",scope="all",queue="",severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="AnvilMQPressureSampleStale",alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AnvilMQPressureSampleStale",alertstate="firing",job="anvilmq",instance="stale",severity="warning"}'
+            value: 1
