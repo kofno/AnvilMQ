@@ -31,8 +31,7 @@ const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
 // BullMQ dashboards' {queue,name,result} breakdowns without unbounded producer labels.
 const NAMED_EVENTS: [&str; 5] = ["enqueued", "claimed", "completed", "failed", "retried"];
-const DURATION_BOUNDS_MS: [i64; 10] =
-    [1, 10, 100, 500, 1000, 5000, 15000, 60000, 300000, 3600000];
+const DURATION_BOUNDS_MS: [i64; 10] = [1, 10, 100, 500, 1000, 5000, 15000, 60000, 300000, 3600000];
 
 fn escape_label(value: &str) -> String {
     value
@@ -335,18 +334,23 @@ mod tests {
         metrics.named.event("Unlisted", "completed");
         metrics.named.observe_duration("Unlisted", 5);
         let output = metrics.render();
-        assert!(output
-            .contains("anvilmq_jobs_by_name_total{name=\"ProcessActivity\",event=\"completed\"} 1"));
+        assert!(output.contains(
+            "anvilmq_jobs_by_name_total{name=\"ProcessActivity\",event=\"completed\"} 1"
+        ));
         assert!(output
             .contains("anvilmq_jobs_by_name_total{name=\"ProcessActivity\",event=\"enqueued\"} 1"));
         assert!(output.contains("anvilmq_jobs_by_name_total{name=\"Stress\",event=\"failed\"} 1"));
         assert!(output.contains("anvilmq_job_duration_seconds_count{name=\"ProcessActivity\"} 1"));
-        assert!(output.contains("anvilmq_job_duration_seconds_bucket{name=\"ProcessActivity\",le=\"0.1\"} 1"));
+        assert!(output.contains(
+            "anvilmq_job_duration_seconds_bucket{name=\"ProcessActivity\",le=\"0.1\"} 1"
+        ));
         assert!(!output.contains("Unlisted"));
     }
 
     #[test]
     fn named_lifecycle_renders_nothing_without_allowlist() {
-        assert!(!Metrics::default().render().contains("anvilmq_jobs_by_name_total"));
+        assert!(!Metrics::default()
+            .render()
+            .contains("anvilmq_jobs_by_name_total"));
     }
 }
