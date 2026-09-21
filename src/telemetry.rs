@@ -1,5 +1,12 @@
 use crate::db::DatabaseManager;
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use crate::reader::{Reader, ReaderError};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering::Relaxed},
@@ -315,27 +322,37 @@ impl Drop for Timer {
         }
     }
 }
-pub fn router(db: Arc<DatabaseManager>) -> Router {
+/// Shared HTTP handler state. Bundles the single-writer `DatabaseManager` (used by the
+/// metrics/readiness probes) with the isolated read-only [`Reader`] (used by observability read
+/// endpoints such as `/v1/failures`). Cheap to clone: both fields are `Arc`s.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Arc<DatabaseManager>,
+    pub reader: Arc<Reader>,
+}
+
+pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(ready))
-        .with_state(db)
+        .route("/v1/failures", get(failures))
+        .with_state(AppState { db, reader })
 }
 async fn metrics(
-    State(db): State<Arc<DatabaseManager>>,
+    State(app): State<AppState>,
 ) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        db.metrics.render(),
+        app.db.metrics.render(),
     )
 }
-async fn ready(State(db): State<Arc<DatabaseManager>>) -> (StatusCode, &'static str) {
+async fn ready(State(app): State<AppState>) -> (StatusCode, &'static str) {
     // Fail fast under contention; never queue unbounded blocking probes behind a busy writer.
-    let Ok(mut conn) = db.get_shared_connection().try_lock_owned() else {
+    let Ok(mut conn) = app.db.get_shared_connection().try_lock_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "database busy\n");
     };
     let probe = tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
@@ -353,23 +370,244 @@ async fn ready(State(db): State<Arc<DatabaseManager>>) -> (StatusCode, &'static 
     }
 }
 
+/// Default and hard-capped page size for the recent-failures feed.
+const FAILURES_DEFAULT_LIMIT: usize = 100;
+const FAILURES_MAX_LIMIT: usize = 1000;
+
+/// Query parameters for `GET /v1/failures`.
+#[derive(Deserialize)]
+pub struct FailuresParams {
+    /// Optional exact job-name filter.
+    name: Option<String>,
+    /// Optional lower bound on `finished_at` (inclusive); only rows finished at or after this.
+    since_ms: Option<i64>,
+    /// Page size; defaults to 100 and is hard-capped at 1000.
+    limit: Option<usize>,
+}
+
+/// One terminal failure row from `job_history`.
+#[derive(Serialize)]
+pub struct FailureRow {
+    id: String,
+    name: String,
+    attempts: i64,
+    finished_at: i64,
+    last_error: Option<String>,
+    trace_id: Option<String>,
+    execution_depth: i64,
+}
+
+/// Recent terminal failures feed, served read-only off the WAL replica connection.
+///
+/// `job_history` rows are TERMINAL failures only — a job that fails but still has retries left
+/// stays in `jobs` and never reaches history — so this feed lists exhausted failures with their
+/// `last_error`. That record-level drill-down (which job, which error) is exactly what the
+/// aggregate Prometheus counters cannot provide. The read runs on the isolated `Reader`, so it
+/// never contends on the single-writer mutex.
+async fn failures(
+    State(app): State<AppState>,
+    Query(params): Query<FailuresParams>,
+) -> Result<Json<Vec<FailureRow>>, StatusCode> {
+    let limit = params
+        .limit
+        .unwrap_or(FAILURES_DEFAULT_LIMIT)
+        .min(FAILURES_MAX_LIMIT) as i64;
+    let name = params.name;
+    let since_ms = params.since_ms;
+    let rows = app
+        .reader
+        .query(move |conn| {
+            // Fully parameterized; user input never interpolated into SQL. Backed by
+            // idx_history_name_state_finished / idx_history_state_finished.
+            let mut sql = String::from(
+                "SELECT id, name, attempts, finished_at, last_error, trace_id, execution_depth \
+                 FROM job_history WHERE state = 'Failed'",
+            );
+            let mut args: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(name) = name {
+                sql.push_str(" AND name = ?");
+                args.push(rusqlite::types::Value::Text(name));
+            }
+            if let Some(since) = since_ms {
+                sql.push_str(" AND finished_at >= ?");
+                args.push(rusqlite::types::Value::Integer(since));
+            }
+            sql.push_str(" ORDER BY finished_at DESC LIMIT ?");
+            args.push(rusqlite::types::Value::Integer(limit));
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args), |r| {
+                Ok(FailureRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    attempts: r.get(2)?,
+                    finished_at: r.get(3)?,
+                    last_error: r.get(4)?,
+                    trace_id: r.get(5)?,
+                    execution_depth: r.get(6)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|error| match error {
+            ReaderError::Busy | ReaderError::Timeout | ReaderError::Unavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Durability;
+    use crate::reader::Reader;
+
+    fn state_for(db: Arc<DatabaseManager>, path: &str) -> AppState {
+        AppState {
+            db,
+            reader: Arc::new(Reader::from_env(path.to_string())),
+        }
+    }
+
     #[tokio::test]
     async fn readiness_fails_fast_under_contention_and_metrics_remain_available() {
         let db = Arc::new(DatabaseManager::new(":memory:").await.unwrap());
-        assert_eq!(ready(State(db.clone())).await.0, StatusCode::OK);
+        let app = state_for(db.clone(), ":memory:");
+        assert_eq!(ready(State(app.clone())).await.0, StatusCode::OK);
         let conn = db.get_shared_connection();
         let _guard = conn.lock().await;
         assert_eq!(
-            ready(State(db.clone())).await.0,
+            ready(State(app.clone())).await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert!(metrics(State(db))
+        assert!(metrics(State(app))
             .await
             .1
             .contains("# TYPE anvilmq_jobs gauge"));
+    }
+
+    #[tokio::test]
+    async fn failures_feed_filters_orders_and_caps() {
+        let path = std::env::temp_dir().join(format!("anvil-failfeed-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        // Seed a mix of Failed and Completed rows across names and finished_at values.
+        let seed: Vec<(String, String, String, i64, i64)> = vec![
+            ("f1".into(), "email".into(), "Failed".into(), 3, 100),
+            ("f2".into(), "email".into(), "Failed".into(), 5, 300),
+            ("f3".into(), "sms".into(), "Failed".into(), 2, 200),
+            ("c1".into(), "email".into(), "Completed".into(), 1, 400),
+        ];
+        {
+            let conn = db.get_shared_connection();
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                for (id, name, state, attempts, finished) in seed {
+                    conn.execute(
+                        "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, last_error) \
+                         VALUES (?1, ?2, ?3, 0, X'', NULL, 'trace', 0, ?4, 3, 0, ?5, 'boom')",
+                        rusqlite::params![id, name, state, attempts, finished],
+                    )
+                    .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        // No filters: only Failed rows, newest finished_at first.
+        let all = failures(
+            State(app.clone()),
+            Query(FailuresParams {
+                name: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            all.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec!["f2", "f3", "f1"]
+        );
+        assert!(all.iter().all(|r| r.name != "email" || r.id != "c1"));
+
+        // name filter.
+        let email = failures(
+            State(app.clone()),
+            Query(FailuresParams {
+                name: Some("email".into()),
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            email.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec!["f2", "f1"]
+        );
+
+        // since_ms lower bound (inclusive).
+        let recent = failures(
+            State(app.clone()),
+            Query(FailuresParams {
+                name: None,
+                since_ms: Some(200),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            recent.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec!["f2", "f3"]
+        );
+
+        // limit honored.
+        let limited = failures(
+            State(app.clone()),
+            Query(FailuresParams {
+                name: None,
+                since_ms: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "f2");
+
+        // Oversized limit clamps to the hard cap rather than erroring.
+        let capped = failures(
+            State(app.clone()),
+            Query(FailuresParams {
+                name: None,
+                since_ms: None,
+                limit: Some(50_000),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(capped.len(), 3);
+
+        // last_error is surfaced for drill-down.
+        assert_eq!(all[0].last_error.as_deref(), Some("boom"));
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn named_lifecycle_is_bounded_to_allowlist_and_renders_series() {

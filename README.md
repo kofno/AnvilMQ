@@ -123,9 +123,9 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Atomic lifecycle metrics, RPC latency histograms, and an axum Prometheus endpoint.
 - [x] Structured transition logs and health/readiness probes.
 - [x] Cached queue-pressure depth/age, claim-wait histograms, and Grafana dashboard/Prometheus alert examples. See [queue-pressure observability](docs/observability.md).
-- [ ] Read-only replica connection (WAL) with bounded concurrency and per-query timeouts for observability/search reads, isolated from the single-writer path so heavy reads never stall enqueue/claim/complete.
+- [x] Read-only replica connection (WAL) with bounded concurrency and per-query timeouts for observability/search reads, isolated from the single-writer path so heavy reads never stall enqueue/claim/complete.
 - [ ] Per-function overview panel (throughput, failure rate, and latency per job name) plus an all-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality.
-- [ ] Recent-failures feed endpoint and Grafana table showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
+- [x] Recent-failures feed endpoint and Grafana table showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
 - [ ] Read-only job/history search API served off the replica connection: structured/LIKE search first (no write-path cost, retention-bounded), then an opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
@@ -182,6 +182,14 @@ The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR
 - `GET /metrics`: Prometheus text exposition from in-memory atomics; no database access or storage locks during scrapes.
 - `GET /healthz`: HTTP 200 while the HTTP server is responsive; no database dependency.
 - `GET /readyz`: HTTP 200 after opening a database write transaction, reading the jobs table, and rolling back. Returns 503 for contention, database errors, or a one-second timeout. It deliberately fails fast if the shared connection is busy; use a failure threshold for deployment probes. A timed-out SQLite call can continue on its blocking thread, with subsequent probes failing fast until it releases the connection. This is an access check, not a disk durability or capacity test.
+- `GET /v1/failures`: Recent terminal (exhausted) failures from `job_history` as JSON, served read-only off the WAL replica connection and isolated from the single-writer path. Accepts `name`, `since_ms`, and `limit` query parameters. See [the recent-failures feed](docs/observability.md#recent-failures-feed) for the parameters and response shape.
+
+The read-only replica connection is configured with two environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ANVILMQ_READER_MAX_CONCURRENCY` | `4` | Maximum concurrent read-only connections for observability reads. Values below 1 (or unparsable) normalize to 1. |
+| `ANVILMQ_READER_TIMEOUT_MS` | `500` | Per-query wall-clock budget in milliseconds; a query exceeding it is interrupted and the request returns 503. |
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:9090/healthz

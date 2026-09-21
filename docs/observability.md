@@ -39,6 +39,46 @@ Sampling still costs O(live jobs) read/aggregation work and briefly holds a WAL 
 
 Cached ages advance at sample time, not scrape time. Independent atomic reads/writes may briefly mix adjacent samples, as with existing lifecycle gauges; this endpoint is not a transactional snapshot. Deadlines use wall time, so clock adjustments affect ages (negative values clamp to zero).
 
+## Recent failures feed
+
+`GET /v1/failures` returns recent terminal failures from `job_history` as a JSON array. Only exhausted failures reach `job_history`: a job that fails but still has retries left stays live in `jobs`, so this feed never shows in-flight retries — only failures that gave up, each with its `last_error`. This is the record-level drill-down (which job, which error) that the aggregate Prometheus counters cannot provide.
+
+The read runs on the isolated read-only WAL replica connection ([see the reader primitive](#read-only-replica-connection)); it opens a separate `SQLITE_OPEN_READ_ONLY` connection and never acquires the single-writer mutex, so the feed cannot stall enqueue/claim/complete. Concurrency and per-query time are bounded by `ANVILMQ_READER_MAX_CONCURRENCY` and `ANVILMQ_READER_TIMEOUT_MS`; a busy or timed-out read returns HTTP 503.
+
+Query parameters (all optional):
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | Restrict to one job name (exact match). |
+| `since_ms` | integer | Only rows with `finished_at >= since_ms` (inclusive). |
+| `limit` | integer | Page size; defaults to 100 and is hard-capped at 1000. |
+
+Rows are ordered by `finished_at` descending (newest first), backed by the `idx_history_name_state_finished` / `idx_history_state_finished` indexes. Each element has the shape:
+
+```json
+{
+  "id": "0f9c…",
+  "name": "email",
+  "attempts": 3,
+  "finished_at": 1727040000000,
+  "last_error": "connection refused",
+  "trace_id": "abc123",
+  "execution_depth": 0
+}
+```
+
+`last_error` and `trace_id` may be `null`. Example:
+
+```powershell
+(Invoke-WebRequest "http://127.0.0.1:9090/v1/failures?name=email&limit=50").Content
+```
+
+A Grafana table over this endpoint (via a JSON/Infinity datasource) is a follow-up; this ships the endpoint only.
+
+## Read-only replica connection
+
+Observability read endpoints (currently the recent-failures feed) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
+
 ## Dashboard and alerts
 
 1. Configure a Prometheus scrape target using [the example](../observability/prometheus.yaml). In Kubernetes, use the actual Service address and allow monitoring traffic through the chart's NetworkPolicy. This does not install a monitoring stack or a ServiceMonitor.

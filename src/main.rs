@@ -11,6 +11,7 @@ mod leases;
 mod lifecycle_tests;
 mod pressure;
 mod rate_limit;
+mod reader;
 mod retention;
 mod scheduling;
 mod telemetry;
@@ -336,12 +337,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.named = named;
     }
     let db_manager = Arc::new(manager);
+    // Isolated read-only WAL replica connection for observability reads (e.g. /v1/failures).
+    // Built before database_path is moved into pressure::spawn below.
+    let reader = Arc::new(reader::Reader::from_env(database_path.clone()));
     let sampler = pressure::spawn(database_path, db_manager.metrics.clone());
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9090".into())
         .parse()?;
     let http = axum::Server::try_bind(&http_addr)?
-        .serve(telemetry::router(db_manager.clone()).into_make_service());
+        .serve(telemetry::router(db_manager.clone(), reader.clone()).into_make_service());
     let recovery_db = db_manager.clone();
     let recovery = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
