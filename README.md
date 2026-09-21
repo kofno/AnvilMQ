@@ -123,6 +123,10 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Atomic lifecycle metrics, RPC latency histograms, and an axum Prometheus endpoint.
 - [x] Structured transition logs and health/readiness probes.
 - [x] Cached queue-pressure depth/age, claim-wait histograms, and Grafana dashboard/Prometheus alert examples. See [queue-pressure observability](docs/observability.md).
+- [ ] Read-only replica connection (WAL) with bounded concurrency and per-query timeouts for observability/search reads, isolated from the single-writer path so heavy reads never stall enqueue/claim/complete.
+- [ ] Per-function overview panel (throughput, failure rate, and latency per job name) plus an all-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality.
+- [ ] Recent-failures feed endpoint and Grafana table showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
+- [ ] Read-only job/history search API served off the replica connection: structured/LIKE search first (no write-path cost, retention-bounded), then an opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 
