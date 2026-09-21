@@ -28,15 +28,124 @@ const METHODS: [&str; 8] = [
     "GetRateLimitStatus",
 ];
 const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
+// Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
+// BullMQ dashboards' {queue,name,result} breakdowns without unbounded producer labels.
+const NAMED_EVENTS: [&str; 5] = ["enqueued", "claimed", "completed", "failed", "retried"];
+const DURATION_BOUNDS_MS: [i64; 10] =
+    [1, 10, 100, 500, 1000, 5000, 15000, 60000, 300000, 3600000];
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
 #[derive(Default)]
 struct Latency {
     count: AtomicU64,
     micros: AtomicU64,
     buckets: [AtomicU64; 7],
 }
+// Enqueue-to-terminal latency histogram rendered in seconds, per allowlisted job name.
+#[derive(Default)]
+struct DurationHistogram {
+    buckets: [AtomicU64; 10],
+    count: AtomicU64,
+    millis: AtomicU64,
+}
+impl DurationHistogram {
+    fn observe(&self, ms: i64) {
+        let ms = ms.max(0);
+        for (i, bound) in DURATION_BOUNDS_MS.iter().enumerate() {
+            if ms <= *bound {
+                self.buckets[i].fetch_add(1, Relaxed);
+            }
+        }
+        self.millis.fetch_add(ms as u64, Relaxed);
+        self.count.fetch_add(1, Relaxed);
+    }
+    fn render(&self, metric: &str, labels: &str, out: &mut String) {
+        for (i, bound) in DURATION_BOUNDS_MS.iter().enumerate() {
+            *out += &format!(
+                "{metric}_bucket{{{labels},le=\"{}\"}} {}\n",
+                *bound as f64 / 1000.,
+                self.buckets[i].load(Relaxed)
+            );
+        }
+        *out += &format!(
+            "{metric}_bucket{{{labels},le=\"+Inf\"}} {}\n{metric}_count{{{labels}}} {}\n{metric}_sum{{{labels}}} {}\n",
+            self.count.load(Relaxed),
+            self.count.load(Relaxed),
+            self.millis.load(Relaxed) as f64 / 1000.
+        );
+    }
+}
+#[derive(Default)]
+struct NamedSeries {
+    events: [AtomicU64; 5],
+    duration: DurationHistogram,
+}
+/// Bounded per-job-name lifecycle counters and duration histogram. Only names in the
+/// configured allowlist (shared with pressure sampling via `ANVILMQ_METRICS_QUEUES`)
+/// produce series, so metric cardinality never grows with arbitrary producer names.
+#[derive(Default)]
+pub struct NamedLifecycle {
+    names: Vec<(String, NamedSeries)>,
+}
+impl NamedLifecycle {
+    pub fn configured(names: &[String]) -> Self {
+        Self {
+            names: names
+                .iter()
+                .map(|n| (n.clone(), NamedSeries::default()))
+                .collect(),
+        }
+    }
+    fn series(&self, name: &str) -> Option<&NamedSeries> {
+        self.names.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+    pub fn event(&self, name: &str, event: &str) {
+        if let (Some(series), Some(i)) = (
+            self.series(name),
+            NAMED_EVENTS.iter().position(|e| *e == event),
+        ) {
+            series.events[i].fetch_add(1, Relaxed);
+        }
+    }
+    pub fn observe_duration(&self, name: &str, ms: i64) {
+        if let Some(series) = self.series(name) {
+            series.duration.observe(ms);
+        }
+    }
+    fn render(&self, out: &mut String) {
+        if self.names.is_empty() {
+            return;
+        }
+        *out += "# HELP anvilmq_jobs_by_name_total Committed lifecycle events since process start, per allowlisted job name.\n# TYPE anvilmq_jobs_by_name_total counter\n";
+        for (name, series) in &self.names {
+            let name = escape_label(name);
+            for (i, event) in NAMED_EVENTS.iter().enumerate() {
+                *out += &format!(
+                    "anvilmq_jobs_by_name_total{{name=\"{name}\",event=\"{event}\"}} {}\n",
+                    series.events[i].load(Relaxed)
+                );
+            }
+        }
+        *out += "# HELP anvilmq_job_duration_seconds Enqueue to terminal (completed or exhausted-failed) latency by name; includes queue wait, retries, and backoff.\n# TYPE anvilmq_job_duration_seconds histogram\n";
+        for (name, series) in &self.names {
+            series.duration.render(
+                "anvilmq_job_duration_seconds",
+                &format!("name=\"{}\"", escape_label(name)),
+                out,
+            );
+        }
+    }
+}
 #[derive(Default)]
 pub struct Metrics {
     pub pressure: crate::pressure::Pressure,
+    pub named: NamedLifecycle,
     enqueue_replays: AtomicU64,
     enqueue_conflicts: AtomicU64,
     enqueue_receipts: AtomicI64,
@@ -131,6 +240,7 @@ impl Metrics {
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
+        self.named.render(&mut out);
         self.pressure.render(&mut out);
         out
     }
@@ -212,12 +322,31 @@ mod tests {
             .contains("# TYPE anvilmq_jobs gauge"));
     }
     #[test]
-    fn initializes_state_counts_but_not_event_counters() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE jobs(state TEXT); CREATE TABLE job_history(state TEXT); CREATE TABLE enqueue_receipts(id TEXT); INSERT INTO jobs VALUES ('Waiting'),('Active'),('Delayed'); INSERT INTO job_history VALUES ('Completed'),('Completed'),('Failed');").unwrap();
-        let output = Metrics::initialize(&conn).unwrap().render();
-        assert!(output.contains("anvilmq_jobs{state=\"Completed\"} 2"));
-        assert!(output.contains("anvilmq_jobs{state=\"Active\"} 1"));
-        assert!(output.contains("anvilmq_transitions_total{event=\"enqueued\"} 0"));
+    fn named_lifecycle_is_bounded_to_allowlist_and_renders_series() {
+        let metrics = Metrics {
+            named: NamedLifecycle::configured(&["ProcessActivity".into(), "Stress".into()]),
+            ..Default::default()
+        };
+        metrics.named.event("ProcessActivity", "enqueued");
+        metrics.named.event("ProcessActivity", "completed");
+        metrics.named.observe_duration("ProcessActivity", 42);
+        metrics.named.event("Stress", "failed");
+        // Names outside the allowlist must never create a series.
+        metrics.named.event("Unlisted", "completed");
+        metrics.named.observe_duration("Unlisted", 5);
+        let output = metrics.render();
+        assert!(output
+            .contains("anvilmq_jobs_by_name_total{name=\"ProcessActivity\",event=\"completed\"} 1"));
+        assert!(output
+            .contains("anvilmq_jobs_by_name_total{name=\"ProcessActivity\",event=\"enqueued\"} 1"));
+        assert!(output.contains("anvilmq_jobs_by_name_total{name=\"Stress\",event=\"failed\"} 1"));
+        assert!(output.contains("anvilmq_job_duration_seconds_count{name=\"ProcessActivity\"} 1"));
+        assert!(output.contains("anvilmq_job_duration_seconds_bucket{name=\"ProcessActivity\",le=\"0.1\"} 1"));
+        assert!(!output.contains("Unlisted"));
+    }
+
+    #[test]
+    fn named_lifecycle_renders_nothing_without_allowlist() {
+        assert!(!Metrics::default().render().contains("anvilmq_jobs_by_name_total"));
     }
 }

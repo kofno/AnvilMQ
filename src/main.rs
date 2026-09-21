@@ -137,6 +137,7 @@ impl QueueService for MyQueueService {
             tx.commit()?;
             if throttled { metrics.throttled(); }
             metrics.transition(Some(&prior_state), "Active", "claimed");
+            metrics.named.event(&job.name, "claimed");
             metrics.pressure.claimed(created_at, available_at, now, job.attempts);
             tracing::info!(job_id = %job.id, worker_id = %req.worker_id, attempt = job.attempts, from = %prior_state, to = "Active", "job transition");
             Ok(job)
@@ -235,10 +236,10 @@ impl MyQueueService {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(internal)?;
             let job = tx.query_row(
-                "SELECT state, worker_id, attempts, max_attempts FROM jobs WHERE id = ?1", [&id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?)),
+                "SELECT state, worker_id, attempts, max_attempts, name, created_at FROM jobs WHERE id = ?1", [&id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?)),
             ).optional().map_err(internal)?;
-            let Some((state, owner, attempts, max_attempts)) = job else {
+            let Some((state, owner, attempts, max_attempts, name, created_at)) = job else {
                 let archived = tx.query_row("SELECT state, worker_id, attempts FROM job_history WHERE id = ?1", [&id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?))).optional().map_err(internal)?;
                 if let Some((state, owner, attempts)) = archived {
@@ -293,7 +294,13 @@ impl MyQueueService {
             }
             tx.commit().map_err(internal)?;
             metrics.transition(Some("Active"), next_state, if failed { "failed" } else { "completed" });
-            if failed && attempts < max_attempts { metrics.event("retried"); }
+            if failed && attempts < max_attempts {
+                metrics.event("retried");
+                metrics.named.event(&name, "retried");
+            } else {
+                metrics.named.event(&name, if failed { "failed" } else { "completed" });
+                metrics.named.observe_duration(&name, now.saturating_sub(created_at));
+            }
             tracing::info!(job_id = %id, worker_id = %worker_id, attempt = attempts, from = "Active", to = next_state, "job transition");
             Ok(failed && attempts >= max_attempts)
         }).await.map_err(|e| Status::internal(e.to_string()))?
@@ -321,9 +328,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &std::env::var("ANVILMQ_METRICS_QUEUES").unwrap_or_default(),
     )?;
     let mut manager = DatabaseManager::with_durability(&database_path, durability).await?;
-    Arc::get_mut(&mut manager.metrics)
-        .expect("metrics not yet shared")
-        .pressure = pressure;
+    let named = telemetry::NamedLifecycle::configured(&pressure.queue_names());
+    {
+        let metrics = Arc::get_mut(&mut manager.metrics).expect("metrics not yet shared");
+        metrics.pressure = pressure;
+        metrics.named = named;
+    }
     let db_manager = Arc::new(manager);
     let sampler = pressure::spawn(database_path, db_manager.metrics.clone());
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
