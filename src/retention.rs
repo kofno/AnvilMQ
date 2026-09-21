@@ -33,7 +33,7 @@ pub struct RetentionConfig {
 
 impl Default for RetentionConfig {
     fn default() -> Self {
-        // Defaults mirror stat's BullMQ defaultWorkerOpts:
+        // Defaults mirror the BullMQ system AnvilMQ replaces:
         // removeOnComplete { age: 24h, count: 1000 }, removeOnFail { age: 7d }.
         Self {
             completed_age_ms: 86_400_000,
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_stat_bullmq_retention() {
+    fn defaults_match_bullmq_retention() {
         let d = RetentionConfig::default();
         assert_eq!(d.completed_age_ms, 86_400_000);
         assert_eq!(d.completed_count, 1_000);
