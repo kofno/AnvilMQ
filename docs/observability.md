@@ -43,7 +43,10 @@ Cached ages advance at sample time, not scrape time. Independent atomic reads/wr
 
 1. Configure a Prometheus scrape target using [the example](../observability/prometheus.yaml). In Kubernetes, use the actual Service address and allow monitoring traffic through the chart's NetworkPolicy. This does not install a monitoring stack or a ServiceMonitor.
 2. Load [alerts.yaml](../observability/alerts.yaml) through Prometheus `rule_files` (or adapt the group into your existing PrometheusRule deployment).
-3. Import [anvilmq-dashboard.json](../observability/anvilmq-dashboard.json) into Grafana and select a Prometheus data source and broker instance.
+3. Import [anvilmq-dashboard.json](../charts/anvilmq/dashboards/anvilmq-dashboard.json) into Grafana and select a Prometheus data source and broker instance.
+4. Import [anvilmq-functions.json](../charts/anvilmq/dashboards/anvilmq-functions.json) into Grafana and select a Prometheus data source. This per-function view (uid `anvilmq-functions`) covers only allowlisted job names (`ANVILMQ_METRICS_QUEUES`): a per-function throughput/failure-rate/p95-latency overview table, a recently-failed-functions table (terminal failures over the selected range, retries excluded), and a failures-over-time-by-function bars panel. Per-failure error messages and payloads are not shown; that drill-down depends on the read-only history query API tracked as a Phase 6 roadmap item.
+
+Both dashboards live in `charts/anvilmq/dashboards/`. The Helm chart can auto-provision them through the Grafana dashboard sidecar (kube-prometheus-stack convention): set `dashboards.enabled=true` to emit a labelled ConfigMap that the sidecar imports. See `charts/anvilmq/values.yaml` for the label, folder, and namespace overrides.
 
 The dashboard separates backlog, per-queue due age, arrivals/completions/retries, p95/p99 timing, throttled polls, lease recovery, RPC latency, and sample health. Empty histogram windows can show no data; do not interpret this as zero latency. Alert thresholds are initial examples, not a workload SLO: tune the 60-second age threshold and one-job/second growth threshold against real jobs. Keep your existing scrape-target-down, PVC free-space, and node/storage alerts; stale-metric rules cannot detect a target that disappears entirely.
 
