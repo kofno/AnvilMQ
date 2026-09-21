@@ -90,6 +90,9 @@ impl Pressure {
             ..Self::default()
         })
     }
+    pub fn queue_names(&self) -> Vec<String> {
+        self.queues.iter().map(|(name, _)| name.clone()).collect()
+    }
     pub fn claimed(&self, created: i64, available: i64, now: i64, attempt: u32) {
         if attempt == 1 {
             self.first_claim.observe(now.saturating_sub(created));

@@ -60,11 +60,11 @@ pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> 
         let now = now_ms(&tx)?;
         // Bound each transaction so a large expired backlog cannot monopolize the writer.
         let jobs = {
-            let mut statement = tx.prepare("SELECT id, attempts, max_attempts, retry_backoff_ms, retry_backoff_max_ms FROM jobs WHERE state = 'Active' AND lease_expires_at_ms <= ?1 ORDER BY lease_expires_at_ms, id LIMIT 100")?;
-            let rows = statement.query_map([now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?;
+            let mut statement = tx.prepare("SELECT id, attempts, max_attempts, retry_backoff_ms, retry_backoff_max_ms, name, created_at FROM jobs WHERE state = 'Active' AND lease_expires_at_ms <= ?1 ORDER BY lease_expires_at_ms, id LIMIT 100")?;
+            let rows = statement.query_map([now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (id, attempts, max_attempts, base, cap) in &jobs {
+        for (id, attempts, max_attempts, base, cap, _name, _created_at) in &jobs {
             if attempts < max_attempts {
                 let delay = crate::scheduling::retry_delay(*base, *cap, *attempts);
                 tx.execute("UPDATE jobs SET state = ?3, available_at = ?4, worker_id = NULL, lease_expires_at_ms = NULL, last_error = 'Worker lease expired', updated_at = ?1 WHERE id = ?2", rusqlite::params![now, id, if delay == 0 { "Waiting" } else { "Delayed" }, now.saturating_add(delay)])?;
@@ -75,11 +75,17 @@ pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> 
             }
         }
         tx.commit()?;
-        for (id, attempts, max_attempts, base, cap) in &jobs {
+        for (id, attempts, max_attempts, base, cap, name, created_at) in &jobs {
             let retry = attempts < max_attempts;
             let to = if !retry { "Failed" } else if crate::scheduling::retry_delay(*base, *cap, *attempts) == 0 { "Waiting" } else { "Delayed" };
             metrics.transition(Some("Active"), to, "lease_expired");
-            if retry { metrics.event("retried"); }
+            if retry {
+                metrics.event("retried");
+                metrics.named.event(name, "retried");
+            } else {
+                metrics.named.event(name, "failed");
+                metrics.named.observe_duration(name, now.saturating_sub(*created_at));
+            }
             tracing::info!(job_id = %id, attempt = attempts, from = "Active", to, reason = "lease_expired", "job transition");
         }
         Ok(jobs.len())

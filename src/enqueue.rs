@@ -85,6 +85,7 @@ pub async fn enqueue(
         tx.commit().map_err(internal)?;
         if receipt_request.is_some() { metrics.enqueue_receipt_created(); }
         metrics.transition(None, state, "enqueued");
+        metrics.named.event(&req.name, "enqueued");
         tracing::info!(job_id = %id, attempt = 0, to = state, "job transition");
         Ok(AddJobResponse { id, state: state.into(), replayed: false })
     }).await.map_err(|error| Status::internal(error.to_string()))?
