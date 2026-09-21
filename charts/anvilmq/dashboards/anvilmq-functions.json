@@ -16,7 +16,7 @@
     {
       "id": 1,
       "title": "Per-function overview",
-      "description": "Inngest-style function list. One row per allowlisted job name (ANVILMQ_METRICS_QUEUES). Failure rate is terminal failures divided by terminal outcomes over 5m; retries are excluded. Sorted by failure rate.",
+      "description": "Per-function overview. One row per allowlisted job name (ANVILMQ_METRICS_QUEUES). Failure rate is terminal failures divided by terminal outcomes over 5m; retries are excluded. Sorted by failure rate.",
       "type": "table",
       "datasource": {
         "type": "prometheus",
