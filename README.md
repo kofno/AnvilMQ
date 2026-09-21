@@ -162,6 +162,15 @@ Terminal jobs are copied into `job_history` and keyed enqueues leave dedup recor
 
 Space is reclaimed by SQLite page reuse at steady state; the sweeper does not run `VACUUM`, which would lock the writer. The `anvilmq_jobs{state}` gauges for terminal states flatten once retention keeps pace with completion throughput.
 
+### Tuning batch and interval
+
+The sweeper shares the single writer connection with every enqueue, claim, and complete, so a sweep tick briefly serializes against the hot path. Two knobs govern the trade-off:
+
+- **Drain capacity** is roughly `ANVILMQ_RETENTION_BATCH / (ANVILMQ_RETENTION_INTERVAL_MS / 1000)` rows per second. If sustained completion throughput exceeds this, terminal history keeps growing even with the sweeper running — the bounded batch protects the writer but caps how fast the backlog drains. Size capacity to comfortably exceed peak completion rate. For example, the defaults (`1000` per `60000` ms) sustain ~16 completions/sec; a broker retiring 100 jobs/sec needs a larger batch or shorter interval.
+- **Latency profile** is set by batch size. Each tick deletes up to `ANVILMQ_RETENTION_BATCH` rows inside one transaction while holding the writer, so a large batch drains faster but produces deeper, spikier stalls on concurrent enqueue/claim latency. Smaller batches run more often on a shorter interval give the same drain capacity with smoother latency. Prefer a batch sized just above peak completion throughput over an oversized one.
+
+The `idx_history_state_finished` and `idx_history_name_state_finished` indexes keep each delete cheap (shorter holds), at the cost of minor index maintenance on the completion write path. Deletes run on the blocking thread pool, so they never starve the async runtime — the writer lock is the only contention point.
+
 ## Observability
 
 The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR`. A bind failure stops startup. These endpoints are unauthenticated; expose them only on a trusted network.
