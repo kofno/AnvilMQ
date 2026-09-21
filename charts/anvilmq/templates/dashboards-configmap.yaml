@@ -1,0 +1,24 @@
+{{- if .Values.dashboards.enabled -}}
+{{- $label := .Values.dashboards.label | default "grafana_dashboard" -}}
+{{- $value := .Values.dashboards.value | default "1" -}}
+{{- $folder := .Values.dashboards.folder -}}
+{{- $namespace := .Values.dashboards.namespace | default .Release.Namespace -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "anvilmq.name" . }}-dashboards
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "anvilmq.labels" . | nindent 4 }}
+    {{ $label }}: {{ $value | quote }}
+  {{- if $folder }}
+  annotations:
+    grafana_dashboard_folder: {{ $folder | quote }}
+    k8s-sidecar-target-directory: {{ printf "/tmp/dashboards/%s" $folder | quote }}
+  {{- end }}
+data:
+  {{- range $path, $bytes := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+{{- end }}

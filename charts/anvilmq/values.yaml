@@ -31,3 +31,16 @@ networkPolicy:
     - podSelector:
         matchLabels:
           anvilmq-client: "true"
+# Auto-provision the bundled Grafana dashboards via the Grafana dashboard sidecar
+# (kube-prometheus-stack convention). Disabled by default; the JSON is always
+# importable by hand from charts/anvilmq/dashboards/.
+dashboards:
+  enabled: false
+  # Sidecar discovery label. The default matches kube-prometheus-stack's sidecar.
+  label: grafana_dashboard
+  value: "1"
+  # Optional Grafana folder to file the dashboards under (empty = General).
+  folder: ""
+  # Namespace for the ConfigMap; empty uses the release namespace. The Grafana
+  # sidecar must be allowed to watch this namespace.
+  namespace: ""
