@@ -98,6 +98,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Immediate retries up to the attempt limit and stale-acknowledgment protection.
 - [x] Persisted worker leases, heartbeat renewal, and abandoned-job recovery.
 - [x] Retry backoff and persisted delayed scheduling.
+- [x] Background retention sweep bounding job history and idempotency receipts (age + per-name count), matching the replaced BullMQ deployment's `removeOnComplete`/`removeOnFail` policy.
 - [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. Not BullMQ-compatible.
 
 ### Phase 3: Safety controls

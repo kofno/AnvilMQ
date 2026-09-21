@@ -1,6 +1,6 @@
 # Queue pressure
 
-`/metrics` now exposes cached backlog depth/age and committed claim timing in addition to the existing lifecycle counters, RPC latency, throttling, recovery, and idempotency metrics.
+`/metrics` now exposes cached backlog depth/age and committed claim timing in addition to the existing lifecycle counters, RPC latency, throttling, recovery, retention, and idempotency metrics.
 
 ## Enable named queues
 
