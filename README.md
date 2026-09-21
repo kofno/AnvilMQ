@@ -148,6 +148,19 @@ limits.close();
 
 `anvilmq_throttled_polls_total` counts committed polls that encounter at least one due, queue-matching throttled job, even if another job is dispatched. It has no tenant/facet labels and does not count rejected jobs individually. The three administrative RPCs also have bounded latency labels.
 
+## Retention
+
+Terminal jobs are copied into `job_history` and keyed enqueues leave dedup records in `enqueue_receipts`. Both are pruned by a background sweeper so on-disk state reaches a steady size instead of growing without bound. Defaults mirror the BullMQ deployment this replaces (`removeOnComplete { age: 24h, count: 1000 }`, `removeOnFail { age: 7d }`).
+
+- Completed jobs older than `ANVILMQ_RETENTION_COMPLETED_AGE_MS` (default `86400000`, 24h) are deleted; `0` disables age pruning.
+- At most `ANVILMQ_RETENTION_COMPLETED_COUNT` completed jobs are kept per job name, newest first (default `1000`); `0` disables count pruning.
+- Failed jobs older than `ANVILMQ_RETENTION_FAILED_AGE_MS` (default `604800000`, 7d) are deleted; `ANVILMQ_RETENTION_FAILED_COUNT` (default `0`, disabled) bounds retained failures per name.
+- The sweep runs every `ANVILMQ_RETENTION_INTERVAL_MS` (default `60000`) and deletes at most `ANVILMQ_RETENTION_BATCH` rows per statement (default `1000`), draining backlogs across ticks so the shared writer is never held for long.
+- An idempotency receipt is removed once its job is gone from both the live and history tables, so the dedup window tracks job retention exactly.
+- Age values below a safety floor (`2 x` the 30s lease) are rejected at startup so a terminal job cannot be pruned while a duplicate lifecycle RPC is still replaying against history. Set every dimension to `0` to disable the sweeper entirely.
+
+Space is reclaimed by SQLite page reuse at steady state; the sweeper does not run `VACUUM`, which would lock the writer. The `anvilmq_jobs{state}` gauges for terminal states flatten once retention keeps pace with completion throughput.
+
 ## Observability
 
 The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR`. A bind failure stops startup. These endpoints are unauthenticated; expose them only on a trusted network.
@@ -170,6 +183,8 @@ Metrics have only fixed state, event, method, and histogram-bound labels:
 | `anvilmq_transitions_total{event}` | Committed enqueued, claimed, completed, failed, retried, and lease_expired events since startup |
 | `anvilmq_rpc_duration_seconds{method}` | Histogram with `_bucket`, `_sum`, `_count`; handler latency includes validation failures and database waits, excludes network transport |
 | `anvilmq_recovery_errors_total` | Recovery batches that failed and will be retried |
+| `anvilmq_retention_deleted_total{target,reason}` | History/receipt rows pruned by the retention sweeper; `target` is completed, failed, or receipt and `reason` is age, count, or orphan |
+| `anvilmq_retention_errors_total` | Retention sweep batches that failed and will be retried |
 | `anvilmq_enqueue_replays_total` | Matching keyed enqueue retries since startup; rising rates can indicate lost responses or producer retry pressure |
 | `anvilmq_enqueue_conflicts_total` | Key reuse with different request contents since startup; investigate producer identity/serialization mistakes |
 | `anvilmq_enqueue_receipts` | Retained idempotency records, initialized from storage; monitor alongside PVC usage |

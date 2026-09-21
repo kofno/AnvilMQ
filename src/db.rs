@@ -294,6 +294,16 @@ impl DatabaseManager {
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedulable ON jobs(priority, created_at, id, available_at) WHERE state IN ('Waiting', 'Delayed')", [])?;
         // Keep periodic pressure scans away from payload pages; adds write/storage cost.
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pressure ON jobs(name, state, available_at, created_at, lease_expires_at_ms)", [])?;
+        // Retention sweeps: age prune scans (state, finished_at) oldest-first; per-name count
+        // prune partitions by name and orders finished_at DESC. Both avoid payload pages.
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_state_finished ON job_history(state, finished_at)",
+            [],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_name_state_finished ON job_history(name, state, finished_at DESC)",
+            [],
+        )?;
         tx.commit()?;
         tracing::info!("Database migrations completed successfully");
         Ok(())
