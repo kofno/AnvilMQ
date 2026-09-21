@@ -32,6 +32,9 @@ const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // BullMQ dashboards' {queue,name,result} breakdowns without unbounded producer labels.
 const NAMED_EVENTS: [&str; 5] = ["enqueued", "claimed", "completed", "failed", "retried"];
 const DURATION_BOUNDS_MS: [i64; 10] = [1, 10, 100, 500, 1000, 5000, 15000, 60000, 300000, 3600000];
+// Retention sweeper deletion counters. Bounded cardinality: 3 targets x 3 reasons.
+const RETENTION_TARGETS: [&str; 3] = ["completed", "failed", "receipt"];
+const RETENTION_REASONS: [&str; 3] = ["age", "count", "orphan"];
 
 fn escape_label(value: &str) -> String {
     value
@@ -153,6 +156,8 @@ pub struct Metrics {
     events: [AtomicU64; 6],
     latency: [Latency; 8],
     pub recovery_errors: AtomicU64,
+    retention_deleted: [[AtomicU64; 3]; 3],
+    retention_errors: AtomicU64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -205,6 +210,38 @@ impl Metrics {
     pub fn enqueue_receipt_created(&self) {
         self.enqueue_receipts.fetch_add(1, Relaxed);
     }
+    /// Records `n` retention deletions and decrements the matching level gauge so
+    /// `anvilmq_jobs{state}` / `anvilmq_enqueue_receipts` flatten as history is pruned.
+    pub fn retention_deleted(&self, target: &str, reason: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let (Some(t), Some(r)) = (
+            RETENTION_TARGETS.iter().position(|v| *v == target),
+            RETENTION_REASONS.iter().position(|v| *v == reason),
+        ) {
+            self.retention_deleted[t][r].fetch_add(n, Relaxed);
+        }
+        match target {
+            "completed" => {
+                if let Some(i) = STATES.iter().position(|s| *s == "Completed") {
+                    self.states[i].fetch_sub(n as i64, Relaxed);
+                }
+            }
+            "failed" => {
+                if let Some(i) = STATES.iter().position(|s| *s == "Failed") {
+                    self.states[i].fetch_sub(n as i64, Relaxed);
+                }
+            }
+            "receipt" => {
+                self.enqueue_receipts.fetch_sub(n as i64, Relaxed);
+            }
+            _ => {}
+        }
+    }
+    pub fn retention_error(&self) {
+        self.retention_errors.fetch_add(1, Relaxed);
+    }
     pub fn render(&self) -> String {
         let mut out = String::from("# HELP anvilmq_jobs Persisted jobs by state including retained history.\n# TYPE anvilmq_jobs gauge\n");
         for (i, state) in STATES.iter().enumerate() {
@@ -236,6 +273,20 @@ impl Metrics {
         out += &format!(
             "anvilmq_recovery_errors_total {}\n",
             self.recovery_errors.load(Relaxed)
+        );
+        out += "# HELP anvilmq_retention_deleted_total History and receipt rows pruned by the retention sweeper.\n# TYPE anvilmq_retention_deleted_total counter\n";
+        for (t, target) in RETENTION_TARGETS.iter().enumerate() {
+            for (r, reason) in RETENTION_REASONS.iter().enumerate() {
+                out += &format!(
+                    "anvilmq_retention_deleted_total{{target=\"{target}\",reason=\"{reason}\"}} {}\n",
+                    self.retention_deleted[t][r].load(Relaxed)
+                );
+            }
+        }
+        out += "# HELP anvilmq_retention_errors_total Failed retention sweep batches.\n# TYPE anvilmq_retention_errors_total counter\n";
+        out += &format!(
+            "anvilmq_retention_errors_total {}\n",
+            self.retention_errors.load(Relaxed)
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));

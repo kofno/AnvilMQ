@@ -16,6 +16,8 @@ The script builds a release Rust broker and a separate Bun runner, then:
 
 This tests process-crash persistence of acknowledged waiting jobs. It does **not** simulate power loss, crashes during arbitrary transactions, or active-lease recovery. The existing client integration test covers killed-worker recovery. This smoke runner is not a throughput benchmark; reported elapsed times include polling and deliberate delays.
 
+The `smoke` job in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs this script under `pwsh` on every pull request and push to `main`, uploading `harness/artifacts` as a build artifact. It gates merges on the broker building and passing the crash-recovery flow.
+
 ## Isolation and results
 
 Default project: `anvilmq-harness`. Use `./harness/smoke.ps1 -Project another-name` for a separate volume/container namespace. Host ports still need separate configuration for simultaneous projects. Do not run concurrent harness scenarios against the same broker: completion gauge checks assume a dedicated instance. Queue names are unique per run, so sequential smoke runs are supported.

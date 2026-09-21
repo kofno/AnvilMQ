@@ -11,6 +11,7 @@ mod leases;
 mod lifecycle_tests;
 mod pressure;
 mod rate_limit;
+mod retention;
 mod scheduling;
 mod telemetry;
 use db::DatabaseManager;
@@ -361,6 +362,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let retention_cfg = retention::RetentionConfig::from_env().map_err(std::io::Error::other)?;
+    let retention = if retention_cfg.enabled() {
+        tracing::info!(?retention_cfg, "retention sweeper enabled");
+        let retention_db = db_manager.clone();
+        Some(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(retention_cfg.interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match retention::sweep(retention_db.clone(), retention_cfg.clone()).await {
+                    Ok(outcome) if outcome.total() > 0 => {
+                        tracing::info!(pruned = outcome.total(), ?outcome, "retention sweep")
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        retention_db.metrics.retention_error();
+                        tracing::error!(%error, "retention sweep failed; retrying next tick");
+                    }
+                }
+            }
+        }))
+    } else {
+        tracing::info!("retention sweeper disabled");
+        None
+    };
+
     let addr = std::env::var("ANVILMQ_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".into())
         .parse()?;
@@ -377,6 +405,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result: Result<(), Box<dyn std::error::Error>> = tokio::select! { result = grpc => result.map_err(Into::into), result = http => result.map_err(Into::into) };
     recovery.abort();
     sampler.abort();
+    if let Some(retention) = retention {
+        retention.abort();
+    }
     result?;
 
     Ok(())
