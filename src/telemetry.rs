@@ -1815,6 +1815,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fts_prefix_wildcard_matches_stem_but_exact_is_unchanged() {
+        let path = std::env::temp_dir().join(format!("anvil-fts-pre-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![
+                ("job-up", "upstream", "Failed", "trace-1", None, 10, 100),
+                ("job-down", "downstream", "Failed", "trace-2", None, 20, 200),
+            ],
+        )
+        .await;
+        db.enable_fts(crate::fts::DEFAULT_BACKFILL_BATCH)
+            .await
+            .unwrap();
+        let app = state_for_fts(db.clone(), path.to_str().unwrap());
+
+        // An explicit trailing `*` runs a prefix query and reaches the `upstream` row.
+        assert_eq!(ids(&search_q(&app, "upstrea*").await), vec!["job-up"]);
+        // The exact token still matches only the whole token.
+        assert_eq!(ids(&search_q(&app, "upstream").await), vec!["job-up"]);
+        // Regression guard: the same stem WITHOUT a `*` is a literal token and matches nothing.
+        assert!(search_q(&app, "upstrea").await.is_empty());
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn search_falls_back_to_like_when_fts_disabled() {
         let path = std::env::temp_dir().join(format!("anvil-fts-off-{}.db", uuid::Uuid::new_v4()));
         let db = Arc::new(
