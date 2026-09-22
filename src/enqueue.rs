@@ -33,12 +33,16 @@ pub async fn enqueue(
         req.max_attempts = 3;
     }
     let metadata = req.metadata.get_or_insert_default();
+    // Fast-path reject on the supplied depth. This is only a cheap pre-check; the
+    // authoritative circuit-breaker guard runs post-derivation inside the transaction,
+    // because children now send 0 and let the server derive the real depth.
     if metadata.execution_depth > service.max_execution_depth {
         return Err(Status::resource_exhausted(format!(
             "Circuit breaker tripped: execution depth {} exceeds max allowed {}",
             metadata.execution_depth, service.max_execution_depth
         )));
     }
+    let max_execution_depth = service.max_execution_depth;
     // Compare normalized input, before generating IDs/timestamps. Exact bytes avoid
     // hash collisions and make changes to payload OR scheduling/ownership options conflicts.
     let receipt_request = if req.idempotency_key.is_empty() {
@@ -77,7 +81,10 @@ pub async fn enqueue(
         // Ancestry validation only kicks in when a parent is claimed; parentless enqueues
         // keep their historical behavior (backward compatible). Parent lookups are PK point
         // reads across the live and history tables, so they stay cheap on the hot path.
-        let trace_id = if let Some(parent) = parent_id.as_deref() {
+        // When a parent is present the server OWNS the lineage facts: the child's
+        // execution_depth is derived from the parent (supplied 0 => derive), and the
+        // trace_id is inherited authoritatively.
+        let (effective_depth, trace_id) = if let Some(parent) = parent_id.as_deref() {
             let parent_row = tx.query_row(
                 "SELECT execution_depth, trace_id FROM jobs WHERE id = ?1
                  UNION ALL SELECT execution_depth, trace_id FROM job_history WHERE id = ?1 LIMIT 1",
@@ -87,17 +94,37 @@ pub async fn enqueue(
                 tracing::warn!(parent_id = %parent, "enqueue rejected: parent not found");
                 return Err(Status::failed_precondition(format!("ancestry: parent {parent} not found")));
             };
-            if i64::from(metadata.execution_depth) != parent_depth + 1 {
+            let derived_depth = parent_depth + 1;
+            // Derive-when-unset, validate-when-provided: a supplied 0 is a safe sentinel
+            // because any job WITH a parent has depth >= 1, so the server fills it in.
+            let effective_depth = if metadata.execution_depth == 0 {
+                derived_depth
+            } else if i64::from(metadata.execution_depth) == derived_depth {
+                i64::from(metadata.execution_depth)
+            } else {
                 metrics.ancestry_rejection();
                 tracing::warn!(parent_id = %parent, execution_depth = metadata.execution_depth, parent_depth, "enqueue rejected: inconsistent execution depth");
                 return Err(Status::invalid_argument(format!(
                     "ancestry: execution_depth {} must equal parent depth + 1 ({})",
-                    metadata.execution_depth, parent_depth + 1)));
-            }
+                    metadata.execution_depth, derived_depth)));
+            };
             // Inherit the parent's lineage id authoritatively so a spoofed/absent trace_id
             // cannot evade the per-lineage quarantine below.
-            parent_trace
-        } else if metadata.trace_id.is_empty() { uuid::Uuid::new_v4().to_string() } else { metadata.trace_id };
+            (effective_depth, parent_trace)
+        } else {
+            let trace_id = if metadata.trace_id.is_empty() { uuid::Uuid::new_v4().to_string() } else { metadata.trace_id.clone() };
+            (i64::from(metadata.execution_depth), trace_id)
+        };
+        // Authoritative circuit-breaker guard on the DERIVED depth. Children send 0 and
+        // let the server derive, so this post-derivation check (not the cheap pre-tx one)
+        // is the real recursion breaker.
+        if effective_depth > i64::from(max_execution_depth) {
+            metrics.ancestry_rejection();
+            tracing::warn!(execution_depth = effective_depth, max_execution_depth, "enqueue rejected: circuit breaker tripped");
+            return Err(Status::resource_exhausted(format!(
+                "Circuit breaker tripped: execution depth {effective_depth} exceeds max allowed {max_execution_depth}"
+            )));
+        }
         // Runaway-chain quarantine: bound total jobs per lineage. Disabled (and zero-cost)
         // when the cap is 0. Read + upsert are PK operations on chain_counters.
         if max_chain_size > 0 {
@@ -115,7 +142,7 @@ pub async fn enqueue(
         tx.execute("INSERT INTO jobs (id, name, state, priority, payload, parent_id, trace_id, execution_depth, max_attempts, created_at, updated_at, rate_limit_facet, available_at, retry_backoff_ms, retry_backoff_max_ms)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![id, req.name, state, req.priority, req.payload,
-                parent_id, trace_id, metadata.execution_depth,
+                parent_id, trace_id, effective_depth,
                 req.max_attempts, now, if req.rate_limit_facet.is_empty() { None } else { Some(req.rate_limit_facet) }, available_at, req.retry_backoff_ms, req.retry_backoff_max_ms]).map_err(internal)?;
         if let Some(original) = receipt_request.as_ref() {
             tx.execute("INSERT INTO enqueue_receipts(queue_name, idempotency_key, request, job_id, initial_state, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",

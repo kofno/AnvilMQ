@@ -20,11 +20,46 @@ export interface AddOptions {
   metadata?: Partial<JobMetadata>; rateLimitFacet?: string;
   idempotencyKey?: string;
 }
+/** Options for {@link Job.enqueueChild}: everything except the lineage fields, which
+ * the server owns (parent is forced to the current job; depth/trace are derived). */
+export type ChildAddOptions = Omit<AddOptions, "metadata">;
 export interface Job<T> {
   id: string; name: string; data: T; attempts: number;
   metadata: JobMetadata; leaseExpiresAtMs: number;
+  /**
+   * Enqueue a child of this job over the worker's existing connection. Parentage is
+   * built-in: `parentId` is forced to this job's id and the server derives the child's
+   * `executionDepth` (parent depth + 1) and inherits the lineage `traceId`. Lineage
+   * fields cannot be set by the caller.
+   */
+  enqueueChild<C = unknown>(name: string, data: C, options?: ChildAddOptions): Promise<{ id: string; state: string; replayed: boolean }>;
 }
 interface Claim { found: boolean; id: string; name: string; payload: Buffer; attempts: number; metadata: JobMetadata; leaseExpiresAtMs: number }
+
+/** Validates options, freezes the request, and sends AddJob with idempotency-safe
+ * retries over the given connection. Shared by {@link Queue.add} and
+ * {@link Job.enqueueChild} so both behave identically regardless of the channel used. */
+async function sendAdd<T>(connection: Connection, name: string, data: T, options: AddOptions = {}): Promise<{ id: string; state: string; replayed: boolean }> {
+  if (options.idempotencyKey !== undefined && (typeof options.idempotencyKey !== "string" || !options.idempotencyKey.trim() || Buffer.byteLength(options.idempotencyKey, "utf8") > 256)) throw new Error("idempotencyKey must be nonblank and at most 256 UTF-8 bytes");
+  for (const key of ["delayMs", "retryBackoffMs", "retryBackoffMaxMs", "maxAttempts"] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`${key} must be a nonnegative safe integer`);
+  }
+  if (options.maxAttempts !== undefined && options.maxAttempts > 0xffffffff) throw new Error("maxAttempts exceeds uint32");
+  if (options.priority !== undefined && (!Number.isInteger(options.priority) || options.priority < -2147483648 || options.priority > 2147483647)) throw new Error("priority exceeds int32");
+  const json = JSON.stringify(data);
+  if (json === undefined) throw new Error("payload must be JSON serializable");
+  // Freeze the request once; a retry must not pick up mutated caller options/data.
+  const request = { ...options, metadata: options.metadata ? { ...options.metadata } : undefined, name, payload: Buffer.from(json) };
+  for (let attempt = 0; ; attempt++) {
+    try { return await connection.call("addJob", request); }
+    catch (error) {
+      const code = (error as grpc.ServiceError).code;
+      if (!request.idempotencyKey || attempt >= 2 || (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED)) throw error;
+      await sleep(100 * 2 ** attempt);
+    }
+  }
+}
 
 class Connection {
   private client: grpc.Client;
@@ -53,25 +88,7 @@ export class Queue<T = unknown> {
     this.connection = new Connection(options);
   }
   async add(data: T, options: AddOptions = {}): Promise<{ id: string; state: string; replayed: boolean }> {
-    if (options.idempotencyKey !== undefined && (typeof options.idempotencyKey !== "string" || !options.idempotencyKey.trim() || Buffer.byteLength(options.idempotencyKey, "utf8") > 256)) throw new Error("idempotencyKey must be nonblank and at most 256 UTF-8 bytes");
-    for (const key of ["delayMs", "retryBackoffMs", "retryBackoffMaxMs", "maxAttempts"] as const) {
-      const value = options[key];
-      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`${key} must be a nonnegative safe integer`);
-    }
-    if (options.maxAttempts !== undefined && options.maxAttempts > 0xffffffff) throw new Error("maxAttempts exceeds uint32");
-    if (options.priority !== undefined && (!Number.isInteger(options.priority) || options.priority < -2147483648 || options.priority > 2147483647)) throw new Error("priority exceeds int32");
-    const json = JSON.stringify(data);
-    if (json === undefined) throw new Error("payload must be JSON serializable");
-    // Freeze the request once; a retry must not pick up mutated caller options/data.
-    const request = { ...options, metadata: options.metadata ? { ...options.metadata } : undefined, name: this.name, payload: Buffer.from(json) };
-    for (let attempt = 0; ; attempt++) {
-      try { return await this.connection.call("addJob", request); }
-      catch (error) {
-        const code = (error as grpc.ServiceError).code;
-        if (!request.idempotencyKey || attempt >= 2 || (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED)) throw error;
-        await sleep(100 * 2 ** attempt);
-      }
-    }
+    return sendAdd(this.connection, this.name, data, options);
   }
   close() { this.connection.close(); }
 }
@@ -134,7 +151,11 @@ export class Worker<T = unknown> {
     let failure: unknown;
     try {
       const data = JSON.parse(claim.payload.toString("utf8")) as T;
-      await this.processor({ id: claim.id, name: claim.name, data, attempts: claim.attempts, metadata: claim.metadata, leaseExpiresAtMs: claim.leaseExpiresAtMs }, handler.signal);
+      // Reuse the worker's multiplexed channel; enqueueChild forces this job as the
+      // parent and leaves depth/trace for the server to derive.
+      const enqueueChild = <C = unknown>(name: string, childData: C, options?: ChildAddOptions) =>
+        sendAdd(this.connection, name, childData, { ...options, metadata: { parentId: claim.id } });
+      await this.processor({ id: claim.id, name: claim.name, data, attempts: claim.attempts, metadata: claim.metadata, leaseExpiresAtMs: claim.leaseExpiresAtMs, enqueueChild }, handler.signal);
     } catch (error) { failed = true; failure = error; }
     heartbeatStop.abort();
     await beats;

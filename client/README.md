@@ -116,6 +116,39 @@ async (job, signal) => {
 
 On success the client acknowledges with `CompleteJob` (idempotent, same attempt token); on a thrown error it sends `FailJob` (retried per `maxAttempts` and backoff); if the handler was aborted, it sends nothing and lets server recovery requeue the job.
 
+## Built-in parentage
+
+Ancestry is automatic: to enqueue a child of the job you are processing, call
+`job.enqueueChild(...)`. You declare only the child's queue name, payload, and ordinary
+options — the server owns the lineage facts. It forces the child's `parentId` to the
+current job's id, derives `executionDepth` (parent depth + 1), and inherits the lineage
+`traceId`. Those lineage fields cannot be set through `enqueueChild`; a caller-supplied
+`parentId` is ignored. The call reuses the worker's existing gRPC channel, so a fan-out
+does not open a connection per child.
+
+```typescript
+const worker = new Worker<{ orderId: string }>("orders", async job => {
+  // Kick off a child job on any queue; parentage is filled in server-side.
+  await job.enqueueChild("shipments", { orderId: job.data.orderId });
+
+  // Ordinary options (priority, delayMs, maxAttempts, backoff, rateLimitFacet,
+  // idempotencyKey) are accepted; lineage fields are not.
+  await job.enqueueChild(
+    "receipts",
+    { orderId: job.data.orderId },
+    { idempotencyKey: `receipt:${job.data.orderId}` },
+  );
+});
+```
+
+The recursion circuit breaker still applies to the derived depth: a child whose lineage
+would exceed the broker's maximum execution depth is rejected with `RESOURCE_EXHAUSTED`.
+
+**Client/server version coupling.** `enqueueChild` sends `executionDepth = 0` and relies
+on the server to derive it. Deploy a broker with server-side depth derivation before
+using `enqueueChild`; against an older broker, a parent enqueue with depth `0` is
+rejected as inconsistent. Callers that pass an explicit correct depth are unaffected.
+
 ## Safe enqueue retries
 
 ```typescript

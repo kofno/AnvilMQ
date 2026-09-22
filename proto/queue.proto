@@ -15,6 +15,8 @@ service QueueService {
 message JobMetadata {
   string parent_id = 1;
   string trace_id = 2;
+  // 0 => derived from parent when parent_id is set (parent depth + 1); otherwise must
+  // equal parent depth + 1. Ignored (server-derived) for child enqueues.
   uint32 execution_depth = 3;
 }
 

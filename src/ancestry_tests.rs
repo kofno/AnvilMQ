@@ -77,7 +77,8 @@ async fn inconsistent_depth_is_rejected() {
     let mut root = job("emails");
     root.metadata = meta("", "", 0);
     let root = add(&service, root).await.unwrap();
-    for bad_depth in [0u32, 2, 7] {
+    // 0 now derives (parent_depth + 1); only wrong NON-ZERO depths are rejected.
+    for bad_depth in [2u32, 7] {
         let mut child = job("emails");
         child.metadata = meta(&root.id, "", bad_depth);
         let err = add(&service, child).await.unwrap_err();
@@ -88,7 +89,7 @@ async fn inconsistent_depth_is_rejected() {
         .db_manager
         .metrics
         .render()
-        .contains("anvilmq_ancestry_rejections_total 3\n"));
+        .contains("anvilmq_ancestry_rejections_total 2\n"));
 }
 
 #[tokio::test]
@@ -198,4 +199,72 @@ async fn chain_cap_zero_disables_quarantine() {
         .metrics
         .render()
         .contains("anvilmq_chain_quarantines_total 0\n"));
+}
+
+#[tokio::test]
+async fn omitted_depth_is_derived_from_parent_and_inherits_trace() {
+    let service = service_with(":memory:", 0).await;
+    let mut root = job("emails");
+    root.metadata = meta("", "", 0);
+    let root = add(&service, root).await.unwrap();
+    let (root_trace, _) = read_trace(&service, &root.id).await;
+
+    // Child declares only parent_id (depth left at the 0 sentinel): the server derives.
+    let mut child = job("emails");
+    child.metadata = meta(&root.id, "", 0);
+    let child = add(&service, child).await.unwrap();
+    let (child_trace, child_depth) = read_trace(&service, &child.id).await;
+    assert_eq!(child_depth, 1);
+    assert_eq!(child_trace, root_trace);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_ancestry_rejections_total 0\n"));
+}
+
+#[tokio::test]
+async fn derived_depth_trips_circuit_breaker() {
+    let service = service_with(":memory:", 0).await;
+    // Build a chain up to the max allowed depth (10) using explicit correct depths.
+    let mut root = job("chain");
+    root.metadata = meta("", "", 0);
+    let mut parent = add(&service, root).await.unwrap();
+    for depth in 1..=10u32 {
+        let mut child = job("chain");
+        child.metadata = meta(&parent.id, "", depth);
+        parent = add(&service, child).await.unwrap();
+    }
+    let (_, parent_depth) = read_trace(&service, &parent.id).await;
+    assert_eq!(parent_depth, 10);
+
+    // Supplied 0 passes the cheap pre-tx check, but the derived depth (11) trips the
+    // authoritative breaker inside the transaction.
+    let mut child = job("chain");
+    child.metadata = meta(&parent.id, "", 0);
+    let err = add(&service, child).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    assert!(err.message().contains("Circuit breaker tripped"));
+}
+
+#[tokio::test]
+async fn multi_level_derivation_increments_and_shares_trace() {
+    let service = service_with(":memory:", 0).await;
+    let mut root = job("chain");
+    root.metadata = meta("", "", 0);
+    let root = add(&service, root).await.unwrap();
+    let (root_trace, _) = read_trace(&service, &root.id).await;
+
+    // Each level declares only its parent; the server derives +1 per hop and every
+    // job shares the root lineage id.
+    let mut parent = root;
+    for expected_depth in 1..=4i64 {
+        let mut child = job("chain");
+        child.metadata = meta(&parent.id, "", 0);
+        let child = add(&service, child).await.unwrap();
+        let (trace, depth) = read_trace(&service, &child.id).await;
+        assert_eq!(depth, expected_depth);
+        assert_eq!(trace, root_trace);
+        parent = child;
+    }
 }
