@@ -144,7 +144,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] All-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality (opt in with `ANVILMQ_METRICS_MODE=all`, bounded by `ANVILMQ_METRICS_MAX_NAMES`; the allowlist path via `ANVILMQ_METRICS_QUEUES` remains the default).
 - [x] Recent-failures feed endpoint (`GET /v1/failures`) served off the read-only replica, showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
 - [ ] Grafana table over the recent-failures feed (via a JSON/Infinity datasource).
-- [x] Read-only job/history search API served off the replica connection: opt-in FTS5 index maintained by triggers at history-insert/delete time (off the hot enqueue path, off by default, retention-bounded). Enable with `ANVILMQ_FTS_ENABLED`; see [search observability](docs/observability.md#search).
+- [x] Read-only job/history search API served off the replica connection: opt-in FTS5 index maintained by triggers at history-insert/delete time (off the hot enqueue path, off by default, retention-bounded), including whole-token prefix search via an explicit trailing `*` (`upstrea*`). Enable with `ANVILMQ_FTS_ENABLED`; see [search observability](docs/observability.md#search).
 - [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded), with an opt-in FTS5 `MATCH` path when `ANVILMQ_FTS_ENABLED` is set.
 - [x] Read-only single-job detail endpoint (`GET /v1/jobs/{id}`) served off the replica connection: the full record for one job — including the payload and ancestry — unioning the live `jobs` table and `job_history` via a `source` discriminator.
 - [ ] Asynchronous regional telemetry aggregation.
@@ -214,7 +214,7 @@ The read-only replica connection is configured with two environment variables:
 | --- | --- | --- |
 | `ANVILMQ_READER_MAX_CONCURRENCY` | `4` | Maximum concurrent read-only connections for observability reads. Values below 1 (or unparsable) normalize to 1. |
 | `ANVILMQ_READER_TIMEOUT_MS` | `500` | Per-query wall-clock budget in milliseconds; a query exceeding it is interrupted and the request returns 503. |
-| `ANVILMQ_FTS_ENABLED` | `false` | Opt-in FTS5 full-text index for `/v1/search` free-text `q`. Truthy values (`1`, `true`, `yes`) enable a trigger-maintained, retention-bounded index over `job_history` metadata; off by default, with zero write cost when disabled. See [search observability](docs/observability.md#opt-in-full-text-search-fts5). |
+| `ANVILMQ_FTS_ENABLED` | `false` | Opt-in FTS5 full-text index for `/v1/search` free-text `q`. Truthy values (`1`, `true`, `yes`) enable a trigger-maintained, retention-bounded index over `job_history` metadata; off by default, with zero write cost when disabled. Supports whole-token prefix search via an explicit trailing `*` (`upstrea*` matches `upstream`). See [search observability](docs/observability.md#opt-in-full-text-search-fts5). |
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:9090/healthz

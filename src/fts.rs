@@ -102,16 +102,35 @@ pub fn backfill_blocking(conn: &Connection, batch: i64) -> rusqlite::Result<usiz
 /// doubled), so every FTS5 operator character (`* : ( ) ^ - AND OR NOT`) is treated as a literal
 /// string term. This guarantees a pathological `q` can never raise an FTS5 syntax error; it either
 /// matches literally or matches nothing.
+///
+/// **Prefix wildcard (opt-in via an explicit trailing `*`).** A token that ends in one or more `*`
+/// (e.g. `upstrea*`) becomes a whole-token FTS5 prefix query: the trailing stars are stripped, the
+/// remaining stem is quoted/escaped, and a single bare `*` is appended *outside* the closing quote
+/// (`"upstrea"*`) — valid FTS5 prefix syntax that matches `upstream`, `upstream-svc`, etc. Only a
+/// *trailing* `*` triggers this; a `*` anywhere else (`foo*bar`, `*word`) stays inside the quoted
+/// phrase as a literal. A token that is only stars (or stars after quotes, e.g. `*`, `**`, `"*`)
+/// has an empty/contentless stem and is skipped like a quote-only token. Tokens without a trailing
+/// `*` are emitted byte-for-byte as before.
 pub fn sanitize_match(query: &str) -> Option<String> {
     let mut terms: Vec<String> = Vec::new();
     for token in query.split_whitespace() {
-        // A token made up entirely of quote characters carries no searchable content; skip it so
-        // it never contributes an empty phrase to the MATCH expression.
-        if token.chars().all(|c| c == '"') {
+        // A trailing run of `*` requests a whole-token prefix query; strip it to find the stem.
+        let stem = token.trim_end_matches('*');
+        let is_prefix = stem.len() != token.len();
+
+        // A stem made up entirely of quote characters (or emptied by stripping stars) carries no
+        // searchable content; skip it so it never contributes an empty phrase to the MATCH
+        // expression.
+        if stem.chars().all(|c| c == '"') {
             continue;
         }
-        let escaped = token.replace('"', "\"\"");
-        terms.push(format!("\"{escaped}\""));
+        let escaped = stem.replace('"', "\"\"");
+        if is_prefix {
+            // The bare `*` goes OUTSIDE the closing quote — FTS5 prefix syntax on a quoted phrase.
+            terms.push(format!("\"{escaped}\"*"));
+        } else {
+            terms.push(format!("\"{escaped}\""));
+        }
     }
     if terms.is_empty() {
         None
@@ -287,5 +306,82 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn sanitize_prefix_wildcard_string_forms() {
+        // A trailing `*` becomes a quoted-phrase prefix query (`*` outside the closing quote).
+        assert_eq!(sanitize_match("upstrea*").as_deref(), Some("\"upstrea\"*"));
+        // No trailing `*` is byte-for-byte unchanged.
+        assert_eq!(sanitize_match("foo").as_deref(), Some("\"foo\""));
+        // A token that is only stars has an empty stem and is skipped.
+        assert_eq!(sanitize_match("*"), None);
+        assert_eq!(sanitize_match("**"), None);
+        // A `*` that is not trailing stays a literal inside the quoted phrase, not a prefix.
+        assert_eq!(sanitize_match("foo*bar").as_deref(), Some("\"foo*bar\""));
+        // Multiple trailing stars collapse to a single prefix query.
+        assert_eq!(sanitize_match("word**").as_deref(), Some("\"word\"*"));
+        // Mixed tokens: exact phrase AND prefix phrase.
+        assert_eq!(
+            sanitize_match("connection upstrea*").as_deref(),
+            Some("\"connection\" \"upstrea\"*")
+        );
+    }
+
+    #[test]
+    fn sanitize_prefix_wildcard_live_matches() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        insert(&conn, "job-1", "upstream", "trace-a", Some("boom"));
+        insert(&conn, "job-2", "upstreamer", "trace-b", None);
+        insert(&conn, "job-3", "downstream", "trace-c", None);
+
+        // A trailing-`*` prefix query matches every token that begins with the stem.
+        assert_eq!(
+            match_ids(&conn, &sanitize_match("upstrea*").unwrap()),
+            vec!["job-1", "job-2"]
+        );
+        // The exact (no-star) form still matches the whole token only.
+        assert_eq!(
+            match_ids(&conn, &sanitize_match("upstream").unwrap()),
+            vec!["job-1"]
+        );
+        // Regression guard: a partial stem WITHOUT a `*` is a literal token and matches nothing —
+        // we did not silently turn every query into a prefix search.
+        assert!(match_ids(&conn, &sanitize_match("upstrea").unwrap()).is_empty());
+
+        // Implicit-AND across an exact token and a prefix token narrows to rows carrying both.
+        insert(
+            &conn,
+            "job-4",
+            "email",
+            "trace-d",
+            Some("connection to upstream"),
+        );
+        assert_eq!(
+            match_ids(&conn, &sanitize_match("connection upstrea*").unwrap()),
+            vec!["job-4"]
+        );
+
+        // Hostile wildcard-adjacent inputs never build invalid MATCH SQL.
+        for hostile in ["*", "\"*", "up*stream"] {
+            let ran = sanitize_match(hostile)
+                .map(|expr| {
+                    conn.prepare("SELECT rowid FROM job_history_fts WHERE job_history_fts MATCH ?1")
+                        .unwrap()
+                        .query_map([expr], |r| r.get::<_, i64>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|rows| rows.len())
+                })
+                .transpose()
+                .expect("hostile prefix input must not raise an FTS5 error");
+            // `up*stream` is a literal token that matches nothing; `*`/`"*` sanitize to None.
+            assert_eq!(
+                ran.unwrap_or(0),
+                0,
+                "hostile {hostile:?} should match nothing"
+            );
+        }
     }
 }
