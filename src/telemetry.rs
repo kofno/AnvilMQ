@@ -1,7 +1,7 @@
 use crate::db::DatabaseManager;
 use crate::reader::{Reader, ReaderError};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Html,
     routing::get,
@@ -360,6 +360,7 @@ pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
         .route("/console", get(console))
         .route("/v1/failures", get(failures))
         .route("/v1/search", get(search))
+        .route("/v1/jobs/:id", get(job_detail))
         .with_state(AppState { db, reader })
 }
 
@@ -634,6 +635,216 @@ async fn search(
             ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
     Ok(Json(rows))
+}
+
+/// Encodes bytes as standard (RFC 4648) base64 with `=` padding. Hand-rolled and encode-only to
+/// avoid pulling in a dependency for the single non-UTF-8 payload case; the alphabet and padding
+/// match any conforming decoder.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Intermediate row read inside the reader closure. Carries the payload as raw bytes so the
+/// UTF-8/JSON decision (which is pure work) happens outside the blocking SQLite closure.
+struct RawJob {
+    id: String,
+    name: String,
+    state: String,
+    source: &'static str,
+    priority: i64,
+    attempts: i64,
+    max_attempts: i64,
+    created_at: i64,
+    finished_at: Option<i64>,
+    parent_id: Option<String>,
+    trace_id: String,
+    execution_depth: i64,
+    rate_limit_facet: Option<String>,
+    last_error: Option<String>,
+    worker_id: Option<String>,
+    lease_expires_at_ms: Option<i64>,
+    available_at: Option<i64>,
+    payload: Vec<u8>,
+}
+
+/// Full detail for a single job, unified across the live `jobs` table and terminal `job_history`
+/// via the `source` discriminator. Live-only fields (`lease_expires_at_ms`, `available_at`) are
+/// null for history rows, and `finished_at`/`last_error` are null for live rows.
+#[derive(Serialize, Debug)]
+pub struct JobDetail {
+    id: String,
+    name: String,
+    state: String,
+    source: &'static str,
+    priority: i64,
+    attempts: i64,
+    max_attempts: i64,
+    created_at: i64,
+    finished_at: Option<i64>,
+    parent_id: Option<String>,
+    trace_id: String,
+    execution_depth: i64,
+    rate_limit_facet: Option<String>,
+    last_error: Option<String>,
+    worker_id: Option<String>,
+    lease_expires_at_ms: Option<i64>,
+    available_at: Option<i64>,
+    /// "json" when `payload` embeds the decoded JSON value, "base64" when it is a base64 string.
+    payload_encoding: &'static str,
+    /// The enqueued payload. Unlike `/v1/search` (a multi-row scan that deliberately omits the
+    /// heavy payload BLOB), this endpoint returns a single bounded primary-key row, so including
+    /// the payload carries no scan-amplification cost — surfacing it is the whole point of the
+    /// drill-down. Raw JSON is embedded directly when the bytes are valid UTF-8 JSON; otherwise the
+    /// bytes are base64-encoded (see `payload_encoding`).
+    payload: serde_json::Value,
+}
+
+/// Read-only single-job detail served off the WAL replica connection.
+///
+/// A job id exists in exactly one table at a time: it lives in `jobs` while in flight and is moved
+/// to `job_history` on completion/failure. This looks it up by primary key in the live table first,
+/// then in history, and returns the full record including the payload and ancestry from whichever
+/// holds it. Blank ids are rejected 400; a miss in both tables is 404. Like `/v1/search`, the read
+/// runs on the isolated `Reader` and never contends on the single-writer mutex.
+async fn job_detail(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobDetail>, StatusCode> {
+    // Reject blank/whitespace ids before touching the database.
+    if id.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let raw = app
+        .reader
+        .query(move |conn| {
+            use rusqlite::OptionalExtension;
+            // Explicit column lists (never SELECT *); fully parameterized by primary key.
+            let live = conn
+                .query_row(
+                    "SELECT id, name, state, priority, payload, parent_id, trace_id, \
+                     execution_depth, attempts, max_attempts, created_at, rate_limit_facet, \
+                     worker_id, lease_expires_at_ms, available_at \
+                     FROM jobs WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok(RawJob {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            state: r.get(2)?,
+                            source: "live",
+                            priority: r.get(3)?,
+                            payload: r.get(4)?,
+                            parent_id: r.get(5)?,
+                            trace_id: r.get(6)?,
+                            execution_depth: r.get(7)?,
+                            attempts: r.get(8)?,
+                            max_attempts: r.get(9)?,
+                            created_at: r.get(10)?,
+                            finished_at: None,
+                            last_error: None,
+                            rate_limit_facet: r.get(11)?,
+                            worker_id: r.get(12)?,
+                            lease_expires_at_ms: r.get(13)?,
+                            available_at: r.get(14)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(job) = live {
+                return Ok(Some(job));
+            }
+            // Not live: consult terminal history. Live-only columns are null here.
+            conn.query_row(
+                "SELECT id, name, state, priority, payload, parent_id, trace_id, \
+                 execution_depth, attempts, max_attempts, created_at, finished_at, last_error, \
+                 worker_id, rate_limit_facet \
+                 FROM job_history WHERE id = ?1",
+                rusqlite::params![id],
+                |r| {
+                    Ok(RawJob {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        state: r.get(2)?,
+                        source: "history",
+                        priority: r.get(3)?,
+                        payload: r.get(4)?,
+                        parent_id: r.get(5)?,
+                        trace_id: r.get(6)?,
+                        execution_depth: r.get(7)?,
+                        attempts: r.get(8)?,
+                        max_attempts: r.get(9)?,
+                        created_at: r.get(10)?,
+                        finished_at: r.get(11)?,
+                        last_error: r.get(12)?,
+                        worker_id: r.get(13)?,
+                        rate_limit_facet: r.get(14)?,
+                        lease_expires_at_ms: None,
+                        available_at: None,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+        .map_err(|error| match error {
+            ReaderError::Busy | ReaderError::Timeout | ReaderError::Unavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    let raw = raw.ok_or(StatusCode::NOT_FOUND)?;
+    // Embed the payload as raw JSON when the bytes are valid UTF-8 JSON; otherwise base64-encode.
+    let (payload, payload_encoding) = match std::str::from_utf8(&raw.payload)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    {
+        Some(value) => (value, "json"),
+        None => (
+            serde_json::Value::String(base64_encode(&raw.payload)),
+            "base64",
+        ),
+    };
+    Ok(Json(JobDetail {
+        id: raw.id,
+        name: raw.name,
+        state: raw.state,
+        source: raw.source,
+        priority: raw.priority,
+        attempts: raw.attempts,
+        max_attempts: raw.max_attempts,
+        created_at: raw.created_at,
+        finished_at: raw.finished_at,
+        parent_id: raw.parent_id,
+        trace_id: raw.trace_id,
+        execution_depth: raw.execution_depth,
+        rate_limit_facet: raw.rate_limit_facet,
+        last_error: raw.last_error,
+        worker_id: raw.worker_id,
+        lease_expires_at_ms: raw.lease_expires_at_ms,
+        available_at: raw.available_at,
+        payload_encoding,
+        payload,
+    }))
 }
 
 #[cfg(test)]
@@ -1208,6 +1419,222 @@ mod tests {
         assert_eq!(ids(&rows), vec!["iso"]);
         drop(guard);
         drop(conn);
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    async fn insert_live_job(
+        db: &DatabaseManager,
+        id: &str,
+        state: &str,
+        payload: &[u8],
+        worker_id: Option<&str>,
+        lease_expires_at_ms: Option<i64>,
+        available_at: Option<i64>,
+    ) {
+        let (id, state, payload, worker_id) = (
+            id.to_string(),
+            state.to_string(),
+            payload.to_vec(),
+            worker_id.map(|w| w.to_string()),
+        );
+        let conn = db.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO jobs (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, updated_at, rate_limit_facet, worker_id, lease_expires_at_ms, available_at) \
+                 VALUES (?1, 'email', ?2, 7, ?3, NULL, 'trace', 0, 1, 3, 5, 6, NULL, ?4, ?5, ?6)",
+                rusqlite::params![id, state, payload, worker_id, lease_expires_at_ms, available_at],
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn insert_history_job(
+        db: &DatabaseManager,
+        id: &str,
+        state: &str,
+        payload: &[u8],
+        last_error: Option<&str>,
+    ) {
+        let (id, state, payload, last_error) = (
+            id.to_string(),
+            state.to_string(),
+            payload.to_vec(),
+            last_error.map(|e| e.to_string()),
+        );
+        let conn = db.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, last_error, worker_id, rate_limit_facet) \
+                 VALUES (?1, 'email', ?2, 0, ?3, 'root', 'trace', 2, 3, 3, 5, 900, ?4, 'w-1', 'facet-a')",
+                rusqlite::params![id, state, payload, last_error],
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_returns_live_active_and_delayed() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-live-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        insert_live_job(
+            &db,
+            "live-active",
+            "Active",
+            br#"{"hello":"world"}"#,
+            Some("w-9"),
+            Some(1234),
+            None,
+        )
+        .await;
+        insert_live_job(
+            &db,
+            "live-delayed",
+            "Delayed",
+            br#"{"n":1}"#,
+            None,
+            None,
+            Some(555),
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let active = job_detail(State(app.clone()), Path("live-active".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(active.source, "live");
+        assert_eq!(active.state, "Active");
+        assert_eq!(active.priority, 7);
+        assert_eq!(active.worker_id.as_deref(), Some("w-9"));
+        assert_eq!(active.lease_expires_at_ms, Some(1234));
+        assert_eq!(active.available_at, None);
+        assert_eq!(active.finished_at, None);
+        assert_eq!(active.last_error, None);
+        assert_eq!(active.payload_encoding, "json");
+        assert_eq!(active.payload, serde_json::json!({"hello": "world"}));
+
+        let delayed = job_detail(State(app.clone()), Path("live-delayed".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(delayed.source, "live");
+        assert_eq!(delayed.state, "Delayed");
+        assert_eq!(delayed.available_at, Some(555));
+        assert_eq!(delayed.payload, serde_json::json!({"n": 1}));
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_returns_history_completed_and_failed() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-hist-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        insert_history_job(&db, "hist-done", "Completed", br#"{"ok":true}"#, None).await;
+        insert_history_job(&db, "hist-fail", "Failed", br#"{"x":1}"#, Some("kaboom")).await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let done = job_detail(State(app.clone()), Path("hist-done".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(done.source, "history");
+        assert_eq!(done.state, "Completed");
+        assert_eq!(done.finished_at, Some(900));
+        assert_eq!(done.last_error, None);
+        assert_eq!(done.parent_id.as_deref(), Some("root"));
+        assert_eq!(done.worker_id.as_deref(), Some("w-1"));
+        assert_eq!(done.rate_limit_facet.as_deref(), Some("facet-a"));
+        assert_eq!(done.execution_depth, 2);
+        assert_eq!(done.lease_expires_at_ms, None);
+        assert_eq!(done.available_at, None);
+        assert_eq!(done.payload_encoding, "json");
+        assert_eq!(done.payload, serde_json::json!({"ok": true}));
+
+        let failed = job_detail(State(app.clone()), Path("hist-fail".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(failed.source, "history");
+        assert_eq!(failed.state, "Failed");
+        assert_eq!(failed.last_error.as_deref(), Some("kaboom"));
+        assert_eq!(failed.payload, serde_json::json!({"x": 1}));
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_unknown_is_404_and_blank_is_400() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-miss-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let missing = job_detail(State(app.clone()), Path("nope".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+
+        let blank = job_detail(State(app.clone()), Path("   ".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(blank, StatusCode::BAD_REQUEST);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_non_json_payload_is_base64() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-b64-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        let bytes = [0xffu8, 0xfe, 0x00, 0x01];
+        insert_live_job(&db, "binary", "Active", &bytes, Some("w-1"), Some(1), None).await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let detail = job_detail(State(app.clone()), Path("binary".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(detail.payload_encoding, "base64");
+        assert_eq!(detail.payload, serde_json::Value::String("//4AAQ==".into()));
+        // Confirms the helper produced the exact standard-base64 value that decodes to the bytes.
+        assert_eq!(
+            detail.payload,
+            serde_json::Value::String(base64_encode(&bytes))
+        );
+
         drop(app);
         drop(db);
         std::fs::remove_file(path).unwrap();
