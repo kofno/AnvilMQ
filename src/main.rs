@@ -333,8 +333,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pressure = pressure::Pressure::configured(
         &std::env::var("ANVILMQ_METRICS_QUEUES").unwrap_or_default(),
     )?;
+    let metrics_mode = match std::env::var("ANVILMQ_METRICS_MODE") {
+        Ok(value) => telemetry::MetricsMode::parse(&value)?,
+        Err(std::env::VarError::NotPresent) => telemetry::MetricsMode::Allowlist,
+        Err(error) => return Err(error.into()),
+    };
+    let metrics_max_names = match std::env::var("ANVILMQ_METRICS_MAX_NAMES") {
+        Ok(value) => telemetry::parse_max_names(&value)?,
+        Err(std::env::VarError::NotPresent) => telemetry::DEFAULT_METRICS_MAX_NAMES,
+        Err(error) => return Err(error.into()),
+    };
     let mut manager = DatabaseManager::with_durability(&database_path, durability).await?;
-    let named = telemetry::NamedLifecycle::configured(&pressure.queue_names());
+    let named = match metrics_mode {
+        telemetry::MetricsMode::Allowlist => {
+            telemetry::NamedLifecycle::configured(&pressure.queue_names())
+        }
+        telemetry::MetricsMode::All => {
+            telemetry::NamedLifecycle::all(metrics_max_names, &pressure.queue_names())
+        }
+    };
     {
         let metrics = Arc::get_mut(&mut manager.metrics).expect("metrics not yet shared");
         metrics.pressure = pressure;

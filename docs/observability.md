@@ -13,6 +13,20 @@ cargo run
 
 For Helm, set `metricsQueues: [invoices, email]`. Restart to change the allowlist. Up to 32 unique exact names, each at most 256 UTF-8 bytes; commas and surrounding whitespace are not supported. Default is an empty allowlist. Never use a tenant/job ID as a queue-name metric label. Escaping handles quotes, backslashes, and newlines. Invalid configuration fails startup.
 
+## All-names metric mode
+
+Per-name lifecycle series (`anvilmq_jobs_by_name_total`, `anvilmq_job_duration_seconds`) are allowlist-bound by default: only `ANVILMQ_METRICS_QUEUES` names produce series. Set `ANVILMQ_METRICS_MODE=all` (case-insensitive; unset or `allowlist` keeps today's behavior) to auto-register every job name on first sighting, so every function appears without maintaining an allowlist.
+
+```powershell
+$env:ANVILMQ_METRICS_MODE = 'all'
+$env:ANVILMQ_METRICS_MAX_NAMES = '200'   # optional; default 100, max 1000
+cargo run
+```
+
+Cardinality stays bounded: `ANVILMQ_METRICS_MAX_NAMES` caps the number of distinct registered names (default 100, hard ceiling 1000). Total per-name series is roughly cap x (5 counters + histogram buckets), so worst case is deterministic. Once the cap is reached, further unseen names create **no** series; instead a single overflow counter `anvilmq_jobs_by_name_dropped_total` increments (a nonzero value tells operators names were dropped — no per-dropped-name cardinality). The gauge `anvilmq_named_series` reports the current registered count so you can alert on proximity to the cap. Non-numeric, zero, or over-ceiling caps, and unknown mode values, fail startup.
+
+Allowlisted names (`ANVILMQ_METRICS_QUEUES`) are pre-seeded up front in `all` mode too — they always appear and count toward the cap, so pressure and named series agree. Render order is deterministic (names sorted). This mode only changes per-name lifecycle cardinality: **per-queue pressure series stay allowlist-bound** and are unaffected by the mode or cap.
+
 ## Signals and semantics
 
 | Metric | Meaning |
