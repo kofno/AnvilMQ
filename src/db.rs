@@ -83,6 +83,8 @@ mod tests {
         conn.execute_batch(
             "DROP INDEX idx_jobs_pressure;
             DROP INDEX idx_jobs_active_lease;
+            DROP INDEX idx_chain_counters_updated;
+            DROP TABLE chain_counters;
             ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
             ALTER TABLE jobs DROP COLUMN last_error;
             ALTER TABLE job_history DROP COLUMN worker_id;
@@ -113,6 +115,8 @@ mod tests {
             .unwrap();
         assert_eq!(error, None);
         conn.prepare("SELECT worker_id, last_error, rate_limit_facet FROM job_history")
+            .unwrap();
+        conn.prepare("SELECT trace_id, job_count, updated_at FROM chain_counters")
             .unwrap();
     }
 }
@@ -218,6 +222,15 @@ impl DatabaseManager {
                 current_count INTEGER NOT NULL,
                 window_expires_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS chain_counters (
+                trace_id TEXT PRIMARY KEY,
+                job_count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chain_counters_updated
+            ON chain_counters (updated_at);
             ",
         )?;
 

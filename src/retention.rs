@@ -29,6 +29,8 @@ pub struct RetentionConfig {
     pub interval_ms: u64,
     /// Max rows deleted per statement per sweep; bounds writer hold time.
     pub batch: i64,
+    /// Delete per-lineage `chain_counters` rows idle longer than this. `0` disables.
+    pub chain_counter_ttl_ms: i64,
 }
 
 impl Default for RetentionConfig {
@@ -42,6 +44,9 @@ impl Default for RetentionConfig {
             failed_count: 0,
             interval_ms: 60_000,
             batch: 1_000,
+            // A lineage idle beyond a week is treated as finished; a much later straggler
+            // reusing the trace starts a fresh chain.
+            chain_counter_ttl_ms: 604_800_000,
         }
     }
 }
@@ -69,6 +74,10 @@ impl RetentionConfig {
                 .try_into()
                 .map_err(|_| "ANVILMQ_RETENTION_INTERVAL_MS must be non-negative".to_string())?,
             batch: env_i64("ANVILMQ_RETENTION_BATCH", d.batch)?,
+            chain_counter_ttl_ms: env_i64(
+                "ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS",
+                d.chain_counter_ttl_ms,
+            )?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -102,6 +111,12 @@ impl RetentionConfig {
         if self.interval_ms == 0 {
             return Err("ANVILMQ_RETENTION_INTERVAL_MS must be positive".to_string());
         }
+        if self.chain_counter_ttl_ms < 0 {
+            return Err(format!(
+                "ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS={} must be >= 0",
+                self.chain_counter_ttl_ms
+            ));
+        }
         Ok(())
     }
 
@@ -110,6 +125,7 @@ impl RetentionConfig {
             || self.completed_count > 0
             || self.failed_age_ms > 0
             || self.failed_count > 0
+            || self.chain_counter_ttl_ms > 0
     }
 }
 
@@ -120,6 +136,7 @@ pub struct SweepOutcome {
     pub failed_age: usize,
     pub failed_count: usize,
     pub receipts: usize,
+    pub chain_counters: usize,
 }
 
 impl SweepOutcome {
@@ -129,6 +146,7 @@ impl SweepOutcome {
             + self.failed_age
             + self.failed_count
             + self.receipts
+            + self.chain_counters
     }
 }
 
@@ -172,6 +190,19 @@ fn prune_receipts(tx: &Connection, batch: i64) -> rusqlite::Result<usize> {
     )
 }
 
+fn prune_chain_counters(tx: &Connection, cutoff: i64, batch: i64) -> rusqlite::Result<usize> {
+    // Reclaim lineage counters that have been idle past the TTL. Indexed on updated_at so
+    // the scan is a bounded range read, never a full-table sweep.
+    tx.execute(
+        "DELETE FROM chain_counters WHERE trace_id IN (
+             SELECT trace_id FROM chain_counters
+             WHERE updated_at < ?1
+             ORDER BY updated_at ASC LIMIT ?2
+         )",
+        rusqlite::params![cutoff, batch],
+    )
+}
+
 /// Run one bounded sweep pass. Each dimension deletes at most `batch` rows so the writer is
 /// never held for long; the caller's interval re-runs until the backlog is drained. Metrics
 /// are updated after commit so gauges never reflect uncommitted deletes.
@@ -206,6 +237,10 @@ pub fn sweep_blocking(
         out.failed_count = prune_count(&tx, "Failed", cfg.failed_count, cfg.batch)?;
     }
     out.receipts = prune_receipts(&tx, cfg.batch)?;
+    if cfg.chain_counter_ttl_ms > 0 {
+        out.chain_counters =
+            prune_chain_counters(&tx, now.saturating_sub(cfg.chain_counter_ttl_ms), cfg.batch)?;
+    }
     tx.commit()?;
 
     metrics.retention_deleted("completed", "age", out.completed_age as u64);
@@ -213,6 +248,7 @@ pub fn sweep_blocking(
     metrics.retention_deleted("failed", "age", out.failed_age as u64);
     metrics.retention_deleted("failed", "count", out.failed_count as u64);
     metrics.retention_deleted("receipt", "orphan", out.receipts as u64);
+    metrics.chain_counters_pruned(out.chain_counters as u64);
     Ok(out)
 }
 
@@ -240,6 +276,7 @@ mod tests {
             failed_count: 0,
             interval_ms: 60_000,
             batch: 1_000,
+            chain_counter_ttl_ms: 0,
         }
     }
 
