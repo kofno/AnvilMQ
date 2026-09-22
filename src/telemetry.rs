@@ -3,6 +3,7 @@ use crate::reader::{Reader, ReaderError};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
+    response::Html,
     routing::get,
     Json, Router,
 };
@@ -356,9 +357,20 @@ pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
         .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(ready))
+        .route("/console", get(console))
         .route("/v1/failures", get(failures))
         .route("/v1/search", get(search))
         .with_state(AppState { db, reader })
+}
+
+/// Self-contained, read-only search console UI. The entire page (inline CSS + vanilla JS) is
+/// embedded in the binary via `include_str!`, so it needs no build step and pulls no external
+/// assets — it works air-gapped inside a cluster. It is served same-origin and consumes only the
+/// public `/v1/search` JSON endpoint; it holds no state and never touches the database directly.
+const CONSOLE_HTML: &str = include_str!("console.html");
+
+async fn console() -> Html<&'static str> {
+    Html(CONSOLE_HTML)
 }
 async fn metrics(
     State(app): State<AppState>,
@@ -635,6 +647,22 @@ mod tests {
             db,
             reader: Arc::new(Reader::from_env(path.to_string())),
         }
+    }
+
+    #[tokio::test]
+    async fn console_serves_self_contained_html_page() {
+        use axum::response::IntoResponse;
+        let page = console().await;
+        assert!(page.0.contains("AnvilMQ Search Console"));
+        let response = page.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/html; charset=utf-8"
+        );
     }
 
     #[tokio::test]

@@ -118,6 +118,36 @@ Rows are ordered by `finished_at` descending (newest first), backed by the `idx_
 
 A full-text index (SQLite FTS5), populated at history-insert time and off by default, is a planned opt-in follow-up for richer ranked search; this PR ships the structured + escaped-LIKE search only.
 
+## Console
+
+`GET /console` serves a built-in, read-only search console: a single HTML page that drives the
+`/v1/search` API from the browser. It is served same-origin off the broker's existing HTTP server,
+so no CORS is involved, and the JSON API remains the source of truth — the console is purely a
+consumer of the public `/v1/search` endpoint and adds no private or side-channel API.
+
+The page is fully self-contained: its inline CSS and vanilla JavaScript are embedded in the binary
+(`include_str!`) with no build step and no external CDN or network dependency, so it works
+air-gapped inside a cluster.
+
+Features:
+
+- A filter bar mapping to `/v1/search` params: free-text `q`, exact `name`, a `state` select
+  (any / Waiting / Delayed / Active / Completed / Failed), exact `trace_id`, a relative-time picker
+  (5m / 15m / 1h / 6h / 24h / all) that computes `since_ms` client-side (`all` omits it), and a
+  `limit` (default 100, capped at 1000). It requires at least one predicate, matching the API.
+- A results table (name, state, attempts, execution depth, created, finished, last error, trace id,
+  id) with humanized timestamps and a result count.
+- **Lineage drill-down**: clicking a `trace_id` pins it as the filter, clears the free-text query,
+  re-runs the search, and re-sorts the chain by `execution_depth` ascending so the fan-out lineage
+  reads top-down. A "clear lineage / back to search" control returns to normal search.
+- Graceful response handling: HTTP 400 shows an "add at least one filter" hint (not an error), 503
+  shows a "reader busy, try again" notice, and other non-200 responses show a generic error.
+
+All values from the API (job `name`, `last_error`, `trace_id`, etc.) are user-controlled strings and
+are inserted via `textContent` / `createElement` only, never via HTML string interpolation, so the
+console is safe against stored XSS. Like the endpoints it consumes, the console is unauthenticated;
+expose the HTTP listener only on a trusted network.
+
 ## Read-only replica connection
 
 Observability read endpoints (currently the recent-failures feed and the search API) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
