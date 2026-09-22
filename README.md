@@ -120,6 +120,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 - [x] Persist metadata and reject supplied execution depth above the limit.
 - [x] Validate ancestry and quarantine runaway chains.
+- [x] Built-in parentage: the server derives `execution_depth` from the resolved parent when unset and validates a supplied non-zero depth against it, and the client exposes an `enqueueChild` helper that propagates the parent's lineage.
 - [ ] Sliding-window ingress velocity controls.
 
 ### Phase 4: Faceted rate limiting
@@ -145,6 +146,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [ ] Grafana table over the recent-failures feed (via a JSON/Infinity datasource).
 - [ ] Read-only job/history search API served off the replica connection: opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
 - [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded). FTS5 is a follow-up.
+- [x] Read-only single-job detail endpoint (`GET /v1/jobs/{id}`) served off the replica connection: the full record for one job — including the payload and ancestry — unioning the live `jobs` table and `job_history` via a `source` discriminator.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 
@@ -203,6 +205,7 @@ The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR
 - `GET /readyz`: HTTP 200 after opening a database write transaction, reading the jobs table, and rolling back. Returns 503 for contention, database errors, or a one-second timeout. It deliberately fails fast if the shared connection is busy; use a failure threshold for deployment probes. A timed-out SQLite call can continue on its blocking thread, with subsequent probes failing fast until it releases the connection. This is an access check, not a disk durability or capacity test.
 - `GET /v1/failures`: Recent terminal (exhausted) failures from `job_history` as JSON, served read-only off the WAL replica connection and isolated from the single-writer path. Accepts `name`, `since_ms`, and `limit` query parameters. See [the recent-failures feed](docs/observability.md#recent-failures-feed) for the parameters and response shape.
 - `GET /v1/search`: Read-only search over `job_history` (retention-bounded past runs) as JSON, served off the WAL replica connection. Accepts a free-text `q` (escaped LIKE across `id`, `name`, `trace_id`, `last_error`) plus structured filters `name`, `state`, `trace_id`, `since_ms`, and `limit` (default 100, hard cap 1000). At least one predicate is required. See [search](docs/observability.md#search) for details.
+- `GET /v1/jobs/{id}`: Read-only detail for a single job as one JSON object, served off the WAL replica connection and isolated from the single-writer path. A job id lives in exactly one place at a time, so the id is looked up by primary key in the live `jobs` table first and then in `job_history`; the response carries a `source` discriminator (`"live"` or `"history"`). Unlike `/v1/search` (a multi-row scan that omits the heavy payload BLOB), this is a single bounded primary-key row, so it returns the full record **including the payload and ancestry**. Fields: `id`, `name`, `state`, `source`, `priority`, `attempts`, `max_attempts`, `created_at`, `finished_at` (null for live), `parent_id` (nullable), `trace_id`, `execution_depth`, `rate_limit_facet` (nullable), `last_error` (nullable; null for live), `worker_id` (nullable), `lease_expires_at_ms` (nullable; live only), `available_at` (nullable; live only), `payload`, and `payload_encoding`. The payload is returned inline: when the stored bytes are valid UTF-8 that parses as JSON the raw JSON value is embedded directly and `payload_encoding` is `"json"`; otherwise the bytes are base64-encoded into `payload` and `payload_encoding` is `"base64"`. A blank/whitespace id returns 400; an id in neither table returns 404; reader contention, a per-query timeout, or an unavailable replica returns 503.
 - `GET /console`: Built-in read-only search console (an HTML page) that drives `/v1/search` from the browser. Same-origin, self-contained (inline CSS/JS embedded in the binary, no external assets, works air-gapped), and consumes only the public `/v1/search` endpoint. Provides a filter bar, a results table, and trace-id lineage drill-down. See [console](docs/observability.md#console) for details.
 
 The read-only replica connection is configured with two environment variables:
