@@ -350,9 +350,12 @@ impl Drop for Timer {
 pub struct AppState {
     pub db: Arc<DatabaseManager>,
     pub reader: Arc<Reader>,
+    /// Whether the opt-in FTS5 index is active. When true, free-text `q` on `/v1/search` is
+    /// resolved via `MATCH` against `job_history_fts`; when false, the escaped-LIKE path is used.
+    pub fts_enabled: bool,
 }
 
-pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
+pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>, fts_enabled: bool) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok\n" }))
@@ -361,7 +364,11 @@ pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
         .route("/v1/failures", get(failures))
         .route("/v1/search", get(search))
         .route("/v1/jobs/:id", get(job_detail))
-        .with_state(AppState { db, reader })
+        .with_state(AppState {
+            db,
+            reader,
+            fts_enabled,
+        })
 }
 
 /// Self-contained, read-only search console UI. The entire page (inline CSS + vanilla JS) is
@@ -516,7 +523,8 @@ fn escape_like(input: &str) -> String {
 /// Query parameters for `GET /v1/search`.
 #[derive(Deserialize)]
 pub struct SearchParams {
-    /// Free-text query; escaped LIKE match across `id`, `name`, `trace_id`, and `last_error`.
+    /// Free-text query. By default an escaped LIKE match across `id`, `name`, `trace_id`, and
+    /// `last_error`; when the opt-in FTS5 index is enabled it is resolved via tokenized `MATCH`.
     /// Empty/whitespace is treated as absent. The payload BLOB is intentionally not searched.
     q: Option<String>,
     /// Optional exact job-name filter.
@@ -548,11 +556,18 @@ pub struct SearchRow {
 /// Read-only job/history search served off the WAL replica connection.
 ///
 /// Searches `job_history` — the retention-bounded record of terminal runs — with structured
-/// filters plus an escaped LIKE free-text match. Live in-flight `jobs` are not searched here (a
-/// follow-up), and neither is the payload BLOB (heavy; a future opt-in). At least one predicate is
-/// required so the query is never an unbounded full scan; results are ordered `finished_at DESC`
-/// and backed by the `idx_history_*_finished` indexes where the filters allow. Like `/v1/failures`,
-/// the read runs on the isolated `Reader` and never contends on the single-writer mutex.
+/// filters plus a free-text match. Live in-flight `jobs` are not searched here (a follow-up), and
+/// neither is the payload BLOB (heavy; a future opt-in). At least one predicate is required so the
+/// query is never an unbounded full scan; results are ordered `finished_at DESC` and backed by the
+/// `idx_history_*_finished` indexes where the filters allow. Like `/v1/failures`, the read runs on
+/// the isolated `Reader` and never contends on the single-writer mutex.
+///
+/// Free-text `q` resolves one of two ways. By default it is an escaped `LIKE` scan across `id`,
+/// `name`, `trace_id`, and `last_error`. When the opt-in FTS5 index is enabled
+/// (`app.fts_enabled`), `q` is resolved via `MATCH` against `job_history_fts` (joined back to
+/// `job_history` by `rowid` so every field and structured filter still applies and the response
+/// shape is unchanged). The FTS query is tokenized and sanitized, so a hostile `q` returns an
+/// empty/best-effort result rather than a 5xx.
 async fn search(
     State(app): State<AppState>,
     Query(params): Query<SearchParams>,
@@ -575,42 +590,70 @@ async fn search(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // Route free-text through FTS only when it is enabled and a query is present. A query that
+    // sanitizes to no usable tokens yields an empty result (best-effort, never an error). When FTS
+    // handles `q`, the LIKE path must not also add a `q` clause.
+    let use_fts = app.fts_enabled && q.is_some();
+    let fts_expr = if use_fts {
+        match crate::fts::sanitize_match(q.as_deref().unwrap_or_default()) {
+            Some(expr) => Some(expr),
+            None => return Ok(Json(Vec::new())),
+        }
+    } else {
+        None
+    };
+    let like_q = if use_fts { None } else { q };
     let rows = app
         .reader
         .query(move |conn| {
-            // Fully parameterized; user input never interpolated into SQL.
-            let mut sql = String::from(
-                "SELECT id, name, state, attempts, created_at, finished_at, last_error, trace_id, execution_depth \
-                 FROM job_history WHERE 1=1",
-            );
+            // Fully parameterized; user input never interpolated into SQL. In the FTS branch the
+            // table is aliased `h`, so structured filters are qualified to avoid ambiguity with the
+            // `job_history_fts` columns of the same name.
             let mut args: Vec<rusqlite::types::Value> = Vec::new();
-            if let Some(q) = q {
-                let pattern = format!("%{}%", escape_like(&q));
-                let idx = args.len() + 1;
-                sql.push_str(&format!(
-                    " AND (id LIKE ?{idx} ESCAPE '\\' OR name LIKE ?{idx} ESCAPE '\\' \
-                       OR trace_id LIKE ?{idx} ESCAPE '\\' OR last_error LIKE ?{idx} ESCAPE '\\')"
-                ));
-                args.push(rusqlite::types::Value::Text(pattern));
-            }
+            let (mut sql, col) = if let Some(expr) = fts_expr {
+                args.push(rusqlite::types::Value::Text(expr));
+                (
+                    String::from(
+                        "SELECT h.id, h.name, h.state, h.attempts, h.created_at, h.finished_at, h.last_error, h.trace_id, h.execution_depth \
+                         FROM job_history_fts f JOIN job_history h ON h.rowid = f.rowid \
+                         WHERE job_history_fts MATCH ?1",
+                    ),
+                    "h.",
+                )
+            } else {
+                let mut sql = String::from(
+                    "SELECT id, name, state, attempts, created_at, finished_at, last_error, trace_id, execution_depth \
+                     FROM job_history WHERE 1=1",
+                );
+                if let Some(q) = like_q {
+                    let pattern = format!("%{}%", escape_like(&q));
+                    let idx = args.len() + 1;
+                    sql.push_str(&format!(
+                        " AND (id LIKE ?{idx} ESCAPE '\\' OR name LIKE ?{idx} ESCAPE '\\' \
+                           OR trace_id LIKE ?{idx} ESCAPE '\\' OR last_error LIKE ?{idx} ESCAPE '\\')"
+                    ));
+                    args.push(rusqlite::types::Value::Text(pattern));
+                }
+                (sql, "")
+            };
             if let Some(name) = name {
                 args.push(rusqlite::types::Value::Text(name));
-                sql.push_str(&format!(" AND name = ?{}", args.len()));
+                sql.push_str(&format!(" AND {col}name = ?{}", args.len()));
             }
             if let Some(state) = state {
                 args.push(rusqlite::types::Value::Text(state));
-                sql.push_str(&format!(" AND state = ?{}", args.len()));
+                sql.push_str(&format!(" AND {col}state = ?{}", args.len()));
             }
             if let Some(trace_id) = trace_id {
                 args.push(rusqlite::types::Value::Text(trace_id));
-                sql.push_str(&format!(" AND trace_id = ?{}", args.len()));
+                sql.push_str(&format!(" AND {col}trace_id = ?{}", args.len()));
             }
             if let Some(since) = since_ms {
                 args.push(rusqlite::types::Value::Integer(since));
-                sql.push_str(&format!(" AND finished_at >= ?{}", args.len()));
+                sql.push_str(&format!(" AND {col}finished_at >= ?{}", args.len()));
             }
             args.push(rusqlite::types::Value::Integer(limit));
-            sql.push_str(&format!(" ORDER BY finished_at DESC LIMIT ?{}", args.len()));
+            sql.push_str(&format!(" ORDER BY {col}finished_at DESC LIMIT ?{}", args.len()));
             let mut statement = conn.prepare(&sql)?;
             let rows = statement.query_map(rusqlite::params_from_iter(args), |r| {
                 Ok(SearchRow {
@@ -857,6 +900,17 @@ mod tests {
         AppState {
             db,
             reader: Arc::new(Reader::from_env(path.to_string())),
+            fts_enabled: false,
+        }
+    }
+
+    /// Like [`state_for`] but with the opt-in FTS5 query path active. Callers must have run
+    /// `DatabaseManager::enable_fts` on the same database first.
+    fn state_for_fts(db: Arc<DatabaseManager>, path: &str) -> AppState {
+        AppState {
+            db,
+            reader: Arc::new(Reader::from_env(path.to_string())),
+            fts_enabled: true,
         }
     }
 
@@ -1419,6 +1473,251 @@ mod tests {
         assert_eq!(ids(&rows), vec!["iso"]);
         drop(guard);
         drop(conn);
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Helper: run `/v1/search` with only `q` set (all other predicates absent).
+    async fn search_q(app: &AppState, q: &str) -> Vec<SearchRow> {
+        search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some(q.into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test]
+    async fn fts_matches_tokenized_terms_and_combines_filters() {
+        let path = std::env::temp_dir().join(format!("anvil-fts-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![
+                (
+                    "job-alpha",
+                    "email",
+                    "Failed",
+                    "trace-1",
+                    Some("timeout talking to smtp"),
+                    10,
+                    100,
+                ),
+                ("job-beta", "sms", "Completed", "trace-2", None, 20, 200),
+                (
+                    "job-gamma",
+                    "email",
+                    "Failed",
+                    "trace-3",
+                    Some("connection refused by smtp"),
+                    30,
+                    300,
+                ),
+            ],
+        )
+        .await;
+        // Enable FTS and backfill the pre-seeded rows.
+        assert_eq!(
+            db.enable_fts(crate::fts::DEFAULT_BACKFILL_BATCH)
+                .await
+                .unwrap(),
+            3
+        );
+        let app = state_for_fts(db.clone(), path.to_str().unwrap());
+
+        // A word inside last_error is matchable via tokenization (newest first).
+        assert_eq!(
+            ids(&search_q(&app, "smtp").await),
+            vec!["job-gamma", "job-alpha"]
+        );
+
+        // Structured filters still narrow the FTS result set and the response shape is unchanged.
+        let narrowed = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("smtp".into()),
+                name: None,
+                state: Some("Completed".into()),
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(narrowed.is_empty());
+
+        let by_state = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("smtp".into()),
+                name: Some("email".into()),
+                state: Some("Failed".into()),
+                trace_id: None,
+                since_ms: Some(250),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&by_state), vec!["job-gamma"]);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fts_delete_trigger_drops_row_from_results() {
+        let path = std::env::temp_dir().join(format!("anvil-fts-del-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        // Enable FTS first so the insert trigger indexes rows as they are written.
+        db.enable_fts(crate::fts::DEFAULT_BACKFILL_BATCH)
+            .await
+            .unwrap();
+        seed_search_history(
+            &db,
+            vec![(
+                "doomed",
+                "email",
+                "Failed",
+                "trace-1",
+                Some("boom"),
+                10,
+                100,
+            )],
+        )
+        .await;
+        let app = state_for_fts(db.clone(), path.to_str().unwrap());
+        assert_eq!(ids(&search_q(&app, "boom").await), vec!["doomed"]);
+
+        // A retention-style delete propagates through the AFTER DELETE trigger.
+        let conn = db.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            conn.blocking_lock()
+                .execute("DELETE FROM job_history WHERE id = 'doomed'", [])
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(search_q(&app, "boom").await.is_empty());
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fts_hostile_query_does_not_500() {
+        let path = std::env::temp_dir().join(format!("anvil-fts-bad-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        db.enable_fts(crate::fts::DEFAULT_BACKFILL_BATCH)
+            .await
+            .unwrap();
+        seed_search_history(
+            &db,
+            vec![(
+                "job-1",
+                "email",
+                "Failed",
+                "trace-1",
+                Some("connection refused"),
+                10,
+                100,
+            )],
+        )
+        .await;
+        let app = state_for_fts(db.clone(), path.to_str().unwrap());
+
+        // FTS5 operator-laden / quote-only inputs must return normally, never 5xx.
+        for hostile in ["a AND ( OR *:^", "\"\"\"", "NOT refused -foo", "((("] {
+            let result = search(
+                State(app.clone()),
+                Query(SearchParams {
+                    q: Some(hostile.into()),
+                    name: None,
+                    state: None,
+                    trace_id: None,
+                    since_ms: None,
+                    limit: None,
+                }),
+            )
+            .await;
+            assert!(result.is_ok(), "hostile q {hostile:?} should not error");
+        }
+        // A benign token still matches.
+        assert_eq!(ids(&search_q(&app, "refused").await), vec!["job-1"]);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_falls_back_to_like_when_fts_disabled() {
+        let path = std::env::temp_dir().join(format!("anvil-fts-off-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![(
+                "job-1",
+                "email",
+                "Failed",
+                "trace-1",
+                Some("connection refused"),
+                10,
+                100,
+            )],
+        )
+        .await;
+        // FTS is not enabled: the index table must be absent and LIKE substring matching applies.
+        let table_exists: i64 = {
+            let conn = db.get_shared_connection();
+            tokio::task::spawn_blocking(move || {
+                conn.blocking_lock()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='job_history_fts'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(table_exists, 0);
+
+        let app = state_for(db.clone(), path.to_str().unwrap());
+        // Substring match (`fused`) works under LIKE — it would not be a token under FTS.
+        assert_eq!(ids(&search_q(&app, "fused").await), vec!["job-1"]);
+
         drop(app);
         drop(db);
         std::fs::remove_file(path).unwrap();

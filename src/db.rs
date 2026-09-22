@@ -162,6 +162,21 @@ impl DatabaseManager {
         Arc::clone(&self.conn)
     }
 
+    /// Sets up the opt-in FTS5 index over `job_history` and backfills existing rows. Creates the
+    /// virtual table plus insert/delete triggers (idempotent) and copies any not-yet-indexed
+    /// history rows in bounded batches, returning the number backfilled. Runs on a blocking thread
+    /// against the shared writer connection; intended for startup only, off the hot path.
+    pub async fn enable_fts(&self, batch: i64) -> SqlResult<usize> {
+        let conn = self.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            crate::fts::setup_blocking(&conn)?;
+            crate::fts::backfill_blocking(&conn, batch)
+        })
+        .await
+        .unwrap()
+    }
+
     fn run_migrations(conn: &mut Connection) -> SqlResult<()> {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
