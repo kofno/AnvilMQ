@@ -53,6 +53,69 @@ Completion retries use the exact same job/worker/attempt token: up to three tota
 
 Enqueue without a key and FailJob are not automatically retried. Keyed enqueue uses the bounded retry policy below. Polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
 
+## Long-running jobs
+
+A job keeps its lease for as long as it needs — minutes, if necessary — as long as heartbeats keep reaching the broker before each 30-second lease lapses. The `Worker` sends those heartbeats automatically on a background task; you never call `heartbeat` yourself. Your processor only has to cooperate in two ways.
+
+**Rule 1 — Do not block the event loop.** Heartbeats share your process's event loop. A synchronous, CPU-bound stretch (rendering a large PDF, a tight loop with no `await`) starves the heartbeat task; the lease lapses at 30 seconds; server recovery requeues the job and you get a duplicate run. Break work into chunks with `await` between them, or offload heavy compute to a `worker_threads` Worker or subprocess and `await` the result.
+
+**Rule 2 — Honor the `AbortSignal`.** If a heartbeat fails (broker unreachable, or the job was already recovered and handed to another worker), the `Worker` aborts the `signal` passed to your processor. Check `signal.aborted` at chunk boundaries and thread `signal` into abortable I/O so you stop promptly; otherwise you keep doing orphaned work that races the requeued copy. The client cannot undo external side effects, so make handlers idempotent — delivery is at least once.
+
+The helpers below (`fetchReportRows`, `renderReportOffThread`, `sendEmailIdempotent`) are illustrative placeholders for your own code.
+
+```ts
+import { Worker } from "./src/index";
+
+// Email report generation: gather data in pages, render, then send. May take minutes.
+const worker = new Worker<{ reportId: string; recipient: string }>(
+  "email-report",
+  async (job, signal) => {
+    const { reportId, recipient } = job.data;
+
+    // Bail out immediately if we've lost the lease — don't do orphaned work.
+    const ensureLeased = () => {
+      if (signal.aborted) throw new Error("lease lost; abandoning to avoid duplicate work");
+    };
+
+    // 1) Page through source data. Each `await` yields the event loop, so the
+    //    background heartbeat keeps renewing the 30-second lease while we work.
+    const rows: ReportRow[] = [];
+    for (let page = 0; ; page++) {
+      ensureLeased();
+      const batch = await fetchReportRows(reportId, page, { signal }); // pass signal to abortable I/O
+      if (batch.length === 0) break;
+      rows.push(...batch);
+    }
+
+    // 2) CPU-heavy render. Offload to a worker thread so we never block the
+    //    event loop (which would starve heartbeats). Chunk it if you render inline.
+    ensureLeased();
+    const pdf = await renderReportOffThread(rows, { signal });
+
+    // 3) Deliver. An idempotent send keyed by reportId tolerates at-least-once retries.
+    ensureLeased();
+    await sendEmailIdempotent(recipient, pdf, { idempotencyKey: reportId, signal });
+  },
+  { heartbeatIntervalMs: 10_000 }, // default; the client caps this at 10s, safely under the 30s lease
+);
+
+process.once("SIGINT", () => void worker.close()); // graceful drain; heartbeats continue until the handler settles
+```
+
+Avoid this anti-pattern:
+
+```ts
+// Starves heartbeats: a synchronous loop that never yields.
+async (job, signal) => {
+  for (const row of hugeArray) {
+    renderRowSync(row); // CPU-bound, no await -> event loop blocked
+  }
+  // ~30 seconds in, the lease is already gone and the job is being retried elsewhere.
+};
+```
+
+On success the client acknowledges with `CompleteJob` (idempotent, same attempt token); on a thrown error it sends `FailJob` (retried per `maxAttempts` and backoff); if the handler was aborted, it sends nothing and lets server recovery requeue the job.
+
 ## Safe enqueue retries
 
 ```typescript
