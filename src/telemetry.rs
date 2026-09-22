@@ -9,9 +9,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering::Relaxed},
-        Arc,
+        Arc, RwLock,
     },
     time::Instant,
 };
@@ -91,64 +92,201 @@ impl DurationHistogram {
         );
     }
 }
+/// Metric registration mode for per-job-name lifecycle series, selected by
+/// `ANVILMQ_METRICS_MODE`. `Allowlist` (default) only produces series for names shared
+/// with pressure sampling via `ANVILMQ_METRICS_QUEUES`. `All` auto-registers every job
+/// name on first sighting, up to `ANVILMQ_METRICS_MAX_NAMES`, keeping cardinality bounded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MetricsMode {
+    Allowlist,
+    All,
+}
+impl MetricsMode {
+    pub fn parse(value: &str) -> Result<Self, std::io::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "allowlist" => Ok(Self::Allowlist),
+            "all" => Ok(Self::All),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ANVILMQ_METRICS_MODE must be 'allowlist' or 'all'",
+            )),
+        }
+    }
+}
+
+/// Default and hard ceiling for `ANVILMQ_METRICS_MAX_NAMES`. The ceiling bounds worst-case
+/// cardinality (total per-name series is roughly cap x (5 counters + histogram buckets)).
+pub const DEFAULT_METRICS_MAX_NAMES: usize = 100;
+pub const METRICS_MAX_NAMES_CEILING: usize = 1000;
+
+pub fn parse_max_names(value: &str) -> Result<usize, std::io::Error> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ANVILMQ_METRICS_MAX_NAMES must be an integer in 1..=1000",
+        )
+    };
+    let cap: usize = value.trim().parse().map_err(|_| invalid())?;
+    if cap == 0 || cap > METRICS_MAX_NAMES_CEILING {
+        return Err(invalid());
+    }
+    Ok(cap)
+}
+
 #[derive(Default)]
-struct NamedSeries {
+pub(crate) struct NamedSeries {
     events: [AtomicU64; 5],
     duration: DurationHistogram,
 }
-/// Bounded per-job-name lifecycle counters and duration histogram. Only names in the
-/// configured allowlist (shared with pressure sampling via `ANVILMQ_METRICS_QUEUES`)
-/// produce series, so metric cardinality never grows with arbitrary producer names.
-#[derive(Default)]
-pub struct NamedLifecycle {
-    names: Vec<(String, NamedSeries)>,
+fn render_named_series(series: &[(&str, &NamedSeries)], out: &mut String) {
+    *out += "# HELP anvilmq_jobs_by_name_total Committed lifecycle events since process start, per job name.\n# TYPE anvilmq_jobs_by_name_total counter\n";
+    for (name, series) in series {
+        let name = escape_label(name);
+        for (i, event) in NAMED_EVENTS.iter().enumerate() {
+            *out += &format!(
+                "anvilmq_jobs_by_name_total{{name=\"{name}\",event=\"{event}\"}} {}\n",
+                series.events[i].load(Relaxed)
+            );
+        }
+    }
+    *out += "# HELP anvilmq_job_duration_seconds Enqueue to terminal (completed or exhausted-failed) latency by name; includes queue wait, retries, and backoff.\n# TYPE anvilmq_job_duration_seconds histogram\n";
+    for (name, series) in series {
+        series.duration.render(
+            "anvilmq_job_duration_seconds",
+            &format!("name=\"{}\"", escape_label(name)),
+            out,
+        );
+    }
+}
+/// Per-job-name lifecycle counters and duration histogram with bounded cardinality.
+/// `Bounded` (default) only registers names supplied up front from the allowlist and is
+/// lock-free on the hot path. `All` auto-registers names on first sighting up to `cap`;
+/// once the cap is reached, further unseen names create no series and instead increment a
+/// single `dropped` overflow counter, so metric cardinality is always bounded.
+pub enum NamedLifecycle {
+    Bounded {
+        names: Vec<(String, NamedSeries)>,
+    },
+    All {
+        cap: usize,
+        series: RwLock<BTreeMap<String, NamedSeries>>,
+        dropped: AtomicU64,
+    },
+}
+impl Default for NamedLifecycle {
+    fn default() -> Self {
+        Self::Bounded { names: Vec::new() }
+    }
 }
 impl NamedLifecycle {
     pub fn configured(names: &[String]) -> Self {
-        Self {
+        Self::Bounded {
             names: names
                 .iter()
                 .map(|n| (n.clone(), NamedSeries::default()))
                 .collect(),
         }
     }
-    fn series(&self, name: &str) -> Option<&NamedSeries> {
-        self.names.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    /// All-names mode pre-seeded from the allowlist. Seeded names count toward `cap`.
+    pub fn all(cap: usize, preseed: &[String]) -> Self {
+        let mut series = BTreeMap::new();
+        for name in preseed {
+            if series.len() >= cap {
+                break;
+            }
+            series.entry(name.clone()).or_default();
+        }
+        Self::All {
+            cap,
+            series: RwLock::new(series),
+            dropped: AtomicU64::default(),
+        }
     }
     pub fn event(&self, name: &str, event: &str) {
-        if let (Some(series), Some(i)) = (
-            self.series(name),
-            NAMED_EVENTS.iter().position(|e| *e == event),
-        ) {
-            series.events[i].fetch_add(1, Relaxed);
+        let Some(i) = NAMED_EVENTS.iter().position(|e| *e == event) else {
+            return;
+        };
+        match self {
+            Self::Bounded { names } => {
+                if let Some((_, series)) = names.iter().find(|(n, _)| n == name) {
+                    series.events[i].fetch_add(1, Relaxed);
+                }
+            }
+            Self::All {
+                cap,
+                series,
+                dropped,
+            } => {
+                if let Some(existing) = series.read().unwrap().get(name) {
+                    existing.events[i].fetch_add(1, Relaxed);
+                    return;
+                }
+                let mut guard = series.write().unwrap();
+                if let Some(existing) = guard.get(name) {
+                    existing.events[i].fetch_add(1, Relaxed);
+                } else if guard.len() < *cap {
+                    guard.entry(name.to_string()).or_default().events[i].fetch_add(1, Relaxed);
+                } else {
+                    dropped.fetch_add(1, Relaxed);
+                }
+            }
         }
     }
     pub fn observe_duration(&self, name: &str, ms: i64) {
-        if let Some(series) = self.series(name) {
-            series.duration.observe(ms);
+        match self {
+            Self::Bounded { names } => {
+                if let Some((_, series)) = names.iter().find(|(n, _)| n == name) {
+                    series.duration.observe(ms);
+                }
+            }
+            Self::All {
+                cap,
+                series,
+                dropped,
+            } => {
+                if let Some(existing) = series.read().unwrap().get(name) {
+                    existing.duration.observe(ms);
+                    return;
+                }
+                let mut guard = series.write().unwrap();
+                if let Some(existing) = guard.get(name) {
+                    existing.duration.observe(ms);
+                } else if guard.len() < *cap {
+                    guard
+                        .entry(name.to_string())
+                        .or_default()
+                        .duration
+                        .observe(ms);
+                } else {
+                    dropped.fetch_add(1, Relaxed);
+                }
+            }
         }
     }
     fn render(&self, out: &mut String) {
-        if self.names.is_empty() {
-            return;
-        }
-        *out += "# HELP anvilmq_jobs_by_name_total Committed lifecycle events since process start, per allowlisted job name.\n# TYPE anvilmq_jobs_by_name_total counter\n";
-        for (name, series) in &self.names {
-            let name = escape_label(name);
-            for (i, event) in NAMED_EVENTS.iter().enumerate() {
+        match self {
+            Self::Bounded { names } => {
+                if names.is_empty() {
+                    return;
+                }
+                let series: Vec<_> = names.iter().map(|(n, s)| (n.as_str(), s)).collect();
+                render_named_series(&series, out);
+            }
+            Self::All {
+                series, dropped, ..
+            } => {
+                let guard = series.read().unwrap();
+                let rendered: Vec<_> = guard.iter().map(|(n, s)| (n.as_str(), s)).collect();
+                render_named_series(&rendered, out);
                 *out += &format!(
-                    "anvilmq_jobs_by_name_total{{name=\"{name}\",event=\"{event}\"}} {}\n",
-                    series.events[i].load(Relaxed)
+                    "# HELP anvilmq_named_series Currently registered per-name metric series in all-names mode.\n# TYPE anvilmq_named_series gauge\nanvilmq_named_series {}\n",
+                    rendered.len()
+                );
+                *out += &format!(
+                    "# HELP anvilmq_jobs_by_name_dropped_total Lifecycle observations dropped for names beyond ANVILMQ_METRICS_MAX_NAMES; nonzero means the cap was reached.\n# TYPE anvilmq_jobs_by_name_dropped_total counter\nanvilmq_jobs_by_name_dropped_total {}\n",
+                    dropped.load(Relaxed)
                 );
             }
-        }
-        *out += "# HELP anvilmq_job_duration_seconds Enqueue to terminal (completed or exhausted-failed) latency by name; includes queue wait, retries, and backoff.\n# TYPE anvilmq_job_duration_seconds histogram\n";
-        for (name, series) in &self.names {
-            series.duration.render(
-                "anvilmq_job_duration_seconds",
-                &format!("name=\"{}\"", escape_label(name)),
-                out,
-            );
         }
     }
 }
@@ -1971,5 +2109,94 @@ mod tests {
         assert!(!Metrics::default()
             .render()
             .contains("anvilmq_jobs_by_name_total"));
+    }
+
+    #[test]
+    fn named_lifecycle_all_mode_auto_registers_unlisted_names() {
+        let metrics = Metrics {
+            named: NamedLifecycle::all(10, &[]),
+            ..Default::default()
+        };
+        metrics.named.event("Unlisted", "completed");
+        metrics.named.observe_duration("Unlisted", 5);
+        let output = metrics.render();
+        assert!(
+            output.contains("anvilmq_jobs_by_name_total{name=\"Unlisted\",event=\"completed\"} 1")
+        );
+        assert!(output.contains("anvilmq_job_duration_seconds_count{name=\"Unlisted\"} 1"));
+        assert!(output.contains("anvilmq_named_series 1"));
+        assert!(output.contains("anvilmq_jobs_by_name_dropped_total 0"));
+    }
+
+    #[test]
+    fn named_lifecycle_all_mode_enforces_cap_and_counts_dropped() {
+        let metrics = Metrics {
+            named: NamedLifecycle::all(2, &[]),
+            ..Default::default()
+        };
+        metrics.named.event("a", "enqueued");
+        metrics.named.event("b", "enqueued");
+        // The third distinct name exceeds the cap: no series, dropped increments.
+        metrics.named.event("c", "enqueued");
+        metrics.named.observe_duration("c", 9);
+        let output = metrics.render();
+        assert!(output.contains("anvilmq_jobs_by_name_total{name=\"a\",event=\"enqueued\"} 1"));
+        assert!(output.contains("anvilmq_jobs_by_name_total{name=\"b\",event=\"enqueued\"} 1"));
+        assert!(!output.contains("name=\"c\""));
+        assert!(output.contains("anvilmq_named_series 2"));
+        assert!(output.contains("anvilmq_jobs_by_name_dropped_total 2"));
+    }
+
+    #[test]
+    fn named_lifecycle_all_mode_preseeds_allowlist() {
+        let metrics = Metrics {
+            named: NamedLifecycle::all(3, &["seeded".into()]),
+            ..Default::default()
+        };
+        // A pre-seeded name renders even before any event is recorded.
+        let output = metrics.render();
+        assert!(output.contains("anvilmq_jobs_by_name_total{name=\"seeded\",event=\"enqueued\"} 0"));
+        assert!(output.contains("anvilmq_named_series 1"));
+        metrics.named.event("later", "enqueued");
+        assert!(metrics
+            .render()
+            .contains("anvilmq_jobs_by_name_total{name=\"later\",event=\"enqueued\"} 1"));
+    }
+
+    #[test]
+    fn named_lifecycle_all_mode_renders_names_in_sorted_order() {
+        let named = NamedLifecycle::all(10, &[]);
+        for name in ["gamma", "alpha", "beta"] {
+            named.event(name, "enqueued");
+        }
+        let mut output = String::new();
+        named.render(&mut output);
+        let a = output.find("name=\"alpha\"").unwrap();
+        let b = output.find("name=\"beta\"").unwrap();
+        let g = output.find("name=\"gamma\"").unwrap();
+        assert!(a < b && b < g);
+    }
+
+    #[test]
+    fn metrics_mode_parses_case_insensitively_and_rejects_unknown() {
+        assert_eq!(MetricsMode::parse("").unwrap(), MetricsMode::Allowlist);
+        assert_eq!(
+            MetricsMode::parse(" Allowlist ").unwrap(),
+            MetricsMode::Allowlist
+        );
+        assert_eq!(MetricsMode::parse("ALL").unwrap(), MetricsMode::All);
+        assert!(MetricsMode::parse("everything").is_err());
+    }
+
+    #[test]
+    fn max_names_parse_applies_bounds() {
+        assert_eq!(parse_max_names("250").unwrap(), 250);
+        assert_eq!(
+            parse_max_names(&METRICS_MAX_NAMES_CEILING.to_string()).unwrap(),
+            METRICS_MAX_NAMES_CEILING
+        );
+        assert!(parse_max_names("0").is_err());
+        assert!(parse_max_names("1001").is_err());
+        assert!(parse_max_names("lots").is_err());
     }
 }

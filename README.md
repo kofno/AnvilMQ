@@ -141,7 +141,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Cached queue-pressure depth/age, claim-wait histograms, and Grafana dashboard/Prometheus alert examples. See [queue-pressure observability](docs/observability.md).
 - [x] Read-only replica connection (WAL) with bounded concurrency and per-query timeouts for observability/search reads, isolated from the single-writer path so heavy reads never stall enqueue/claim/complete.
 - [x] Per-function overview panel (throughput, failure rate, and latency per job name), shipped as an importable Grafana dashboard packaged for the chart's Grafana sidecar.
-- [ ] All-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality (per-name series are currently bounded by the `ANVILMQ_METRICS_QUEUES` allowlist).
+- [x] All-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality (opt in with `ANVILMQ_METRICS_MODE=all`, bounded by `ANVILMQ_METRICS_MAX_NAMES`; the allowlist path via `ANVILMQ_METRICS_QUEUES` remains the default).
 - [x] Recent-failures feed endpoint (`GET /v1/failures`) served off the read-only replica, showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
 - [ ] Grafana table over the recent-failures feed (via a JSON/Infinity datasource).
 - [x] Read-only job/history search API served off the replica connection: opt-in FTS5 index maintained by triggers at history-insert/delete time (off the hot enqueue path, off by default, retention-bounded). Enable with `ANVILMQ_FTS_ENABLED`; see [search observability](docs/observability.md#search).
@@ -237,6 +237,17 @@ Metrics have only fixed state, event, method, and histogram-bound labels:
 | `anvilmq_enqueue_receipts` | Retained idempotency records, initialized from storage; monitor alongside PVC usage |
 
 The `failed` event counts accepted FailJob calls, including those scheduled for retry. Lease expiry has its own event and increments `retried` when attempts remain. State gauges initialize from jobs/history at startup; cumulative counters reset on restart. Lifecycle/receipt counts update after successful commits while the writer lock is held; conflict counters count rejected requests without mutations. Scrapes may see brief intermediate values across independent atomics and are not a transactional snapshot. Counts assume this daemon owns database writes; external SQL changes or a second process writing the same database are not reflected automatically. Idempotency metrics have no queue, key, or job-ID labels; replay/conflict logs identify the original job ID without logging keys or payloads.
+
+### Per-name metrics mode
+
+`anvilmq_jobs_by_name_total` and `anvilmq_job_duration_seconds` break lifecycle counts and duration down by job name. By default only names in the `ANVILMQ_METRICS_QUEUES` allowlist produce series, keeping producer-controlled names from creating unbounded cardinality. Opt in to per-name coverage of every function with `ANVILMQ_METRICS_MODE=all`, bounded by a cap.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ANVILMQ_METRICS_MODE` | `allowlist` | `allowlist` (default; unset behaves identically) emits per-name series only for `ANVILMQ_METRICS_QUEUES` names. `all` auto-registers every job name on first sighting, up to the cap. Parsed case-insensitively and trimmed; any other value fails startup. |
+| `ANVILMQ_METRICS_MAX_NAMES` | `100` | Cap on distinct per-name series in `all` mode (integer `1..=1000`). Names beyond the cap create no series and instead increment `anvilmq_jobs_by_name_dropped_total`; `anvilmq_named_series` reports the current registered count. Total per-name series is roughly cap x (5 counters + histogram buckets). Non-numeric, zero, or over-ceiling values fail startup. |
+
+Allowlisted names are pre-seeded in `all` mode (and count toward the cap), so pressure and named series agree. Per-queue pressure series stay allowlist-bound regardless of mode. See [all-names metric mode](docs/observability.md#all-names-metric-mode).
 
 JSON logs include committed transitions with job ID, attempt, source/destination state, and worker ID for claims and acknowledgments. Payloads and arbitrary error messages are not logged in transition events. Set `RUST_LOG` (default `info`) to control verbosity. The background log queue is bounded and may drop logs under sustained overload; logs are diagnostic, not an audit record.
 
