@@ -165,6 +165,9 @@ pub struct Metrics {
     pub recovery_errors: AtomicU64,
     retention_deleted: [[AtomicU64; 3]; 3],
     retention_errors: AtomicU64,
+    ancestry_rejections: AtomicU64,
+    chain_quarantines: AtomicU64,
+    chain_counters_pruned: AtomicU64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -249,6 +252,22 @@ impl Metrics {
     pub fn retention_error(&self) {
         self.retention_errors.fetch_add(1, Relaxed);
     }
+    /// Enqueue rejected because a supplied `parent_id` did not resolve or the child's
+    /// `execution_depth` was not exactly `parent + 1`.
+    pub fn ancestry_rejection(&self) {
+        self.ancestry_rejections.fetch_add(1, Relaxed);
+    }
+    /// Enqueue rejected because its lineage (`trace_id`) exceeded the configured
+    /// runaway-chain cap.
+    pub fn chain_quarantine(&self) {
+        self.chain_quarantines.fetch_add(1, Relaxed);
+    }
+    /// Idle per-lineage counter rows reclaimed by the retention sweeper's TTL prune.
+    pub fn chain_counters_pruned(&self, n: u64) {
+        if n > 0 {
+            self.chain_counters_pruned.fetch_add(n, Relaxed);
+        }
+    }
     pub fn render(&self) -> String {
         let mut out = String::from("# HELP anvilmq_jobs Persisted jobs by state including retained history.\n# TYPE anvilmq_jobs gauge\n");
         for (i, state) in STATES.iter().enumerate() {
@@ -297,6 +316,7 @@ impl Metrics {
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
+        out += &format!("# HELP anvilmq_ancestry_rejections_total Enqueues rejected for missing parent or inconsistent execution depth.\n# TYPE anvilmq_ancestry_rejections_total counter\nanvilmq_ancestry_rejections_total {}\n# HELP anvilmq_chain_quarantines_total Enqueues rejected because their lineage exceeded the runaway-chain cap.\n# TYPE anvilmq_chain_quarantines_total counter\nanvilmq_chain_quarantines_total {}\n# HELP anvilmq_chain_counters_pruned_total Idle per-lineage counter rows reclaimed by the retention sweeper.\n# TYPE anvilmq_chain_counters_pruned_total counter\nanvilmq_chain_counters_pruned_total {}\n", self.ancestry_rejections.load(Relaxed), self.chain_quarantines.load(Relaxed), self.chain_counters_pruned.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out

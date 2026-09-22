@@ -12,6 +12,7 @@ async fn service(path: &str) -> MyQueueService {
     MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     }
 }
 async fn add(service: &MyQueueService, req: AddJobRequest) -> Result<AddJobResponse, Status> {

@@ -49,6 +49,7 @@ async fn completion_receipt_survives_reopening_database() {
         let service = MyQueueService {
             db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
             max_execution_depth: 10,
+            max_chain_size: 0,
         };
         id = service
             .add_job(Request::new(AddJobRequest {
@@ -66,6 +67,7 @@ async fn completion_receipt_survives_reopening_database() {
         let service = MyQueueService {
             db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
             max_execution_depth: 10,
+            max_chain_size: 0,
         };
         complete(&service, &id, "worker", 1).await.unwrap();
         complete(&service, &id, "worker", 0).await.unwrap();
@@ -255,6 +257,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -271,6 +274,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -292,6 +296,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -339,6 +344,7 @@ async fn setup(max_attempts: u32) -> (MyQueueService, String) {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -718,6 +724,7 @@ async fn schedule_and_policy_survive_restart() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     service
         .add_job(Request::new(AddJobRequest {
@@ -733,6 +740,7 @@ async fn schedule_and_policy_survive_restart() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     assert!(!claim(&service).await.found);
     let conn = service.db_manager.get_shared_connection();
@@ -967,6 +975,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     service
         .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
@@ -991,6 +1000,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
     let service = MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
+        max_chain_size: 0,
     };
     assert!(!claim(&service).await.found);
     let status = service

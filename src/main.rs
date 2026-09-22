@@ -2,6 +2,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 
+#[cfg(test)]
+mod ancestry_tests;
 mod db;
 mod enqueue;
 #[cfg(test)]
@@ -32,6 +34,7 @@ use queue::v1::{
 pub struct MyQueueService {
     db_manager: Arc<DatabaseManager>,
     max_execution_depth: u32,
+    max_chain_size: u64,
 }
 
 #[tonic::async_trait]
@@ -396,9 +399,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("ANVILMQ_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".into())
         .parse()?;
+    let max_chain_size = match std::env::var("ANVILMQ_MAX_CHAIN_SIZE") {
+        Ok(value) => value.trim().parse::<u64>().map_err(|_| {
+            std::io::Error::other("ANVILMQ_MAX_CHAIN_SIZE must be a non-negative integer")
+        })?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(error) => return Err(error.into()),
+    };
     let service = MyQueueService {
         db_manager,
         max_execution_depth: 10, // Max recursion depth guardrail
+        max_chain_size,          // Runaway-chain quarantine cap; 0 disables
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -422,10 +433,25 @@ mod tests {
     use super::*;
 
     async fn service() -> MyQueueService {
-        MyQueueService {
+        let service = MyQueueService {
             db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
             max_execution_depth: 10,
-        }
+            max_chain_size: 0,
+        };
+        // Seed the ancestry parent referenced by the enqueue helper so that supplied
+        // parent_id/execution_depth pass ancestry validation. Parked in job_history so it
+        // is never claimable and does not perturb scheduling/count assertions.
+        let conn = service.db_manager.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            conn.blocking_lock().execute(
+                "INSERT INTO job_history (id, name, state, priority, payload, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at)
+                 VALUES ('parent', 'email', 'Completed', 0, X'', 'trace', 1, 1, 1, 1, 1)",
+                [],
+            ).unwrap();
+        })
+        .await
+        .unwrap();
+        service
     }
 
     async fn enqueue(service: &MyQueueService, name: &str, priority: i32, delay_ms: i64) -> String {

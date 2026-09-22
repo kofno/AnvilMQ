@@ -16,9 +16,24 @@ For a versioned container, Helm chart, and packaged Bun client, see [evaluation 
 
 ### Enqueue
 
-`AddJob` persists a UUID, payload, priority, ancestry metadata, attempts limit, timestamps, and optional rate-limit facet. Missing trace IDs are generated. Execution depth greater than 10 is rejected before persistence; ancestry is not verified against a parent record. An immediate transaction atomically inserts the job and, when requested, its idempotency receipt.
+`AddJob` persists a UUID, payload, priority, ancestry metadata, attempts limit, timestamps, and optional rate-limit facet. Missing trace IDs are generated. Execution depth greater than 10 is rejected before persistence. When `parent_id` is supplied, ancestry is validated against the referenced record (see below). An immediate transaction atomically inserts the job and, when requested, its idempotency receipt.
 
 Optional `idempotency_key` (protobuf tag 10) deduplicates within the exact job/queue `name`. Empty/omitted means ordinary enqueue; nonempty keys must be nonblank and at most 256 UTF-8 bytes. Matching retries return the original ID and initial enqueue state with `replayed=true` (response tag 3), even after completion or failure. This is an enqueue receipt, not a current-state query. Replays do not reset delays, create another job, consume attempts, or increment the enqueued counter.
+
+### Ancestry validation and runaway-chain quarantine
+
+The execution-depth cap only holds if callers honestly propagate and increment `execution_depth`. Two enqueue-time controls harden this, both evaluated inside the existing immediate transaction using indexed point lookups so the hot path stays cheap. They are backward compatible: an enqueue with no `parent_id` (and with the chain cap unset) behaves exactly as before.
+
+- **Ancestry integrity** applies only when `parent_id` is supplied. The parent is resolved by primary key across the live `jobs` table and `job_history`. A missing parent is rejected with `FAILED_PRECONDITION`; a child whose `execution_depth` is not exactly `parent.execution_depth + 1` is rejected with `INVALID_ARGUMENT`. When a valid parent is found, the child **inherits the parent's `trace_id`** authoritatively — any supplied or absent `trace_id` is overridden with the parent's lineage id. This closes the quarantine-evasion hole for callers that would otherwise vary `trace_id` per hop; correct callers that already propagate the parent's `trace_id` are unaffected. Root jobs (no `parent_id`) keep generating/using their own `trace_id` as before. This backs the AGENTS.md "Enforce depth checks" rule with a verified parent relationship rather than a self-reported counter.
+
+- **Runaway-chain quarantine** bounds the total number of jobs spawned within a single lineage, keyed by the root-chain `trace_id`. A per-trace counter (`chain_counters`) is upserted in the same transaction. Once the count reaches `ANVILMQ_MAX_CHAIN_SIZE`, further enqueues in that lineage are quarantined and rejected with `RESOURCE_EXHAUSTED` ("chain quarantined"). The cap is configurable and safely disable-able: `0` or unset disables enforcement entirely (and skips all counter writes), so it can be turned off under pressure. Idempotent replays/conflicts return before this logic and never count.
+
+Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage whose counter has not been touched within `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` (default 7 days; `0` disables the prune) is deleted in bounded batches, so the table does not grow unbounded across a long-lived process. Metrics `anvilmq_ancestry_rejections_total`, `anvilmq_chain_quarantines_total`, and `anvilmq_chain_counters_pruned_total` surface on `/metrics`.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Max jobs per lineage (`trace_id`) before further enqueues are quarantined. |
+| `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
 
 The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate.
 
@@ -104,7 +119,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 ### Phase 3: Safety controls
 
 - [x] Persist metadata and reject supplied execution depth above the limit.
-- [ ] Validate ancestry and quarantine runaway chains.
+- [x] Validate ancestry and quarantine runaway chains.
 - [ ] Sliding-window ingress velocity controls.
 
 ### Phase 4: Faceted rate limiting
@@ -165,6 +180,7 @@ Terminal jobs are copied into `job_history` and keyed enqueues leave dedup recor
 - Failed jobs older than `ANVILMQ_RETENTION_FAILED_AGE_MS` (default `604800000`, 7d) are deleted; `ANVILMQ_RETENTION_FAILED_COUNT` (default `0`, disabled) bounds retained failures per name.
 - The sweep runs every `ANVILMQ_RETENTION_INTERVAL_MS` (default `60000`) and deletes at most `ANVILMQ_RETENTION_BATCH` rows per statement (default `1000`), draining backlogs across ticks so the shared writer is never held for long.
 - An idempotency receipt is removed once its job is gone from both the live and history tables, so the dedup window tracks job retention exactly.
+- Idle runaway-chain counters (`chain_counters`, keyed by lineage `trace_id`) are pruned once untouched for `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` (default `604800000`, 7d; `0` disables the prune), bounding the counter table across a long-lived process. See [Ancestry validation and runaway-chain quarantine](#ancestry-validation-and-runaway-chain-quarantine).
 - Age values below a safety floor (`2 x` the 30s lease) are rejected at startup so a terminal job cannot be pruned while a duplicate lifecycle RPC is still replaying against history. Set every dimension to `0` to disable the sweeper entirely.
 
 Space is reclaimed by SQLite page reuse at steady state; the sweeper does not run `VACUUM`, which would lock the writer. The `anvilmq_jobs{state}` gauges for terminal states flatten once retention keeps pace with completion throughput.
