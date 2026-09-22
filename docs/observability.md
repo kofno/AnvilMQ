@@ -83,7 +83,7 @@ Query parameters (all optional individually, but at least one is required):
 
 | Parameter | Type | Meaning |
 | --- | --- | --- |
-| `q` | string | Free-text match across `id`, `name`, `trace_id`, and `last_error` (a bounded set of low-cost text columns). Whitespace-only is treated as absent. |
+| `q` | string | Free-text match across `id`, `name`, `trace_id`, and `last_error` (a bounded set of low-cost text columns). Whitespace-only is treated as absent. Uses escaped LIKE by default, or tokenized FTS5 `MATCH` when `ANVILMQ_FTS_ENABLED` is set (see [Opt-in full-text search](#opt-in-full-text-search-fts5)). |
 | `name` | string | Restrict to one job name (exact match). |
 | `state` | string | Restrict to one lifecycle state, e.g. `Failed` or `Completed` (exact match). |
 | `trace_id` | string | Restrict to one trace id (exact match). |
@@ -116,7 +116,13 @@ Rows are ordered by `finished_at` descending (newest first), backed by the `idx_
 (Invoke-WebRequest "http://127.0.0.1:9090/v1/search?q=timeout&state=Failed&limit=50").Content
 ```
 
-A full-text index (SQLite FTS5), populated at history-insert time and off by default, is a planned opt-in follow-up for richer ranked search; this PR ships the structured + escaped-LIKE search only.
+### Opt-in full-text search (FTS5)
+
+By default `q` is the escaped-LIKE substring scan described above. Setting `ANVILMQ_FTS_ENABLED` to a truthy value (`1`, `true`, or `yes`, ASCII case-insensitive) switches the free-text path to a SQLite FTS5 full-text index. It is **off by default**; when disabled there is no index, no triggers, and no added write cost, and `/v1/search` behaves exactly as documented above.
+
+- **What is indexed.** A standalone FTS5 table (`job_history_fts`) over `job_history` metadata only: `name`, `trace_id`, and `last_error` are tokenized and searchable, and `id` is stored `UNINDEXED` for retrieval. The payload BLOB is intentionally not indexed (a future opt-in).
+- **Query semantics.** When enabled and `q` is present, `q` is resolved with `MATCH` (joined back to `job_history` so every returned field and the structured `name`/`state`/`trace_id`/`since_ms`/`limit` filters still apply and the response shape is unchanged). Matching is token-based rather than substring: `q=smtp` finds a row whose `last_error` is `timeout talking to smtp`, but a partial token like `mtp` does not match. Each whitespace-separated term is quoted and escaped before it reaches FTS5, so query text is treated as literal terms (implicit AND) — FTS5 operators are neutralized and a pathological `q` returns an empty/best-effort result, never an HTTP 5xx. Requests with no `q` (structured filters only) are unaffected by the flag.
+- **Maintenance and retention.** The index is kept in sync by SQLite triggers, not application code: an `AFTER INSERT` trigger mirrors each new terminal row in and an `AFTER DELETE` trigger removes it, so the index stays correct across every write site and is automatically bounded by the retention sweeper (pruned history rows drop out of the index in the same transaction). Existing history is backfilled into the index once at startup, in bounded batches and idempotently, off the hot path.
 
 ## Console
 

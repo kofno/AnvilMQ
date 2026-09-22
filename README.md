@@ -7,7 +7,7 @@ AnvilMQ is an early-stage Rust queue engine intended for autonomous regional Kub
 For a versioned container, Helm chart, and packaged Bun client, see [evaluation releases and Azure deployment](docs/release-and-deploy.md). The chart deploys one broker with FULL durability and a dedicated PVC; it does not provide HA yet.
 
 - Rust Edition 2021, Tokio, and Tonic/Protocol Buffers.
-- Bundled SQLite through `rusqlite`. The target architecture in AGENTS.md specifies libSQL; that migration remains open.
+- Bundled SQLite through `rusqlite`. AGENTS.md describes the storage layer as libSQL; in practice the broker standardizes on the bundled `rusqlite` SQLite build (the amalgamation ships FTS5 and WAL in-box), and the earlier "migrate to libSQL" question is resolved in its favor.
 - Database work runs in `spawn_blocking`, with one shared connection protected by a mutex.
 - WAL with configurable `ANVILMQ_DURABILITY=NORMAL|FULL` (default NORMAL). NORMAL permits loss of recent acknowledged writes after OS/power failure; FULL requests commit synchronization on retained storage. Startup logs the applied settings. See the [durability contract](docs/durability.md) for storage assumptions and operational guidance.
 - Initial schema creation and additive ownership/error-history migrations run in a transaction. Existing jobs are preserved.
@@ -103,7 +103,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Rust project and core protobuf contract.
 - [x] Tonic server bootstrap.
 - [x] Embedded SQLite connection, WAL, and initial schema.
-- [ ] Resolve the libSQL target versus current rusqlite implementation.
+- [x] Resolve the libSQL target versus current rusqlite implementation: standardized on the bundled `rusqlite` SQLite build.
 
 ### Phase 2: Transactional lifecycle (current focus)
 
@@ -144,8 +144,8 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [ ] All-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality (per-name series are currently bounded by the `ANVILMQ_METRICS_QUEUES` allowlist).
 - [x] Recent-failures feed endpoint (`GET /v1/failures`) served off the read-only replica, showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
 - [ ] Grafana table over the recent-failures feed (via a JSON/Infinity datasource).
-- [ ] Read-only job/history search API served off the replica connection: opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
-- [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded). FTS5 is a follow-up.
+- [x] Read-only job/history search API served off the replica connection: opt-in FTS5 index maintained by triggers at history-insert/delete time (off the hot enqueue path, off by default, retention-bounded). Enable with `ANVILMQ_FTS_ENABLED`; see [search observability](docs/observability.md#search).
+- [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded), with an opt-in FTS5 `MATCH` path when `ANVILMQ_FTS_ENABLED` is set.
 - [x] Read-only single-job detail endpoint (`GET /v1/jobs/{id}`) served off the replica connection: the full record for one job — including the payload and ancestry — unioning the live `jobs` table and `job_history` via a `source` discriminator.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
@@ -214,6 +214,7 @@ The read-only replica connection is configured with two environment variables:
 | --- | --- | --- |
 | `ANVILMQ_READER_MAX_CONCURRENCY` | `4` | Maximum concurrent read-only connections for observability reads. Values below 1 (or unparsable) normalize to 1. |
 | `ANVILMQ_READER_TIMEOUT_MS` | `500` | Per-query wall-clock budget in milliseconds; a query exceeding it is interrupted and the request returns 503. |
+| `ANVILMQ_FTS_ENABLED` | `false` | Opt-in FTS5 full-text index for `/v1/search` free-text `q`. Truthy values (`1`, `true`, `yes`) enable a trigger-maintained, retention-bounded index over `job_history` metadata; off by default, with zero write cost when disabled. See [search observability](docs/observability.md#opt-in-full-text-search-fts5). |
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:9090/healthz

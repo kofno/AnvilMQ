@@ -8,6 +8,7 @@ mod db;
 mod enqueue;
 #[cfg(test)]
 mod enqueue_tests;
+mod fts;
 mod leases;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -340,6 +341,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.named = named;
     }
     let db_manager = Arc::new(manager);
+    // Opt-in full-text search: create the FTS5 index + triggers and backfill existing history
+    // rows once at startup, off the hot path. Disabled by default (zero write cost when off).
+    let fts_enabled = fts::enabled_from_env();
+    if fts_enabled {
+        let backfilled = db_manager.enable_fts(fts::DEFAULT_BACKFILL_BATCH).await?;
+        tracing::info!(backfilled, "full-text search enabled");
+    }
     // Isolated read-only WAL replica connection for observability reads (e.g. /v1/failures).
     // Built before database_path is moved into pressure::spawn below.
     let reader = Arc::new(reader::Reader::from_env(database_path.clone()));
@@ -347,8 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9090".into())
         .parse()?;
-    let http = axum::Server::try_bind(&http_addr)?
-        .serve(telemetry::router(db_manager.clone(), reader.clone()).into_make_service());
+    let http = axum::Server::try_bind(&http_addr)?.serve(
+        telemetry::router(db_manager.clone(), reader.clone(), fts_enabled).into_make_service(),
+    );
     let recovery_db = db_manager.clone();
     let recovery = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
