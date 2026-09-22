@@ -75,9 +75,52 @@ Rows are ordered by `finished_at` descending (newest first), backed by the `idx_
 
 A Grafana table over this endpoint (via a JSON/Infinity datasource) is a follow-up; this ships the endpoint only.
 
+## Search
+
+`GET /v1/search` runs a read-only search over `job_history` — the retention-bounded record of terminal runs — and returns a JSON array. It answers "find the past runs that match X" for on-call drill-down when the aggregate counters and the recent-failures feed are not specific enough. Live in-flight `jobs` are not searched (a follow-up), and neither is the payload BLOB (heavy; a future opt-in). The read runs on the isolated read-only WAL replica connection ([see the reader primitive](#read-only-replica-connection)); it opens a separate `SQLITE_OPEN_READ_ONLY` connection and never acquires the single-writer mutex, so search cannot stall enqueue/claim/complete. Concurrency and per-query time are bounded by `ANVILMQ_READER_MAX_CONCURRENCY` and `ANVILMQ_READER_TIMEOUT_MS`; a busy or timed-out read returns HTTP 503.
+
+Query parameters (all optional individually, but at least one is required):
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `q` | string | Free-text match across `id`, `name`, `trace_id`, and `last_error` (a bounded set of low-cost text columns). Whitespace-only is treated as absent. |
+| `name` | string | Restrict to one job name (exact match). |
+| `state` | string | Restrict to one lifecycle state, e.g. `Failed` or `Completed` (exact match). |
+| `trace_id` | string | Restrict to one trace id (exact match). |
+| `since_ms` | integer | Only rows with `finished_at >= since_ms` (inclusive). `finished_at` is used (not `created_at`) because history is retention-bounded by it and it is index-backed. |
+| `limit` | integer | Page size; defaults to 100 and is hard-capped at 1000. |
+
+At least one of `q`, `name`, `state`, `trace_id`, or `since_ms` must be present; a request with no predicate returns HTTP 400 rather than scanning the whole table. The `limit` cap is always enforced.
+
+`q` is matched with SQL `LIKE ? ESCAPE '\'` and is always bound as a parameter — never interpolated. The `\`, `%`, and `_` characters in the query are escaped, so a `q` of `100%` or `id_1` matches those characters literally instead of acting as wildcards.
+
+Rows are ordered by `finished_at` descending (newest first), backed by the `idx_history_name_state_finished` / `idx_history_state_finished` indexes for the common `name`/`state`/`since_ms` filters. Each element has the shape:
+
+```json
+{
+  "id": "0f9c…",
+  "name": "email",
+  "state": "Failed",
+  "attempts": 3,
+  "created_at": 1727039990000,
+  "finished_at": 1727040000000,
+  "last_error": "connection refused",
+  "trace_id": "abc123",
+  "execution_depth": 0
+}
+```
+
+`last_error` and `trace_id` may be `null`. Example:
+
+```powershell
+(Invoke-WebRequest "http://127.0.0.1:9090/v1/search?q=timeout&state=Failed&limit=50").Content
+```
+
+A full-text index (SQLite FTS5), populated at history-insert time and off by default, is a planned opt-in follow-up for richer ranked search; this PR ships the structured + escaped-LIKE search only.
+
 ## Read-only replica connection
 
-Observability read endpoints (currently the recent-failures feed) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
+Observability read endpoints (currently the recent-failures feed and the search API) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
 
 ## Dashboard and alerts
 

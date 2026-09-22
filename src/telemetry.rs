@@ -337,6 +337,7 @@ pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(ready))
         .route("/v1/failures", get(failures))
+        .route("/v1/search", get(search))
         .with_state(AppState { db, reader })
 }
 async fn metrics(
@@ -444,6 +445,151 @@ async fn failures(
                     last_error: r.get(4)?,
                     trace_id: r.get(5)?,
                     execution_depth: r.get(6)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|error| match error {
+            ReaderError::Busy | ReaderError::Timeout | ReaderError::Unavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(rows))
+}
+
+/// Default and hard-capped page size for the search API.
+const SEARCH_DEFAULT_LIMIT: usize = 100;
+const SEARCH_MAX_LIMIT: usize = 1000;
+/// Escape character for LIKE patterns. User input has `\`, `%`, and `_` escaped against this so
+/// wildcards in a query are matched literally rather than expanding the search.
+const LIKE_ESCAPE: char = '\\';
+
+/// Escapes LIKE metacharacters in user input so `%` and `_` match literally. The escape character
+/// itself is escaped first to avoid double-expansion. The result is wrapped in `%…%` by the caller
+/// and bound as a parameter (never interpolated), with `ESCAPE '\'` on every LIKE clause.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch == LIKE_ESCAPE || ch == '%' || ch == '_' {
+            out.push(LIKE_ESCAPE);
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Query parameters for `GET /v1/search`.
+#[derive(Deserialize)]
+pub struct SearchParams {
+    /// Free-text query; escaped LIKE match across `id`, `name`, `trace_id`, and `last_error`.
+    /// Empty/whitespace is treated as absent. The payload BLOB is intentionally not searched.
+    q: Option<String>,
+    /// Optional exact job-name filter.
+    name: Option<String>,
+    /// Optional exact lifecycle-state filter (e.g. `Failed`, `Completed`).
+    state: Option<String>,
+    /// Optional exact trace-id filter.
+    trace_id: Option<String>,
+    /// Optional lower bound on `finished_at` (inclusive); only rows finished at or after this.
+    since_ms: Option<i64>,
+    /// Page size; defaults to 100 and is hard-capped at 1000.
+    limit: Option<usize>,
+}
+
+/// One `job_history` row returned by the search API.
+#[derive(Serialize, Debug)]
+pub struct SearchRow {
+    id: String,
+    name: String,
+    state: String,
+    attempts: i64,
+    created_at: i64,
+    finished_at: i64,
+    last_error: Option<String>,
+    trace_id: Option<String>,
+    execution_depth: i64,
+}
+
+/// Read-only job/history search served off the WAL replica connection.
+///
+/// Searches `job_history` — the retention-bounded record of terminal runs — with structured
+/// filters plus an escaped LIKE free-text match. Live in-flight `jobs` are not searched here (a
+/// follow-up), and neither is the payload BLOB (heavy; a future opt-in). At least one predicate is
+/// required so the query is never an unbounded full scan; results are ordered `finished_at DESC`
+/// and backed by the `idx_history_*_finished` indexes where the filters allow. Like `/v1/failures`,
+/// the read runs on the isolated `Reader` and never contends on the single-writer mutex.
+async fn search(
+    State(app): State<AppState>,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Vec<SearchRow>>, StatusCode> {
+    let limit = params
+        .limit
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
+        .min(SEARCH_MAX_LIMIT) as i64;
+    // Treat an empty/whitespace query as absent so it never counts as a predicate.
+    let q = params
+        .q
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let name = params.name;
+    let state = params.state;
+    let trace_id = params.trace_id;
+    let since_ms = params.since_ms;
+    // Reject a predicate-free request rather than scanning the whole history table.
+    if q.is_none() && name.is_none() && state.is_none() && trace_id.is_none() && since_ms.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rows = app
+        .reader
+        .query(move |conn| {
+            // Fully parameterized; user input never interpolated into SQL.
+            let mut sql = String::from(
+                "SELECT id, name, state, attempts, created_at, finished_at, last_error, trace_id, execution_depth \
+                 FROM job_history WHERE 1=1",
+            );
+            let mut args: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(q) = q {
+                let pattern = format!("%{}%", escape_like(&q));
+                let idx = args.len() + 1;
+                sql.push_str(&format!(
+                    " AND (id LIKE ?{idx} ESCAPE '\\' OR name LIKE ?{idx} ESCAPE '\\' \
+                       OR trace_id LIKE ?{idx} ESCAPE '\\' OR last_error LIKE ?{idx} ESCAPE '\\')"
+                ));
+                args.push(rusqlite::types::Value::Text(pattern));
+            }
+            if let Some(name) = name {
+                args.push(rusqlite::types::Value::Text(name));
+                sql.push_str(&format!(" AND name = ?{}", args.len()));
+            }
+            if let Some(state) = state {
+                args.push(rusqlite::types::Value::Text(state));
+                sql.push_str(&format!(" AND state = ?{}", args.len()));
+            }
+            if let Some(trace_id) = trace_id {
+                args.push(rusqlite::types::Value::Text(trace_id));
+                sql.push_str(&format!(" AND trace_id = ?{}", args.len()));
+            }
+            if let Some(since) = since_ms {
+                args.push(rusqlite::types::Value::Integer(since));
+                sql.push_str(&format!(" AND finished_at >= ?{}", args.len()));
+            }
+            args.push(rusqlite::types::Value::Integer(limit));
+            sql.push_str(&format!(" ORDER BY finished_at DESC LIMIT ?{}", args.len()));
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args), |r| {
+                Ok(SearchRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    state: r.get(2)?,
+                    attempts: r.get(3)?,
+                    created_at: r.get(4)?,
+                    finished_at: r.get(5)?,
+                    last_error: r.get(6)?,
+                    trace_id: r.get(7)?,
+                    execution_depth: r.get(8)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -609,6 +755,416 @@ mod tests {
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
+
+    /// Seeds `job_history` with full rows for the search tests.
+    /// Columns per tuple: (id, name, state, trace_id, last_error, created_at, finished_at).
+    async fn seed_search_history(
+        db: &DatabaseManager,
+        rows: Vec<(&str, &str, &str, &str, Option<&str>, i64, i64)>,
+    ) {
+        let owned: Vec<(String, String, String, String, Option<String>, i64, i64)> = rows
+            .into_iter()
+            .map(|(id, name, state, trace, err, created, finished)| {
+                (
+                    id.to_string(),
+                    name.to_string(),
+                    state.to_string(),
+                    trace.to_string(),
+                    err.map(|e| e.to_string()),
+                    created,
+                    finished,
+                )
+            })
+            .collect();
+        let conn = db.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            for (id, name, state, trace, err, created, finished) in owned {
+                conn.execute(
+                    "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, last_error) \
+                     VALUES (?1, ?2, ?3, 0, X'', NULL, ?4, 0, 3, 3, ?5, ?6, ?7)",
+                    rusqlite::params![id, name, state, trace, created, finished, err],
+                )
+                .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn ids(rows: &[SearchRow]) -> Vec<String> {
+        rows.iter().map(|r| r.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn search_like_matches_across_columns_and_filters_narrow() {
+        let path = std::env::temp_dir().join(format!("anvil-search-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![
+                (
+                    "job-alpha",
+                    "email",
+                    "Failed",
+                    "trace-1",
+                    Some("timeout talking to smtp"),
+                    10,
+                    100,
+                ),
+                ("job-beta", "sms", "Completed", "trace-2", None, 20, 200),
+                (
+                    "gamma-id",
+                    "email",
+                    "Failed",
+                    "alpha-trace",
+                    Some("boom"),
+                    30,
+                    300,
+                ),
+            ],
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        // `q` matches id (job-alpha) and trace_id (alpha-trace).
+        let by_alpha = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("alpha".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&by_alpha), vec!["gamma-id", "job-alpha"]);
+
+        // `q` matches last_error text.
+        let by_error = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("smtp".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&by_error), vec!["job-alpha"]);
+
+        // `q` matches name.
+        let by_name_q = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("sms".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&by_name_q), vec!["job-beta"]);
+
+        // Structured filters narrow: name + state.
+        let email_failed = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: Some("email".into()),
+                state: Some("Failed".into()),
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&email_failed), vec!["gamma-id", "job-alpha"]);
+
+        // trace_id exact filter.
+        let by_trace = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: None,
+                state: None,
+                trace_id: Some("trace-2".into()),
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&by_trace), vec!["job-beta"]);
+
+        // since_ms lower bound (inclusive) on finished_at.
+        let recent = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: Some(200),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&recent), vec!["gamma-id", "job-beta"]);
+
+        // Nullable fields round-trip.
+        assert_eq!(by_trace[0].last_error, None);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_escapes_like_metacharacters() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-search-esc-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![
+                (
+                    "id-100pct",
+                    "email",
+                    "Failed",
+                    "t1",
+                    Some("100% failure"),
+                    10,
+                    100,
+                ),
+                (
+                    "id-plain",
+                    "email",
+                    "Failed",
+                    "t2",
+                    Some("50 percent"),
+                    20,
+                    200,
+                ),
+                (
+                    "id_under",
+                    "email",
+                    "Failed",
+                    "t3",
+                    Some("has_underscore"),
+                    30,
+                    300,
+                ),
+                (
+                    "idXunder",
+                    "email",
+                    "Failed",
+                    "t4",
+                    Some("noUnderscore"),
+                    40,
+                    400,
+                ),
+            ],
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        // `%` is literal: matches only the "100%" row, not every row.
+        let pct = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("100%".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&pct), vec!["id-100pct"]);
+
+        // `_` is literal: matches "id_under" but NOT "idXunder".
+        let under = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("id_under".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&under), vec!["id_under"]);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_orders_caps_and_requires_predicate() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-search-cap-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![
+                ("s1", "email", "Failed", "t", Some("e"), 10, 100),
+                ("s2", "email", "Failed", "t", Some("e"), 20, 300),
+                ("s3", "email", "Failed", "t", Some("e"), 30, 200),
+            ],
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        // Ordered finished_at DESC.
+        let ordered = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: Some("email".into()),
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&ordered), vec!["s2", "s3", "s1"]);
+
+        // limit honored.
+        let limited = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: Some("email".into()),
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&limited), vec!["s2"]);
+
+        // Oversized limit clamps to the hard cap rather than erroring.
+        let capped = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: None,
+                name: Some("email".into()),
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: Some(50_000),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(capped.len(), 3);
+
+        // No predicate at all → 400, never an unbounded scan. Whitespace-only q counts as absent.
+        let err = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("   ".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_returns_while_writer_mutex_held() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-search-iso-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        seed_search_history(
+            &db,
+            vec![("iso", "email", "Failed", "t", Some("boom"), 10, 100)],
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+        // Hold the writer mutex for the whole read to prove the reader is isolated from it.
+        let conn = db.get_shared_connection();
+        let guard = conn.lock().await;
+        let rows = search(
+            State(app.clone()),
+            Query(SearchParams {
+                q: Some("boom".into()),
+                name: None,
+                state: None,
+                trace_id: None,
+                since_ms: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ids(&rows), vec!["iso"]);
+        drop(guard);
+        drop(conn);
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn named_lifecycle_is_bounded_to_allowlist_and_renders_series() {
         let metrics = Metrics {
