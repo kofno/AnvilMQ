@@ -128,7 +128,8 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [ ] All-names / auto-registered-up-to-a-cap metric mode so every function appears without unbounded producer-label cardinality (per-name series are currently bounded by the `ANVILMQ_METRICS_QUEUES` allowlist).
 - [x] Recent-failures feed endpoint (`GET /v1/failures`) served off the read-only replica, showing terminal failures (name, finished_at, last_error, attempts, trace_id); excludes in-flight retries since only exhausted failures reach job_history.
 - [ ] Grafana table over the recent-failures feed (via a JSON/Infinity datasource).
-- [ ] Read-only job/history search API served off the replica connection: structured/LIKE search first (no write-path cost, retention-bounded), then an opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
+- [ ] Read-only job/history search API served off the replica connection: opt-in FTS5 index populated at history-insert time (off the hot enqueue path, off by default, retention-bounded).
+- [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded). FTS5 is a follow-up.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 
@@ -185,6 +186,7 @@ The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR
 - `GET /healthz`: HTTP 200 while the HTTP server is responsive; no database dependency.
 - `GET /readyz`: HTTP 200 after opening a database write transaction, reading the jobs table, and rolling back. Returns 503 for contention, database errors, or a one-second timeout. It deliberately fails fast if the shared connection is busy; use a failure threshold for deployment probes. A timed-out SQLite call can continue on its blocking thread, with subsequent probes failing fast until it releases the connection. This is an access check, not a disk durability or capacity test.
 - `GET /v1/failures`: Recent terminal (exhausted) failures from `job_history` as JSON, served read-only off the WAL replica connection and isolated from the single-writer path. Accepts `name`, `since_ms`, and `limit` query parameters. See [the recent-failures feed](docs/observability.md#recent-failures-feed) for the parameters and response shape.
+- `GET /v1/search`: Read-only search over `job_history` (retention-bounded past runs) as JSON, served off the WAL replica connection. Accepts a free-text `q` (escaped LIKE across `id`, `name`, `trace_id`, `last_error`) plus structured filters `name`, `state`, `trace_id`, `since_ms`, and `limit` (default 100, hard cap 1000). At least one predicate is required. See [search](docs/observability.md#search) for details.
 
 The read-only replica connection is configured with two environment variables:
 
