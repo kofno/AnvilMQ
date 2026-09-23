@@ -38,6 +38,8 @@ Allowlisted names (`ANVILMQ_METRICS_QUEUES`) are pre-seeded up front in `all` mo
 | `anvilmq_pressure_sample_timestamp_seconds` | Last successful sample Unix timestamp. Zero until first success. |
 | `anvilmq_pressure_sample_errors_total` | Failed/interrupted sample attempts since startup. |
 | `anvilmq_pressure_sample_duration_seconds` | Duration of the last sampling attempt. |
+| `anvilmq_enqueue_rejections_total{kind}` | Admission-time enqueue rejections by kind (`ingress_velocity`, `parent_not_found`, `inconsistent_depth`, `circuit_breaker`, `chain_quarantine`). Each corresponds to a durable row in the [enqueue-rejections feed](#enqueue-rejections-feed); rejected enqueues never become jobs. |
+| `anvilmq_rejections_pruned_total` | Aged-out forensic `enqueue_rejections` rows reclaimed by the retention sweeper (`ANVILMQ_RETENTION_REJECTIONS_AGE_MS`). |
 
 `scope="all",queue=""` is the aggregate; `scope="queue"` identifies allowlisted queues. Do not sum both scopes. Named queues remain present at zero after they drain. Histograms and lifecycle event rates are broker-wide in this increment, not per queue. Counters/histograms reset on restart; use `rate`/`increase`, not subtraction across restarts.
 
@@ -88,6 +90,46 @@ Rows are ordered by `finished_at` descending (newest first), backed by the `idx_
 ```
 
 A Grafana table over this endpoint ships as the `anvilmq-failures` dashboard, backed by the Infinity datasource; see [Dashboard and alerts](#dashboard-and-alerts).
+
+## Enqueue rejections feed
+
+`GET /v1/rejections` returns durably-recorded admission-time enqueue rejections from `enqueue_rejections` as a JSON array. It captures the five rejection kinds that are refused at enqueue time — `ingress_velocity`, `parent_not_found`, `inconsistent_depth`, `circuit_breaker`, and `chain_quarantine` — each of which creates **no job row**. Because the rejected enqueue never became a job, these events appear nowhere in the recent-failures feed or the search API; this feed is the only record-level trail for them.
+
+It exists for durable forensics. A rejected enqueue used to leave only an aggregate counter increment and a transient log line, so once the log rotated there was no way to reconstruct which lineage tripped a circuit breaker or chain quarantine. Each row here carries `trace_id` and `parent_id`, so an operator can trace a rejection back to the offending lineage even after that lineage's jobs have been pruned from job history.
+
+The read runs on the isolated read-only WAL replica connection ([see the reader primitive](#read-only-replica-connection)); it opens a separate `SQLITE_OPEN_READ_ONLY` connection and never acquires the single-writer mutex, so the feed cannot stall enqueue/claim/complete. Concurrency and per-query time are bounded by `ANVILMQ_READER_MAX_CONCURRENCY` and `ANVILMQ_READER_TIMEOUT_MS`; a busy or timed-out read returns HTTP 503.
+
+Query parameters (all optional):
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `kind` | string | Restrict to one rejection kind (exact match), e.g. `circuit_breaker`. |
+| `name` | string | Restrict to one job name (exact match). |
+| `trace_id` | string | Restrict to one lineage (exact `trace_id` match). |
+| `since_ms` | integer | Only rows with `rejected_at >= since_ms` (inclusive). |
+| `limit` | integer | Page size; defaults to 100 and is hard-capped at 1000. |
+
+Rows are ordered by `rejected_at` descending (newest first), then `id` descending, backed by the `idx_rejections_name_rejected` / `idx_rejections_rejected_at` indexes. Each element has the shape:
+
+```json
+{
+  "id": 42,
+  "rejected_at": 1727040000000,
+  "kind": "circuit_breaker",
+  "name": "fanout",
+  "trace_id": "abc123",
+  "parent_id": "0f9c…",
+  "execution_depth": 32,
+  "rate_limit_facet": "tenant-7",
+  "detail": "execution depth 32 exceeds maximum"
+}
+```
+
+`trace_id`, `parent_id`, `execution_depth`, and `rate_limit_facet` may be `null`. Rows are retention-bounded: records older than `ANVILMQ_RETENTION_REJECTIONS_AGE_MS` (default `604800000`, 7d; `0` disables) are deleted by the retention sweeper, and the reclaimed-row count surfaces as `anvilmq_rejections_pruned_total`. Example:
+
+```powershell
+(Invoke-WebRequest "http://127.0.0.1:9090/v1/rejections?kind=circuit_breaker&limit=50").Content
+```
 
 ## Search
 
@@ -181,7 +223,7 @@ expose the HTTP listener only on a trusted network.
 
 ## Read-only replica connection
 
-Observability read endpoints (currently the recent-failures feed and the search API) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
+Observability read endpoints (currently the recent-failures feed, the enqueue-rejections feed, and the search API) run on a dedicated read-only connection rather than the broker's single writer. SQLite in WAL mode allows one writer plus many concurrent readers, so each read opens a fresh `SQLITE_OPEN_READ_ONLY` connection (with `query_only=true` and a tight busy timeout), runs on the blocking thread pool, and is interrupted by a progress handler once the per-query budget is exhausted — the same safeguards the pressure sampler uses. Because these connections never touch the writer mutex, heavy or slow reads are isolated from enqueue/claim/complete. Two environment variables bound the primitive: `ANVILMQ_READER_MAX_CONCURRENCY` (default 4, minimum 1) caps concurrent reader connections, and `ANVILMQ_READER_TIMEOUT_MS` (default 500) caps per-query wall-clock time. File-backed storage is required; `:memory:` databases are per-connection and invisible to the separate reader.
 
 ## Dashboard and alerts
 
