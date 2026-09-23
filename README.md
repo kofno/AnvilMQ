@@ -43,7 +43,7 @@ New per-job protobuf fields `retry_backoff_ms` (tag 8) and `retry_backoff_max_ms
 
 After attempt N fails, delay is `min(base * 2^(N-1), cap)`. For base 1000 and cap 10000, delays are 1s, 2s, 4s, 8s, then 10s. The same policy applies to expired leases, measured from recovery time. Positive retries enter Delayed; zero-delay retries enter Waiting. Exhausted jobs go straight to Failed history. Arithmetic saturates to avoid overflow; no jitter is applied.
 
-Due times and policies survive restart. Existing jobs default to zero backoff; legacy Waiting jobs remain eligible. These timestamps use the server wall clock, so clock adjustments can change scheduling timing. Workers must regenerate protobuf bindings to set the new fields.
+Due times and policies survive restart. Existing jobs default to zero backoff; legacy Waiting jobs remain eligible. These timestamps use the server wall clock, so clock adjustments can change scheduling timing.
 
 ### Dequeue
 
@@ -61,7 +61,7 @@ The response includes `lease_expires_at_ms` (Unix epoch milliseconds). Workers m
 
 ### Worker leases and recovery
 
-Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue. A successful heartbeat returns the renewed `lease_expires_at_ms`, at least 30 seconds from server time when the transaction obtains its write lock. Send heartbeats approximately every 10 seconds while executing; clients must regenerate protobuf bindings to use this RPC.
+Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue. A successful heartbeat returns the renewed `lease_expires_at_ms`, at least 30 seconds from server time when the transaction obtains its write lock. Send heartbeats approximately every 10 seconds while executing.
 
 For live jobs, heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Already committed completions can be replayed as described below. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
 
@@ -79,7 +79,7 @@ On upgrade, stop old workers before starting this version. The additive migratio
 
 `FailJob` performs the same ownership checks and records `error_message`. If `attempts < max_attempts`, it reschedules the job and clears worker ownership; `moved_to_failed_state=false`. Otherwise it atomically moves the job to history as Failed and returns `moved_to_failed_state=true`. Attempts increment only on dequeue. `max_attempts=0` at enqueue defaults to three total attempts. Retries retain original priority/creation time and follow the per-job backoff policy below. Only the latest error is retained, not a per-attempt log.
 
-Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker. The new protobuf fields use previously unused tags. For older callers, omitted/zero `attempt` is accepted only on the first attempt; retry-aware clients must regenerate their bindings and send the attempt number.
+Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker.
 
 Acknowledgments return success only after commit. If a completion response is lost, repeating `CompleteJob` with the same job ID, worker ID, and successful attempt returns success from the Completed history record, including after restart. Zero remains an alias for attempt one. Replays do not change history or increment transition/state metrics; RPC latency metrics still count each request. The original lease need not remain valid once completion has committed.
 
@@ -88,7 +88,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
-- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented. This applies to both the dispatch-side rate limits and the admission-side ingress velocity limits. Equal (unweighted) round-robin fairness across facets is available opt-in; see [Tenant fairness](#tenant-fairness).
+- Both rate-limit mechanisms match facets exactly (no wildcard or pattern matching): the dispatch-side faceted rate limits use fixed windows, while the admission-side ingress velocity limits use a sliding-window-counter approximation. Weighted tenant fairness is not implemented, though equal (unweighted) round-robin fairness across facets is available opt-in; see [Tenant fairness](#tenant-fairness).
 - The server defaults to loopback. A non-loopback bind requires an explicit `ANVILMQ_ADDR`; transport authentication/TLS are not implemented.
 - No Raft replication or global telemetry exists yet.
 
@@ -184,7 +184,7 @@ if (receipt.replayed) {
 
 ### Durability, cost, and metrics
 
-Receipts survive restarts and terminal transitions and, in this first version, have no standalone TTL: a receipt is removed only once retention has dropped its job from both the live and history tables, so the dedup window tracks job retention exactly. Each receipt stores the full normalized request including payload, so keyed jobs add storage. The `anvilmq_enqueue_receipts` gauge tracks the retained count, `anvilmq_enqueue_replays_total` counts matching replays, and `anvilmq_enqueue_conflicts_total` counts rejected key reuse. Idempotency covers job creation only — handler side effects remain at least once. An older broker that predates this feature silently ignores the unknown field, so keyed retries against it can still create duplicates.
+Receipts survive restarts and terminal transitions and, in this first version, have no standalone TTL: a receipt is removed only once retention has dropped its job from both the live and history tables, so the dedup window tracks job retention exactly. Each receipt stores the full normalized request including payload, so keyed jobs add storage. The `anvilmq_enqueue_receipts` gauge tracks the retained count, `anvilmq_enqueue_replays_total` counts matching replays, and `anvilmq_enqueue_conflicts_total` counts rejected key reuse. Idempotency covers job creation only — handler side effects remain at least once.
 
 ## Faceted rate limits
 

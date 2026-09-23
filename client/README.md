@@ -144,11 +144,6 @@ const worker = new Worker<{ orderId: string }>("orders", async job => {
 The recursion circuit breaker still applies to the derived depth: a child whose lineage
 would exceed the broker's maximum execution depth is rejected with `RESOURCE_EXHAUSTED`.
 
-**Client/server version coupling.** `enqueueChild` sends `executionDepth = 0` and relies
-on the server to derive it. Deploy a broker with server-side depth derivation before
-using `enqueueChild`; against an older broker, a parent enqueue with depth `0` is
-rejected as inconsistent. Callers that pass an explicit correct depth are unaffected.
-
 ## Safe enqueue retries
 
 ```typescript
@@ -164,9 +159,7 @@ Keys are scoped to the queue name. Matching requests return one job ID; conflict
 
 Only keyed enqueue automatically retries `Unavailable` and `DeadlineExceeded`: three calls maximum, 100ms then 200ms waits, each with `rpcTimeoutMs`. Request data is serialized and options copied once before retrying. After exhaustion, the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work. This is not a durable producer buffer: use an outbox if submissions must survive producer-process loss before acknowledgment.
 
-Receipts are retained indefinitely for now, including after job completion/failure. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
-
-**Upgrade the broker before using this client feature. Published v0.1.0-rc.1 does not support enqueue idempotency.** Older protobuf servers silently ignore unknown request fields, so keyed retries against an older broker can create duplicates. This feature requires a subsequent broker release; ordinary unkeyed callers remain compatible.
+Receipts have no standalone TTL and are reclaimed only once the job is gone from both the live and history tables, so the dedup window tracks job retention. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
 
