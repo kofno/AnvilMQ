@@ -41,7 +41,7 @@ const METHODS: [&str; 11] = [
 ];
 const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
-// BullMQ dashboards' {queue,name,result} breakdowns without unbounded producer labels.
+// {queue,name,result} dashboard breakdowns of the system it replaces, without unbounded producer labels.
 const NAMED_EVENTS: [&str; 5] = ["enqueued", "claimed", "completed", "failed", "retried"];
 const DURATION_BOUNDS_MS: [i64; 10] = [1, 10, 100, 500, 1000, 5000, 15000, 60000, 300000, 3600000];
 // Retention sweeper deletion counters. Bounded cardinality: 3 targets x 3 reasons.
