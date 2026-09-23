@@ -7,6 +7,40 @@ use prost::Message;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use tonic::Status;
 
+/// Persist an admission-time enqueue rejection for post-hoc forensics.
+///
+/// Runs in its OWN fresh IMMEDIATE transaction on `conn`. The caller must have already
+/// dropped the main enqueue transaction (rolling it back) so the rejected job consumes no
+/// ingress quota and leaves no job row; recording the rejection separately keeps that
+/// rollback intact while still durably capturing why the enqueue was refused. `conn` is a
+/// MutexGuard at the call site; deref coercion passes it as `&mut Connection`. A failure to
+/// persist is logged and swallowed so it never masks the original rejection returned to the
+/// caller.
+#[allow(clippy::too_many_arguments)]
+fn record_rejection(
+    conn: &mut rusqlite::Connection,
+    now: i64,
+    kind: &str,
+    name: &str,
+    trace_id: Option<&str>,
+    parent_id: Option<&str>,
+    execution_depth: Option<i64>,
+    rate_limit_facet: Option<&str>,
+    detail: &str,
+) {
+    let outcome = (|| -> rusqlite::Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO enqueue_rejections (rejected_at, kind, name, trace_id, parent_id, execution_depth, rate_limit_facet, detail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![now, kind, name, trace_id, parent_id, execution_depth, rate_limit_facet, detail],
+        )?;
+        tx.commit()
+    })();
+    if let Err(error) = outcome {
+        tracing::warn!(%error, kind, name, "failed to persist enqueue rejection record");
+    }
+}
+
 pub async fn enqueue(
     service: &MyQueueService,
     mut req: AddJobRequest,
@@ -81,11 +115,27 @@ pub async fn enqueue(
             && !crate::ingress_limit::admit(&tx, &req.rate_limit_facet, now).map_err(internal)?
         {
             metrics.ingress_rejection();
-            tracing::warn!(facet = %req.rate_limit_facet, "enqueue rejected: ingress velocity limit");
-            return Err(Status::resource_exhausted(format!(
+            metrics.rejection_recorded("ingress_velocity");
+            tracing::warn!(name = %req.name, facet = %req.rate_limit_facet, "enqueue rejected: ingress velocity limit");
+            let message = format!(
                 "ingress velocity limit exceeded for facet {}",
                 req.rate_limit_facet
-            )));
+            );
+            // Roll back the admission tx so a rejected enqueue consumes no ingress quota,
+            // then durably record the rejection in its own fresh tx (see record_rejection).
+            drop(tx);
+            record_rejection(
+                &mut conn,
+                now,
+                "ingress_velocity",
+                &req.name,
+                None,
+                None,
+                None,
+                Some(&req.rate_limit_facet),
+                &message,
+            );
+            return Err(Status::resource_exhausted(message));
         }
         let available_at = now.checked_add(req.delay_ms).ok_or_else(|| Status::invalid_argument("delay timestamp overflows"))?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -105,8 +155,22 @@ pub async fn enqueue(
                 [parent], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).optional().map_err(internal)?;
             let Some((parent_depth, parent_trace)) = parent_row else {
                 metrics.ancestry_rejection();
-                tracing::warn!(parent_id = %parent, "enqueue rejected: parent not found");
-                return Err(Status::failed_precondition(format!("ancestry: parent {parent} not found")));
+                metrics.rejection_recorded("parent_not_found");
+                tracing::warn!(name = %req.name, parent_id = %parent, "enqueue rejected: parent not found");
+                let message = format!("ancestry: parent {parent} not found");
+                drop(tx);
+                record_rejection(
+                    &mut conn,
+                    now,
+                    "parent_not_found",
+                    &req.name,
+                    None,
+                    Some(parent),
+                    None,
+                    None,
+                    &message,
+                );
+                return Err(Status::failed_precondition(message));
             };
             let derived_depth = parent_depth + 1;
             // Derive-when-unset, validate-when-provided: a supplied 0 is a safe sentinel
@@ -117,10 +181,24 @@ pub async fn enqueue(
                 i64::from(metadata.execution_depth)
             } else {
                 metrics.ancestry_rejection();
-                tracing::warn!(parent_id = %parent, execution_depth = metadata.execution_depth, parent_depth, "enqueue rejected: inconsistent execution depth");
-                return Err(Status::invalid_argument(format!(
+                metrics.rejection_recorded("inconsistent_depth");
+                tracing::warn!(name = %req.name, parent_id = %parent, execution_depth = metadata.execution_depth, parent_depth, "enqueue rejected: inconsistent execution depth");
+                let message = format!(
                     "ancestry: execution_depth {} must equal parent depth + 1 ({})",
-                    metadata.execution_depth, derived_depth)));
+                    metadata.execution_depth, derived_depth);
+                drop(tx);
+                record_rejection(
+                    &mut conn,
+                    now,
+                    "inconsistent_depth",
+                    &req.name,
+                    Some(&parent_trace),
+                    Some(parent),
+                    Some(i64::from(metadata.execution_depth)),
+                    None,
+                    &message,
+                );
+                return Err(Status::invalid_argument(message));
             };
             // Inherit the parent's lineage id authoritatively so a spoofed/absent trace_id
             // cannot evade the per-lineage quarantine below.
@@ -134,10 +212,24 @@ pub async fn enqueue(
         // is the real recursion breaker.
         if effective_depth > i64::from(max_execution_depth) {
             metrics.ancestry_rejection();
-            tracing::warn!(execution_depth = effective_depth, max_execution_depth, "enqueue rejected: circuit breaker tripped");
-            return Err(Status::resource_exhausted(format!(
+            metrics.rejection_recorded("circuit_breaker");
+            tracing::warn!(name = %req.name, trace_id = %trace_id, parent_id = parent_id.as_deref().unwrap_or(""), execution_depth = effective_depth, max_execution_depth, "enqueue rejected: circuit breaker tripped");
+            let message = format!(
                 "Circuit breaker tripped: execution depth {effective_depth} exceeds max allowed {max_execution_depth}"
-            )));
+            );
+            drop(tx);
+            record_rejection(
+                &mut conn,
+                now,
+                "circuit_breaker",
+                &req.name,
+                Some(&trace_id),
+                parent_id.as_deref(),
+                Some(effective_depth),
+                None,
+                &message,
+            );
+            return Err(Status::resource_exhausted(message));
         }
         // Runaway-chain quarantine: bound total jobs per lineage. Disabled (and zero-cost)
         // when the cap is 0. Read + upsert are PK operations on chain_counters.
@@ -145,9 +237,23 @@ pub async fn enqueue(
             let current = tx.query_row("SELECT job_count FROM chain_counters WHERE trace_id = ?1", [&trace_id], |r| r.get::<_, i64>(0)).optional().map_err(internal)?.unwrap_or(0);
             if current as u64 >= max_chain_size {
                 metrics.chain_quarantine();
-                tracing::warn!(trace_id = %trace_id, chain_size = current, max_chain_size, "enqueue rejected: chain quarantined");
-                return Err(Status::resource_exhausted(format!(
-                    "chain quarantined: lineage {trace_id} exceeded max chain size {max_chain_size}")));
+                metrics.rejection_recorded("chain_quarantine");
+                tracing::warn!(name = %req.name, trace_id = %trace_id, parent_id = parent_id.as_deref().unwrap_or(""), chain_size = current, max_chain_size, "enqueue rejected: chain quarantined");
+                let message = format!(
+                    "chain quarantined: lineage {trace_id} exceeded max chain size {max_chain_size}");
+                drop(tx);
+                record_rejection(
+                    &mut conn,
+                    now,
+                    "chain_quarantine",
+                    &req.name,
+                    Some(&trace_id),
+                    parent_id.as_deref(),
+                    Some(effective_depth),
+                    None,
+                    &message,
+                );
+                return Err(Status::resource_exhausted(message));
             }
             tx.execute("INSERT INTO chain_counters(trace_id, job_count, updated_at) VALUES (?1, 1, ?2)
                 ON CONFLICT(trace_id) DO UPDATE SET job_count = job_count + 1, updated_at = ?2",

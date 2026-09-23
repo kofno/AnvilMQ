@@ -33,6 +33,8 @@ pub struct RetentionConfig {
     pub chain_counter_ttl_ms: i64,
     /// Delete idle `facet_dispatch` fairness rows (no live jobs, idle beyond this). `0` disables.
     pub facet_dispatch_ttl_ms: i64,
+    /// Delete `enqueue_rejections` forensic rows older than this. `0` disables.
+    pub rejections_age_ms: i64,
 }
 
 impl Default for RetentionConfig {
@@ -52,6 +54,8 @@ impl Default for RetentionConfig {
             // A facet idle beyond a week with no live jobs has left rotation; a returning
             // tenant is served promptly (never-served sorts first) and rejoins rotation.
             facet_dispatch_ttl_ms: 604_800_000,
+            // Retain admission-time rejection forensics for a week, then reclaim.
+            rejections_age_ms: 604_800_000,
         }
     }
 }
@@ -87,6 +91,7 @@ impl RetentionConfig {
                 "ANVILMQ_FACET_DISPATCH_TTL_MS",
                 d.facet_dispatch_ttl_ms,
             )?,
+            rejections_age_ms: env_i64("ANVILMQ_RETENTION_REJECTIONS_AGE_MS", d.rejections_age_ms)?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -132,6 +137,12 @@ impl RetentionConfig {
                 self.facet_dispatch_ttl_ms
             ));
         }
+        if self.rejections_age_ms < 0 {
+            return Err(format!(
+                "ANVILMQ_RETENTION_REJECTIONS_AGE_MS={} must be >= 0",
+                self.rejections_age_ms
+            ));
+        }
         Ok(())
     }
 
@@ -142,6 +153,7 @@ impl RetentionConfig {
             || self.failed_count > 0
             || self.chain_counter_ttl_ms > 0
             || self.facet_dispatch_ttl_ms > 0
+            || self.rejections_age_ms > 0
     }
 }
 
@@ -154,6 +166,7 @@ pub struct SweepOutcome {
     pub receipts: usize,
     pub chain_counters: usize,
     pub facet_dispatch: usize,
+    pub rejections: usize,
 }
 
 impl SweepOutcome {
@@ -165,6 +178,7 @@ impl SweepOutcome {
             + self.receipts
             + self.chain_counters
             + self.facet_dispatch
+            + self.rejections
     }
 }
 
@@ -238,6 +252,19 @@ fn prune_facet_dispatch(tx: &Connection, cutoff: i64, batch: i64) -> rusqlite::R
     )
 }
 
+fn prune_rejections(tx: &Connection, cutoff: i64, batch: i64) -> rusqlite::Result<usize> {
+    // Reclaim forensic rejection rows older than the age cutoff, oldest-first and bounded per
+    // statement. Backed by idx_rejections_rejected_at so the scan is a bounded range read.
+    tx.execute(
+        "DELETE FROM enqueue_rejections WHERE id IN (
+             SELECT id FROM enqueue_rejections
+             WHERE rejected_at < ?1
+             ORDER BY rejected_at ASC LIMIT ?2
+         )",
+        rusqlite::params![cutoff, batch],
+    )
+}
+
 /// Run one bounded sweep pass. Each dimension deletes at most `batch` rows so the writer is
 /// never held for long; the caller's interval re-runs until the backlog is drained. Metrics
 /// are updated after commit so gauges never reflect uncommitted deletes.
@@ -283,6 +310,10 @@ pub fn sweep_blocking(
             cfg.batch,
         )?;
     }
+    if cfg.rejections_age_ms > 0 {
+        out.rejections =
+            prune_rejections(&tx, now.saturating_sub(cfg.rejections_age_ms), cfg.batch)?;
+    }
     tx.commit()?;
 
     metrics.retention_deleted("completed", "age", out.completed_age as u64);
@@ -292,6 +323,7 @@ pub fn sweep_blocking(
     metrics.retention_deleted("receipt", "orphan", out.receipts as u64);
     metrics.chain_counters_pruned(out.chain_counters as u64);
     metrics.facet_dispatch_pruned(out.facet_dispatch as u64);
+    metrics.rejections_pruned(out.rejections as u64);
     Ok(out)
 }
 
@@ -321,6 +353,7 @@ mod tests {
             batch: 1_000,
             chain_counter_ttl_ms: 0,
             facet_dispatch_ttl_ms: 0,
+            rejections_age_ms: 0,
         }
     }
 
@@ -586,5 +619,37 @@ mod tests {
         let conn = db.get_shared_connection();
         let guard = conn.lock().await;
         guard.execute_batch(sql).unwrap();
+    }
+
+    async fn insert_rejection(db: &DatabaseManager, id: i64, kind: &str, rejected_at: i64) {
+        let conn = db.get_shared_connection();
+        let guard = conn.lock().await;
+        guard
+            .execute(
+                "INSERT INTO enqueue_rejections (id, rejected_at, kind, name, detail)
+                 VALUES (?1, ?2, ?3, 'q', 'd')",
+                rusqlite::params![id, rejected_at, kind],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejections_prune_removes_only_rows_older_than_cutoff() {
+        let db = manager().await;
+        let t = now(&db).await;
+        insert_rejection(&db, 1, "circuit_breaker", t - 7_200_000).await;
+        insert_rejection(&db, 2, "parent_not_found", t - 60_000).await;
+        let mut c = cfg();
+        c.rejections_age_ms = 3_600_000;
+        let out = sweep(db.clone(), c).await.unwrap();
+        assert_eq!(out.rejections, 1);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM enqueue_rejections").await,
+            1
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM enqueue_rejections WHERE id = 2").await,
+            1
+        );
     }
 }
