@@ -81,7 +81,7 @@ pub async fn enqueue(
             && !crate::ingress_limit::admit(&tx, &req.rate_limit_facet, now).map_err(internal)?
         {
             metrics.ingress_rejection();
-            tracing::warn!(facet = %req.rate_limit_facet, "enqueue rejected: ingress velocity limit");
+            tracing::warn!(name = %req.name, facet = %req.rate_limit_facet, "enqueue rejected: ingress velocity limit");
             return Err(Status::resource_exhausted(format!(
                 "ingress velocity limit exceeded for facet {}",
                 req.rate_limit_facet
@@ -105,7 +105,7 @@ pub async fn enqueue(
                 [parent], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).optional().map_err(internal)?;
             let Some((parent_depth, parent_trace)) = parent_row else {
                 metrics.ancestry_rejection();
-                tracing::warn!(parent_id = %parent, "enqueue rejected: parent not found");
+                tracing::warn!(name = %req.name, parent_id = %parent, "enqueue rejected: parent not found");
                 return Err(Status::failed_precondition(format!("ancestry: parent {parent} not found")));
             };
             let derived_depth = parent_depth + 1;
@@ -117,7 +117,7 @@ pub async fn enqueue(
                 i64::from(metadata.execution_depth)
             } else {
                 metrics.ancestry_rejection();
-                tracing::warn!(parent_id = %parent, execution_depth = metadata.execution_depth, parent_depth, "enqueue rejected: inconsistent execution depth");
+                tracing::warn!(name = %req.name, parent_id = %parent, execution_depth = metadata.execution_depth, parent_depth, "enqueue rejected: inconsistent execution depth");
                 return Err(Status::invalid_argument(format!(
                     "ancestry: execution_depth {} must equal parent depth + 1 ({})",
                     metadata.execution_depth, derived_depth)));
@@ -134,7 +134,7 @@ pub async fn enqueue(
         // is the real recursion breaker.
         if effective_depth > i64::from(max_execution_depth) {
             metrics.ancestry_rejection();
-            tracing::warn!(execution_depth = effective_depth, max_execution_depth, "enqueue rejected: circuit breaker tripped");
+            tracing::warn!(name = %req.name, trace_id = %trace_id, parent_id = ?parent_id, execution_depth = effective_depth, max_execution_depth, "enqueue rejected: circuit breaker tripped");
             return Err(Status::resource_exhausted(format!(
                 "Circuit breaker tripped: execution depth {effective_depth} exceeds max allowed {max_execution_depth}"
             )));
@@ -145,7 +145,7 @@ pub async fn enqueue(
             let current = tx.query_row("SELECT job_count FROM chain_counters WHERE trace_id = ?1", [&trace_id], |r| r.get::<_, i64>(0)).optional().map_err(internal)?.unwrap_or(0);
             if current as u64 >= max_chain_size {
                 metrics.chain_quarantine();
-                tracing::warn!(trace_id = %trace_id, chain_size = current, max_chain_size, "enqueue rejected: chain quarantined");
+                tracing::warn!(name = %req.name, trace_id = %trace_id, parent_id = ?parent_id, chain_size = current, max_chain_size, "enqueue rejected: chain quarantined");
                 return Err(Status::resource_exhausted(format!(
                     "chain quarantined: lineage {trace_id} exceeded max chain size {max_chain_size}")));
             }
