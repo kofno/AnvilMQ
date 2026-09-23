@@ -2,6 +2,25 @@
 
 AnvilMQ is an early-stage Rust queue engine intended for autonomous regional Kubernetes deployments. The current implementation is a single-process gRPC server with embedded SQLite persistence, atomic enqueue/dequeue, and a caller-supplied execution-depth guard. Sub-millisecond latency, high availability, and tenant rate limiting are goals, not verified capabilities.
 
+## Components
+
+AnvilMQ is a single **broker** process that owns an embedded SQLite database; **producers** and **workers** are your own processes that talk to it over gRPC. There is no separate storage tier, coordinator, or message bus — the broker is the whole server.
+
+- **Broker.** The `QueueService` gRPC server. It owns the embedded SQLite store (a single shared writer connection with WAL, plus an isolated read-only replica for inspection) and performs every state transition as an immediate transaction. Workers never touch the database directly; all queue operations go through its RPCs.
+- **Producer.** Any client that enqueues work with `AddJob` (optionally with a delay, priority, ancestry `parent_id`, rate-limit facet, or `idempotency_key`). A producer need not stay connected after enqueue.
+- **Worker.** A client that pulls and runs jobs: `GetNextJob` claims one job under a time-boxed lease, `Heartbeat` renews the lease during long work, and `CompleteJob`/`FailJob` acknowledge the outcome. Each acknowledgment carries the job's `attempt` token so the broker can verify ownership. Handlers should be idempotent (see [Delivery and execution semantics](#delivery-and-execution-semantics)).
+- **Client library.** A repo-local TypeScript/Bun client wraps the gRPC contract as `Queue` (producer), `Worker`, and the administrative `RateLimits`/`IngressLimits` helpers. Any gRPC-capable language can generate its own bindings from `proto/queue.proto`.
+- **Store.** A single embedded SQLite database owned by the broker (jobs, history, enqueue receipts, and rate-limit/fairness bookkeeping). It is not shared with any other process.
+- **Two surfaces.** Queue operations use the gRPC control plane (`QueueService`). A separate HTTP port serves observability: `/metrics` (Prometheus), `/healthz`, `/readyz`, a built-in `/console`, and read-only inspection at `/v1/failures`, `/v1/search`, and `/v1/jobs/:id` — served from the read-only replica so inspection never contends with the write path.
+
+```mermaid
+flowchart LR
+  P[Producer] -->|AddJob| B[Broker: QueueService gRPC]
+  W[Worker] -->|GetNextJob / Heartbeat / CompleteJob / FailJob| B
+  B <--> DB[(Embedded SQLite WAL)]
+  B -->|/metrics /console /v1/*| O[Observability HTTP]
+```
+
 ## Current architecture
 
 For a versioned container, Helm chart, and packaged Bun client, see [evaluation releases and Azure deployment](docs/release-and-deploy.md). The chart deploys one broker with FULL durability and a dedicated PVC; it does not provide HA yet.
@@ -11,6 +30,46 @@ For a versioned container, Helm chart, and packaged Bun client, see [evaluation 
 - Database work runs in `spawn_blocking`, with one shared connection protected by a mutex.
 - WAL with configurable `ANVILMQ_DURABILITY=NORMAL|FULL` (default NORMAL). NORMAL permits loss of recent acknowledged writes after OS/power failure; FULL requests commit synchronization on retained storage. Startup logs the applied settings. See the [durability contract](docs/durability.md) for storage assumptions and operational guidance.
 - Initial schema creation and additive ownership/error-history migrations run in a transaction. Existing jobs are preserved.
+
+## Delivery and execution semantics
+
+AnvilMQ delivers each job **at least once**. It does **not** provide exactly-once execution of a handler's external side effects, and it does not try to. This is a deliberate choice; this section states the guarantee and defends it.
+
+### The guarantee
+
+Within the configured attempt limit and the storage's durability settings:
+
+- **No acknowledged job is silently lost.** Every transition (enqueue, claim, heartbeat, completion, failure, recovery) is an immediate, durable transaction, so a committed job survives restarts and is eventually completed, retried, or moved to Failed history.
+- **A job may run more than once.** If the broker cannot be certain a claimed job finished, it re-dispatches the job after its lease expires, so handlers must be idempotent.
+
+That is the whole trade-off: under crashes and partitions a queue can guarantee it never loses a job (at-least-once) or never duplicates a job (at-most-once), but not both. AnvilMQ chooses never-lose, because a dropped job is usually far worse than a duplicate an idempotent handler can absorb.
+
+### Why exactly-once execution isn't offered
+
+A worker performs side effects in external systems the broker does not control. Exactly-once execution would require performing the side effect and durably recording "done" as one atomic step. Whenever the worker or broker can crash between those two, that atomicity is impossible in general: the broker cannot distinguish "the handler finished but the acknowledgment was lost" from "the handler never ran." Duplicates therefore arise from:
+
+- **A lost completion acknowledgment** — the handler committed its side effect, then the `CompleteJob` call (or the worker) died before the broker recorded it; the lease expires and recovery re-runs the job.
+- **A lease reclaimed under a slow handler** — a long pause (GC, I/O stall, or clock skew) lets the 30-second lease expire while the worker is still running, so recovery hands the job to another worker and both may execute it.
+- **A retried enqueue** — a producer that resends `AddJob` after a timed-out-but-committed call creates a second job unless it supplied an `idempotency_key`.
+
+Systems that advertise exactly-once either confine every side effect to the same transactional store as the queue (not possible for general external effects) or actually mean *effectively once*: at-least-once delivery plus de-duplication at the effect boundary. AnvilMQ takes the honest version of that.
+
+### Reaching *effectively once*
+
+The broker de-duplicates everything it can reach and hands you stable keys for the rest:
+
+- **Ownership-checked acknowledgments.** Completion, failure, and heartbeat require a matching, unexpired claim carrying the dequeue's `attempt` token, so a stale claim can never acknowledge or renew a newer one.
+- **Completion idempotency.** Replaying `CompleteJob` for an already-completed job returns success from history without re-writing history or double-counting metrics. This de-duplicates the broker-side transition, not the external effect.
+- **Enqueue idempotency.** An opt-in `idempotency_key` collapses producer retries into one job; see [Idempotent enqueue](#idempotent-enqueue).
+- **A stable job identity.** Every dispatch carries the job `id`, unchanged across re-executions; use it (or your own business key) as the natural key for effect de-duplication. Do not key on the `attempt` number — a duplicate run has a different attempt.
+
+Make handler side effects idempotent (natural keys, upserts, conditional writes, or a transactional outbox keyed on the job `id`) and at-least-once delivery becomes effectively-once at the point where exactly-once can actually be enforced: inside the system that owns the side effect.
+
+### Why this is the right choice
+
+- **It is honest.** The guarantee matches what a crash-safe queue can truly deliver, with no hidden window where a job is silently dropped or assumed to run exactly once when it cannot be.
+- **It stays fast and local.** True exactly-once across external systems needs a distributed commit protocol spanning the worker's downstream dependencies, which contradicts AnvilMQ's embedded, low-latency design. At-least-once keeps the hot path a single local transaction.
+- **It composes with best practice.** Idempotent handlers are already the norm for reliable processing; AnvilMQ supplies the primitives (stable `id`, `attempt` ownership, enqueue dedup key, completion replay) so you enforce exactly-once effects exactly where you can — at the boundary you control.
 
 ## Implemented behavior
 
@@ -33,13 +92,7 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Max jobs per lineage (`trace_id`) before further enqueues are quarantined. |
-| `ANVILMQ_FAIRNESS_ENABLED` | `false` | Opt-in equal round-robin tenant fairness during dequeue, keyed on `rate_limit_facet`. Truthy values (`1`, `true`, `yes`) enable it; off by default with zero claim-path overhead. See [Tenant fairness](#tenant-fairness). |
 | `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
-| `ANVILMQ_FACET_DISPATCH_TTL_MS` | `604800000` (7d) | Idle age after which a fairness rotation row (`facet_dispatch`) with no live jobs is pruned by the retention sweeper. `0` disables the prune. |
-
-The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate.
-
-Receipts survive restart and terminal job transitions and are retained indefinitely in this first version, independently of job history. They contain the normalized request including payload, so keyed jobs add storage overhead. There is no TTL or cleanup endpoint yet; deleting receipts removes the corresponding deduplication guarantee. Monitor receipt count and PVC usage. Use a new key for intentionally new work and retain the same key/request across producer retries/restarts. Handler side effects remain at least once. See [client usage](client/README.md).
 
 ### Delays and retry backoff
 
@@ -49,7 +102,7 @@ New per-job protobuf fields `retry_backoff_ms` (tag 8) and `retry_backoff_max_ms
 
 After attempt N fails, delay is `min(base * 2^(N-1), cap)`. For base 1000 and cap 10000, delays are 1s, 2s, 4s, 8s, then 10s. The same policy applies to expired leases, measured from recovery time. Positive retries enter Delayed; zero-delay retries enter Waiting. Exhausted jobs go straight to Failed history. Arithmetic saturates to avoid overflow; no jitter is applied.
 
-Due times and policies survive restart. Existing jobs default to zero backoff; legacy Waiting jobs remain eligible. These timestamps use the server wall clock, so clock adjustments can change scheduling timing. Workers must regenerate protobuf bindings to set the new fields.
+Due times and policies survive restart. Existing jobs default to zero backoff; legacy Waiting jobs remain eligible. These timestamps use the server wall clock, so clock adjustments can change scheduling timing.
 
 ### Dequeue
 
@@ -67,7 +120,7 @@ The response includes `lease_expires_at_ms` (Unix epoch milliseconds). Workers m
 
 ### Worker leases and recovery
 
-Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue. A successful heartbeat returns the renewed `lease_expires_at_ms`, at least 30 seconds from server time when the transaction obtains its write lock. Send heartbeats approximately every 10 seconds while executing; clients must regenerate protobuf bindings to use this RPC.
+Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue. A successful heartbeat returns the renewed `lease_expires_at_ms`, at least 30 seconds from server time when the transaction obtains its write lock. Send heartbeats approximately every 10 seconds while executing.
 
 For live jobs, heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Already committed completions can be replayed as described below. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
 
@@ -75,7 +128,7 @@ The daemon runs recovery immediately on startup and every five seconds thereafte
 
 Lease duration is currently a fixed `LEASE_DURATION_MS = 30_000` in `src/leases.rs`; the recovery interval is five seconds in `src/main.rs`. Runtime configuration is not implemented. Expirations persist across restarts and use the server's wall clock; keep the host clock synchronized. Forward clock jumps can expire work early, and backward jumps can delay recovery.
 
-Delivery follows at-least-once processing semantics within the configured attempt limit and existing storage durability constraints. Recovery can cause duplicate execution, so job handlers must make side effects idempotent. This does not provide exactly-once external execution.
+Delivery is at-least-once; see [Delivery and execution semantics](#delivery-and-execution-semantics).
 
 On upgrade, stop old workers before starting this version. The additive migration preserves existing jobs and treats legacy Active jobs without a lease as expired for immediate recovery. Existing unexpired leases are preserved on restart. Older clients that cannot heartbeat must finish within 30 seconds.
 
@@ -85,7 +138,7 @@ On upgrade, stop old workers before starting this version. The additive migratio
 
 `FailJob` performs the same ownership checks and records `error_message`. If `attempts < max_attempts`, it reschedules the job and clears worker ownership; `moved_to_failed_state=false`. Otherwise it atomically moves the job to history as Failed and returns `moved_to_failed_state=true`. Attempts increment only on dequeue. `max_attempts=0` at enqueue defaults to three total attempts. Retries retain original priority/creation time and follow the per-job backoff policy below. Only the latest error is retained, not a per-attempt log.
 
-Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker. The new protobuf fields use previously unused tags. For older callers, omitted/zero `attempt` is accepted only on the first attempt; retry-aware clients must regenerate their bindings and send the attempt number.
+Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker.
 
 Acknowledgments return success only after commit. If a completion response is lost, repeating `CompleteJob` with the same job ID, worker ID, and successful attempt returns success from the Completed history record, including after restart. Zero remains an alias for attempt one. Replays do not change history or increment transition/state metrics; RPC latency metrics still count each request. The original lease need not remain valid once completion has committed.
 
@@ -94,7 +147,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
-- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented. This applies to both the dispatch-side rate limits and the admission-side ingress velocity limits. Equal (unweighted) round-robin fairness across facets is available opt-in; see [Tenant fairness](#tenant-fairness).
+- Both rate-limit mechanisms match facets exactly (no wildcard or pattern matching): the dispatch-side faceted rate limits use fixed windows, while the admission-side ingress velocity limits use a sliding-window-counter approximation. Weighted tenant fairness is not implemented, though equal (unweighted) round-robin fairness across facets is available opt-in; see [Tenant fairness](#tenant-fairness).
 - The server defaults to loopback. A non-loopback bind requires an explicit `ANVILMQ_ADDR`; transport authentication/TLS are not implemented.
 - No Raft replication or global telemetry exists yet.
 
@@ -115,8 +168,8 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Immediate retries up to the attempt limit and stale-acknowledgment protection.
 - [x] Persisted worker leases, heartbeat renewal, and abandoned-job recovery.
 - [x] Retry backoff and persisted delayed scheduling.
-- [x] Background retention sweep bounding job history and idempotency receipts (age + per-name count), matching the replaced BullMQ deployment's `removeOnComplete`/`removeOnFail` policy.
-- [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. Not BullMQ-compatible.
+- [x] Background retention sweep bounding job history and idempotency receipts (age + per-name count), matching the retention policy of the queue system it replaces (bounded completed/failed history by age and per-name count).
+- [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. It defines its own gRPC contract and is not a drop-in replacement for any existing queue client.
 
 ### Phase 3: Safety controls
 
@@ -153,13 +206,52 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 
+## Idempotent enqueue
+
+Enqueue idempotency makes a repeated `AddJob` safe: when a producer retries the same submission — after a timed-out call, a dropped connection, or a crash and restart — the broker returns the original job instead of creating a duplicate. It is opt-in per request through `idempotency_key` and scoped to the exact queue `name`; unkeyed enqueues take the ordinary path and store nothing extra.
+
+### How a keyed enqueue is resolved
+
+On the first keyed enqueue the broker writes an enqueue receipt into `enqueue_receipts`, keyed by `(queue_name, idempotency_key)`. The receipt stores the normalized request bytes (captured before the job UUID and timestamps are generated), the resulting `job_id`, and the job's `initial_state`. The job insert and the receipt insert commit in the same immediate transaction, so a job never exists without its receipt or the reverse. A later keyed enqueue has three outcomes: new key -> insert job+receipt, return `replayed=false`; matching replay (byte-identical normalized request) -> return the original `job_id` and stored `initial_state` with `replayed=true`, creating no second job and consuming no attempt; conflict (receipt exists, request differs) -> return `AlreadyExists` and change nothing.
+
+### Receipt versus status
+
+A matching replay returns the job's INITIAL state (`Waiting`, or `Delayed` if you supplied `delay_ms > 0`) — frozen in the receipt — not the job's live state. It answers "was this already submitted, and what is its ID?", never "what is this job doing now?".
+
+```
+t0  AddJob(key=K)       -> job J created, state=Waiting, receipt{J,"Waiting"} written
+t1  worker claims J     -> J is Active
+t2  worker finishes J   -> J is Completed (later copied to history, maybe pruned)
+t3  retry AddJob(key=K) -> { id: J, state: "Waiting", replayed: true }
+```
+
+At t3 the job is finished, yet the reply still says `Waiting`. The meaningful signals are `replayed=true` (nothing new was created) and the returned id. Query the job by id for live progress. A receipt outlives its job — reclaimed only once the job is gone from both the live and history tables — so a replay can still report `Waiting` after the original was retention-pruned.
+
+### Designing keys
+
+Reuse the same key and the same request across retries and restarts of the same logical work; use a new key for genuinely new work. Because comparison is byte-for-byte on the normalized request, the payload must be serialized identically across retries.
+
+```typescript
+const receipt = await queue.add(
+  { invoiceId: "123" },
+  { idempotencyKey: "tenant-a:generate-invoice:123:v1" },
+);
+if (receipt.replayed) {
+  // A prior submission already created this job; do not treat it as new work.
+}
+```
+
+### Durability, cost, and metrics
+
+Receipts survive restarts and terminal transitions and, in this first version, have no standalone TTL: a receipt is removed only once retention has dropped its job from both the live and history tables, so the dedup window tracks job retention exactly. Each receipt stores the full normalized request including payload, so keyed jobs add storage. The `anvilmq_enqueue_receipts` gauge tracks the retained count, `anvilmq_enqueue_replays_total` counts matching replays, and `anvilmq_enqueue_conflicts_total` counts rejected key reuse. Idempotency covers job creation only — handler side effects remain at least once.
+
 ## Faceted rate limits
 
 `UpsertRateLimitRule(facet_pattern, max_jobs, window_duration_ms)` creates or replaces an exact-match rule. Wildcards (`*`, `?`), blank keys, surrounding whitespace, and nonpositive/overflowing durations are rejected. `max_jobs=0` pauses claims for that facet. **Every upsert resets usage**, including an identical update; do not repeatedly upsert rules as a reconciliation heartbeat.
 
 `DeleteRateLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetRateLimitStatus(facet_key)` reports rule existence, effective count, limit, duration, window expiration, and throttling. An expired or unstarted window reports count/deadline zero without writing to the database. Missing rules mean unrestricted claims.
 
-Windows start on the first claim and remain fixed until expiry (`expires <= now` resets on the next claim). Quota is shared across all queue names with the same `rate_limit_facet`. Each claim consumes one unit, including retries and recovered jobs. Completion/failure does not refund usage. Counter changes and the claim commit together; failed claims roll back quota consumption. Rules and counters persist across restarts. These are dispatch-rate limits, not concurrency limits or enqueue admission controls.
+Windows start on the first claim and remain fixed until expiry (`expires <= now` resets on the next claim). The `rate_limit_facet` is a free-form label set per job at enqueue (the client's `rateLimitFacet` option), not a per-queue setting; a queue here is just the job `name`. Because the counter is keyed solely by facet, every job carrying a given facet draws on one shared quota regardless of the `name` it was enqueued under. Each claim consumes one unit, including retries and recovered jobs. Completion/failure does not refund usage. Counter changes and the claim commit together; failed claims roll back quota consumption. Rules and counters persist across restarts. These are dispatch-rate limits, not concurrency limits or enqueue admission controls.
 
 Dequeue skips throttled candidates and preserves priority/age ordering among eligible jobs; a blocked tenant cannot prevent an eligible different facet from progressing. This is not a round-robin fairness guarantee. If all matching jobs are throttled, polling returns `found=false`; the client continues normal polling. Jobs without a matching rule remain unrestricted. Limits depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
 
@@ -199,7 +291,7 @@ Ingress velocity limits are an **admission-side** control: they throttle the rat
 
 `DeleteIngressLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetIngressLimitStatus(facet_key)` reports rule existence, the current sliding-window estimate, limit, duration, current window start, and throttling. It is read-only: it projects the estimate for the current instant without rolling or persisting the stored buckets. Missing rules mean unrestricted ingress.
 
-Enforcement uses a sliding-window-counter approximation: two adjacent fixed windows (the current and previous counts) weighted by their overlap with the trailing window, giving `estimated = previous * weight + current` where `weight` decays linearly from the full previous count at a window's start to zero at its end. This is O(1) per facet with no per-event row growth. An enqueue is rejected when the estimate would reach `max_jobs` (or the facet is paused); otherwise it consumes one unit. The counter update commits in the same immediate transaction as the job insert, so a rejected enqueue writes nothing and consumes no quota, and an accepted enqueue's consumption is atomic with the insert. Quota is shared across all queue names with the same `rate_limit_facet`. Idempotent replays of an already-accepted key return the original receipt and do **not** consume quota. Rules and counters persist across restarts. These are enqueue admission controls, not concurrency limits or dispatch-rate limits, and they depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
+Enforcement uses a sliding-window-counter approximation: two adjacent fixed windows (the current and previous counts) weighted by their overlap with the trailing window, giving `estimated = previous * weight + current` where `weight` decays linearly from the full previous count at a window's start to zero at its end. This is O(1) per facet with no per-event row growth. An enqueue is rejected when the estimate would reach `max_jobs` (or the facet is paused); otherwise it consumes one unit. The counter update commits in the same immediate transaction as the job insert, so a rejected enqueue writes nothing and consumes no quota, and an accepted enqueue's consumption is atomic with the insert. Quota is keyed solely by `rate_limit_facet` (a per-job label, not per queue/`name`), so all jobs sharing a facet draw on one quota. Idempotent replays of an already-accepted key return the original receipt and do **not** consume quota. Rules and counters persist across restarts. These are enqueue admission controls, not concurrency limits or dispatch-rate limits, and they depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
 
 The TypeScript client exports `IngressLimits`, shaped like `RateLimits`:
 
@@ -214,9 +306,27 @@ ingress.close();
 
 `anvilmq_ingress_rejected_total` is a global counter of enqueues rejected by this control. It has no tenant/facet labels to keep metric cardinality bounded. The three administrative RPCs also have bounded latency labels.
 
+### Fixed vs sliding windows
+
+The two controls deliberately use different window algorithms.
+
+Dispatch-side faceted rate limits use a **fixed window**: a per-facet counter anchored by the first claim that hard-resets once its window expires (`window_expires_at <= now`). It is the cheapest correct option — one row, one integer compare — but it can admit up to roughly 2×`max_jobs` across a boundary (`max_jobs` at the tail of one window, then `max_jobs` again at the head of the next).
+
+Admission-side ingress limits use a **sliding-window counter** to smooth that burst. They keep two adjacent buckets (current and previous) and estimate `previous * weight + current`, where `weight` decays linearly from 1.0 at the current window's start to 0.0 at its end. The previous window's count bleeds off gradually instead of snapping to zero, so any trailing-window span is bounded to about `max_jobs`. This stays O(1) per facet with no per-event rows, at the cost of one extra bucket and a float; it approximates by assuming the previous window's events were spread evenly.
+
+| | Faceted rate limits (dispatch) | Ingress velocity limits (admission) |
+| --- | --- | --- |
+| Throttles | job **claims** | job **enqueues** |
+| Window model | fixed, hard reset at expiry | sliding-window counter (decaying previous) |
+| Boundary burst | up to ~2×`max_jobs` | bounded to ≈`max_jobs` |
+| Per-facet state | count + expiry | two buckets + start |
+| Reject cost | skipped in claim SQL, no write | checked before insert, no write |
+
+Both match facets exactly (no wildcards), key their counter solely by `rate_limit_facet`, are O(1) per facet, and commit the counter change in the same immediate transaction as the claim or the insert, so a rejected operation writes nothing.
+
 ## Retention
 
-Terminal jobs are copied into `job_history` and keyed enqueues leave dedup records in `enqueue_receipts`. Both are pruned by a background sweeper so on-disk state reaches a steady size instead of growing without bound. Defaults mirror the BullMQ deployment this replaces (`removeOnComplete { age: 24h, count: 1000 }`, `removeOnFail { age: 7d }`).
+Terminal jobs are copied into `job_history` and keyed enqueues leave dedup records in `enqueue_receipts`. Both are pruned by a background sweeper so on-disk state reaches a steady size instead of growing without bound. Defaults mirror the retention policy of the system this replaces: completed history bounded to ~24h and ~1000 per name, failed history to ~7d.
 
 - Completed jobs older than `ANVILMQ_RETENTION_COMPLETED_AGE_MS` (default `86400000`, 24h) are deleted; `0` disables age pruning.
 - At most `ANVILMQ_RETENTION_COMPLETED_COUNT` completed jobs are kept per job name, newest first (default `1000`); `0` disables count pruning.

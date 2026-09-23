@@ -34,7 +34,7 @@ The client archive is npm-compatible and includes the canonical protobuf. It exp
 
 ## Deploy the published release
 
-Download the assets from the GitHub release and verify `SHA256SUMS`. Replace the repository placeholder below. Confirm your current Kubernetes context is the intended Azure cluster. Keep this release in its own namespace, separate from production Valkey.
+Download the assets from the GitHub release and verify `SHA256SUMS`. Replace the repository placeholder below. Confirm your current Kubernetes context is the intended Azure cluster. Keep this release in its own namespace, separate from the production queue store.
 
 ```powershell
 kubectl config current-context
@@ -48,7 +48,7 @@ helm upgrade --install eval ./anvilmq-0.1.0-rc.2.tgz `
 
 Prefer `--set-string image.digest=sha256:...` from the release's `image.txt`; digest takes precedence over tag. Image repository paths must be lowercase. For private GHCR packages, provision a `kubernetes.io/dockerconfigjson` pull secret in `anvilmq-eval` using your secret-management workflow, then pass `--set imagePullSecrets[0].name=ghcr-pull`. Do not put credentials in Helm values or commit them.
 
-AKS values request a new 10Gi `managed-csi` PVC, matching the configured storage-class name for Valkey. Actual disk SKU, topology, caching, and VM limits must be recorded for comparison; matching the class name alone does not establish identical storage performance. Change node selectors/tolerations for your pool if needed.
+AKS values request a new 10Gi `managed-csi` PVC, matching the configured storage-class name used by the incumbent queue store. Actual disk SKU, topology, caching, and VM limits must be recorded for comparison; matching the class name alone does not establish identical storage performance. Change node selectors/tolerations for your pool if needed.
 
 Validation:
 
@@ -90,9 +90,9 @@ await queue.add({ sourceJobId: "captured-job-123", payload: {} });
 // await worker.close(); queue.close();
 ```
 
-This is not a BullMQ wire/API replacement. Adapt producer/worker calls and explicitly map retries, delays, and facets. Use captured payloads with side effects disabled or redirected; replaying production jobs through both engines can execute effects twice. At-least-once handlers still need their own idempotency.
+This is not a wire/API-compatible replacement for the incumbent queue. Adapt producer/worker calls and explicitly map retries, delays, and facets. Use captured payloads with side effects disabled or redirected; replaying production jobs through both engines can execute effects twice. At-least-once handlers still need their own idempotency.
 
-For a useful comparison, replay the same payload mix and handler work with the same concurrency, resources, and storage assumptions. Measure submission-to-completion acknowledgment, queue delay, throughput, errors, retries, and backlog. Start at 13/s, then 26/s and 50/s. Compare against Valkey's actual AOF/everysec configuration and label the durability difference. Synthetic zero-work numbers and real-handler timings answer different questions.
+For a useful comparison, replay the same payload mix and handler work with the same concurrency, resources, and storage assumptions. Measure submission-to-completion acknowledgment, queue delay, throughput, errors, retries, and backlog. Start at 13/s, then 26/s and 50/s. Compare against the incumbent store's actual fsync/durability configuration and label the difference. Synthetic zero-work numbers and real-handler timings answer different questions.
 
 ## Upgrade, rollback, and retained data
 
@@ -100,4 +100,4 @@ Single-pod updates interrupt service; clients must tolerate reconnects and ambig
 
 Use a new image version/digest for upgrades. `helm rollback eval <revision> -n anvilmq-eval --wait` restores chart/image configuration only; it does not roll back database contents or migrations. Verify schema compatibility and arrange a storage-consistent backup before upgrades involving schema changes. PVC template settings cannot generally be changed in-place through a StatefulSet upgrade; plan storage changes separately.
 
-`helm uninstall eval -n anvilmq-eval` removes the workload/services while StatefulSet-created PVCs remain. Keep the namespace if retaining its PVC: deleting the namespace deletes its claims, and the storage reclaim policy may then delete the underlying disk. Never mount Valkey's volume into AnvilMQ. Kubernetes PVC retention behavior is documented in [StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).
+`helm uninstall eval -n anvilmq-eval` removes the workload/services while StatefulSet-created PVCs remain. Keep the namespace if retaining its PVC: deleting the namespace deletes its claims, and the storage reclaim policy may then delete the underlying disk. Never mount the incumbent store's volume into AnvilMQ. Kubernetes PVC retention behavior is documented in [StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/).

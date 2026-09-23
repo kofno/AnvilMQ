@@ -1,8 +1,8 @@
 //! Background retention sweeper.
 //!
 //! AnvilMQ retains terminal jobs in `job_history` and dedup keys in `enqueue_receipts`
-//! forever unless pruned. This mirrors BullMQ's `removeOnComplete`/`removeOnFail` bounds
-//! (age + per-name count) so disk usage reaches steady state instead of growing without
+//! forever unless pruned. This mirrors the completed/failed retention bounds (by age and
+//! count) of the system AnvilMQ replaces so disk usage reaches steady state instead of growing without
 //! limit. Deletes run in bounded IMMEDIATE transactions against the shared writer, and rely
 //! on SQLite page reuse rather than VACUUM to avoid locking the writer.
 
@@ -37,7 +37,7 @@ pub struct RetentionConfig {
 
 impl Default for RetentionConfig {
     fn default() -> Self {
-        // Defaults mirror the BullMQ system AnvilMQ replaces:
+        // Defaults mirror the retention policy of the system AnvilMQ replaces:
         // removeOnComplete { age: 24h, count: 1000 }, removeOnFail { age: 7d }.
         Self {
             completed_age_ms: 86_400_000,
@@ -196,7 +196,7 @@ fn prune_count(tx: &Connection, state: &str, keep: i64, batch: i64) -> rusqlite:
 
 fn prune_receipts(tx: &Connection, batch: i64) -> rusqlite::Result<usize> {
     // A receipt's dedup window ends when its job leaves both live and history tables, so the
-    // idempotency horizon tracks job retention exactly (matching BullMQ jobId semantics).
+    // idempotency horizon tracks job retention exactly (matching the dedup-by-key semantics of the system it replaces).
     tx.execute(
         "DELETE FROM enqueue_receipts WHERE rowid IN (
              SELECT er.rowid FROM enqueue_receipts er
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_bullmq_retention() {
+    fn defaults_match_replaced_retention() {
         let d = RetentionConfig::default();
         assert_eq!(d.completed_age_ms, 86_400_000);
         assert_eq!(d.completed_count, 1_000);

@@ -1,6 +1,6 @@
 # AnvilMQ TypeScript client (Bun)
 
-This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a BullMQ-style starting point, not a compatible replacement or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are not implemented.
+This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a minimal starting point, not a compatible replacement for any existing client or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are not implemented.
 
 ## Setup and validation
 
@@ -144,11 +144,6 @@ const worker = new Worker<{ orderId: string }>("orders", async job => {
 The recursion circuit breaker still applies to the derived depth: a child whose lineage
 would exceed the broker's maximum execution depth is rejected with `RESOURCE_EXHAUSTED`.
 
-**Client/server version coupling.** `enqueueChild` sends `executionDepth = 0` and relies
-on the server to derive it. Deploy a broker with server-side depth derivation before
-using `enqueueChild`; against an older broker, a parent enqueue with depth `0` is
-rejected as inconsistent. Callers that pass an explicit correct depth are unaffected.
-
 ## Safe enqueue retries
 
 ```typescript
@@ -160,13 +155,11 @@ const result = await queue.add(
 console.log(result.id, result.replayed);
 ```
 
-Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. A matching replay returns the original enqueue state, which can be Waiting/Delayed even if the job has since completed.
+Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. The reply is an enqueue receipt, not a status query: a matching replay returns the job's ORIGINAL enqueue state (`Waiting`, or `Delayed` if a delay was set) even after the job has run. Treat `result.replayed === true` as "nothing new was created" and use `result.id` to look up live progress separately. See [Idempotent enqueue](../README.md#idempotent-enqueue) for the full model.
 
 Only keyed enqueue automatically retries `Unavailable` and `DeadlineExceeded`: three calls maximum, 100ms then 200ms waits, each with `rpcTimeoutMs`. Request data is serialized and options copied once before retrying. After exhaustion, the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work. This is not a durable producer buffer: use an outbox if submissions must survive producer-process loss before acknowledgment.
 
-Receipts are retained indefinitely for now, including after job completion/failure. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
-
-**Upgrade the broker before using this client feature. Published v0.1.0-rc.1 does not support enqueue idempotency.** Older protobuf servers silently ignore unknown request fields, so keyed retries against an older broker can create duplicates. This feature requires a subsequent broker release; ordinary unkeyed callers remain compatible.
+Receipts have no standalone TTL and are reclaimed only once the job is gone from both the live and history tables, so the dedup window tracks job retention. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
 
