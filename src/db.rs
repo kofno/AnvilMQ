@@ -123,6 +123,8 @@ mod tests {
             .unwrap();
         conn.prepare("SELECT facet_key, last_served_seq, last_served_at FROM facet_dispatch")
             .unwrap();
+        conn.prepare("SELECT id, rejected_at, kind, name, trace_id, parent_id, execution_depth, rate_limit_facet, detail FROM enqueue_rejections")
+            .unwrap();
     }
 }
 
@@ -276,6 +278,24 @@ impl DatabaseManager {
 
             CREATE INDEX IF NOT EXISTS idx_facet_dispatch_served_at
             ON facet_dispatch (last_served_at);
+
+            CREATE TABLE IF NOT EXISTS enqueue_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rejected_at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                trace_id TEXT,
+                parent_id TEXT,
+                execution_depth INTEGER,
+                rate_limit_facet TEXT,
+                detail TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_rejections_rejected_at
+            ON enqueue_rejections (rejected_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_rejections_name_rejected
+            ON enqueue_rejections (name, rejected_at DESC);
             ",
         )?;
 
