@@ -5,6 +5,7 @@ async fn service_with(path: &str, max_chain_size: u64) -> MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size,
+        fairness_enabled: false,
     }
 }
 

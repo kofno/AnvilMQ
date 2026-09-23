@@ -84,6 +84,9 @@ mod tests {
             "DROP INDEX idx_jobs_pressure;
             DROP INDEX idx_jobs_active_lease;
             DROP INDEX idx_chain_counters_updated;
+            DROP INDEX idx_facet_dispatch_seq;
+            DROP INDEX idx_facet_dispatch_served_at;
+            DROP TABLE facet_dispatch;
             DROP TABLE chain_counters;
             ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
             ALTER TABLE jobs DROP COLUMN last_error;
@@ -117,6 +120,8 @@ mod tests {
         conn.prepare("SELECT worker_id, last_error, rate_limit_facet FROM job_history")
             .unwrap();
         conn.prepare("SELECT trace_id, job_count, updated_at FROM chain_counters")
+            .unwrap();
+        conn.prepare("SELECT facet_key, last_served_seq, last_served_at FROM facet_dispatch")
             .unwrap();
     }
 }
@@ -259,6 +264,18 @@ impl DatabaseManager {
 
             CREATE INDEX IF NOT EXISTS idx_chain_counters_updated
             ON chain_counters (updated_at);
+
+            CREATE TABLE IF NOT EXISTS facet_dispatch (
+                facet_key TEXT PRIMARY KEY,
+                last_served_seq INTEGER NOT NULL,
+                last_served_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facet_dispatch_seq
+            ON facet_dispatch (last_served_seq);
+
+            CREATE INDEX IF NOT EXISTS idx_facet_dispatch_served_at
+            ON facet_dispatch (last_served_at);
             ",
         )?;
 

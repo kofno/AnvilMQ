@@ -310,6 +310,7 @@ pub struct Metrics {
     ancestry_rejections: AtomicU64,
     chain_quarantines: AtomicU64,
     chain_counters_pruned: AtomicU64,
+    facet_dispatch_pruned: AtomicU64,
     ingress_rejections: AtomicU64,
 }
 impl Metrics {
@@ -411,6 +412,12 @@ impl Metrics {
             self.chain_counters_pruned.fetch_add(n, Relaxed);
         }
     }
+    /// Idle per-facet fairness rotation rows reclaimed by the retention sweeper's TTL prune.
+    pub fn facet_dispatch_pruned(&self, n: u64) {
+        if n > 0 {
+            self.facet_dispatch_pruned.fetch_add(n, Relaxed);
+        }
+    }
     /// Enqueue rejected because the facet's sliding-window ingress velocity exceeded its
     /// configured admission limit (or the facet is paused with `max_jobs == 0`).
     pub fn ingress_rejection(&self) {
@@ -466,6 +473,7 @@ impl Metrics {
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
         out += &format!("# HELP anvilmq_ancestry_rejections_total Enqueues rejected for missing parent or inconsistent execution depth.\n# TYPE anvilmq_ancestry_rejections_total counter\nanvilmq_ancestry_rejections_total {}\n# HELP anvilmq_chain_quarantines_total Enqueues rejected because their lineage exceeded the runaway-chain cap.\n# TYPE anvilmq_chain_quarantines_total counter\nanvilmq_chain_quarantines_total {}\n# HELP anvilmq_chain_counters_pruned_total Idle per-lineage counter rows reclaimed by the retention sweeper.\n# TYPE anvilmq_chain_counters_pruned_total counter\nanvilmq_chain_counters_pruned_total {}\n", self.ancestry_rejections.load(Relaxed), self.chain_quarantines.load(Relaxed), self.chain_counters_pruned.load(Relaxed));
         out += &format!("# HELP anvilmq_ingress_rejected_total Enqueues rejected by the sliding-window ingress velocity control.\n# TYPE anvilmq_ingress_rejected_total counter\nanvilmq_ingress_rejected_total {}\n", self.ingress_rejections.load(Relaxed));
+        out += &format!("# HELP anvilmq_facet_dispatch_pruned_total Idle per-facet fairness rotation rows reclaimed by the retention sweeper.\n# TYPE anvilmq_facet_dispatch_pruned_total counter\nanvilmq_facet_dispatch_pruned_total {}\n", self.facet_dispatch_pruned.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out
