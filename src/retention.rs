@@ -31,6 +31,8 @@ pub struct RetentionConfig {
     pub batch: i64,
     /// Delete per-lineage `chain_counters` rows idle longer than this. `0` disables.
     pub chain_counter_ttl_ms: i64,
+    /// Delete idle `facet_dispatch` fairness rows (no live jobs, idle beyond this). `0` disables.
+    pub facet_dispatch_ttl_ms: i64,
 }
 
 impl Default for RetentionConfig {
@@ -47,6 +49,9 @@ impl Default for RetentionConfig {
             // A lineage idle beyond a week is treated as finished; a much later straggler
             // reusing the trace starts a fresh chain.
             chain_counter_ttl_ms: 604_800_000,
+            // A facet idle beyond a week with no live jobs has left rotation; a returning
+            // tenant is served promptly (never-served sorts first) and rejoins rotation.
+            facet_dispatch_ttl_ms: 604_800_000,
         }
     }
 }
@@ -77,6 +82,10 @@ impl RetentionConfig {
             chain_counter_ttl_ms: env_i64(
                 "ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS",
                 d.chain_counter_ttl_ms,
+            )?,
+            facet_dispatch_ttl_ms: env_i64(
+                "ANVILMQ_FACET_DISPATCH_TTL_MS",
+                d.facet_dispatch_ttl_ms,
             )?,
         };
         cfg.validate()?;
@@ -117,6 +126,12 @@ impl RetentionConfig {
                 self.chain_counter_ttl_ms
             ));
         }
+        if self.facet_dispatch_ttl_ms < 0 {
+            return Err(format!(
+                "ANVILMQ_FACET_DISPATCH_TTL_MS={} must be >= 0",
+                self.facet_dispatch_ttl_ms
+            ));
+        }
         Ok(())
     }
 
@@ -126,6 +141,7 @@ impl RetentionConfig {
             || self.failed_age_ms > 0
             || self.failed_count > 0
             || self.chain_counter_ttl_ms > 0
+            || self.facet_dispatch_ttl_ms > 0
     }
 }
 
@@ -137,6 +153,7 @@ pub struct SweepOutcome {
     pub failed_count: usize,
     pub receipts: usize,
     pub chain_counters: usize,
+    pub facet_dispatch: usize,
 }
 
 impl SweepOutcome {
@@ -147,6 +164,7 @@ impl SweepOutcome {
             + self.failed_count
             + self.receipts
             + self.chain_counters
+            + self.facet_dispatch
     }
 }
 
@@ -203,6 +221,23 @@ fn prune_chain_counters(tx: &Connection, cutoff: i64, batch: i64) -> rusqlite::R
     )
 }
 
+fn prune_facet_dispatch(tx: &Connection, cutoff: i64, batch: i64) -> rusqlite::Result<usize> {
+    // Reclaim fairness rotation rows for facets idle past the TTL that have no live jobs, so the
+    // table stays bounded. Dropping an idle facet is safe: a returning tenant is never-served and
+    // sorts first. Indexed on last_served_at so the scan is a bounded range read.
+    tx.execute(
+        "DELETE FROM facet_dispatch WHERE facet_key IN (
+             SELECT facet_key FROM facet_dispatch d
+             WHERE d.last_served_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs j WHERE COALESCE(j.rate_limit_facet, '') = d.facet_key
+               )
+             ORDER BY d.last_served_at ASC LIMIT ?2
+         )",
+        rusqlite::params![cutoff, batch],
+    )
+}
+
 /// Run one bounded sweep pass. Each dimension deletes at most `batch` rows so the writer is
 /// never held for long; the caller's interval re-runs until the backlog is drained. Metrics
 /// are updated after commit so gauges never reflect uncommitted deletes.
@@ -241,6 +276,13 @@ pub fn sweep_blocking(
         out.chain_counters =
             prune_chain_counters(&tx, now.saturating_sub(cfg.chain_counter_ttl_ms), cfg.batch)?;
     }
+    if cfg.facet_dispatch_ttl_ms > 0 {
+        out.facet_dispatch = prune_facet_dispatch(
+            &tx,
+            now.saturating_sub(cfg.facet_dispatch_ttl_ms),
+            cfg.batch,
+        )?;
+    }
     tx.commit()?;
 
     metrics.retention_deleted("completed", "age", out.completed_age as u64);
@@ -249,6 +291,7 @@ pub fn sweep_blocking(
     metrics.retention_deleted("failed", "count", out.failed_count as u64);
     metrics.retention_deleted("receipt", "orphan", out.receipts as u64);
     metrics.chain_counters_pruned(out.chain_counters as u64);
+    metrics.facet_dispatch_pruned(out.facet_dispatch as u64);
     Ok(out)
 }
 
@@ -277,6 +320,7 @@ mod tests {
             interval_ms: 60_000,
             batch: 1_000,
             chain_counter_ttl_ms: 0,
+            facet_dispatch_ttl_ms: 0,
         }
     }
 
@@ -489,5 +533,58 @@ mod tests {
         assert_eq!(d.failed_age_ms, 604_800_000);
         assert!(d.enabled());
         assert!(d.validate().is_ok());
+    }
+
+    async fn insert_facet_dispatch(db: &DatabaseManager, key: &str, seq: i64, served_at: i64) {
+        let conn = db.get_shared_connection();
+        let guard = conn.lock().await;
+        guard
+            .execute(
+                "INSERT INTO facet_dispatch (facet_key, last_served_seq, last_served_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, seq, served_at],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn facet_dispatch_prune_removes_idle_rows_without_live_jobs() {
+        let db = manager().await;
+        let t = now(&db).await;
+        // Idle beyond TTL, no live job -> pruned.
+        insert_facet_dispatch(&db, "tenant:idle", 1, t - 7_200_000).await;
+        // Idle beyond TTL but still has a live job -> kept.
+        insert_facet_dispatch(&db, "tenant:live", 2, t - 7_200_000).await;
+        insert_live_job(&db, "live-job").await;
+        sql_exec(
+            &db,
+            "UPDATE jobs SET rate_limit_facet = 'tenant:live' WHERE id = 'live-job'",
+        )
+        .await;
+        // Recently served -> kept.
+        insert_facet_dispatch(&db, "tenant:fresh", 3, t - 60_000).await;
+        let mut c = cfg();
+        c.facet_dispatch_ttl_ms = 3_600_000;
+        let out = sweep(db.clone(), c).await.unwrap();
+        assert_eq!(out.facet_dispatch, 1);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM facet_dispatch").await,
+            2,
+            "only the idle unreferenced facet is pruned"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM facet_dispatch WHERE facet_key = 'tenant:idle'"
+            )
+            .await,
+            0
+        );
+    }
+
+    async fn sql_exec(db: &DatabaseManager, sql: &'static str) {
+        let conn = db.get_shared_connection();
+        let guard = conn.lock().await;
+        guard.execute_batch(sql).unwrap();
     }
 }

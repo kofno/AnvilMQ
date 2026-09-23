@@ -37,6 +37,7 @@ pub struct MyQueueService {
     db_manager: Arc<DatabaseManager>,
     max_execution_depth: u32,
     max_chain_size: u64,
+    fairness_enabled: bool,
 }
 
 #[tonic::async_trait]
@@ -66,6 +67,7 @@ impl QueueService for MyQueueService {
             ));
         }
         let metrics = self.db_manager.metrics.clone();
+        let fairness_enabled = self.fairness_enabled;
         let conn_arc = self.db_manager.get_shared_connection();
         let job = tokio::task::spawn_blocking(move || -> rusqlite::Result<GetNextJobResponse> {
             let mut conn = conn_arc.blocking_lock();
@@ -86,11 +88,32 @@ impl QueueService for MyQueueService {
             // CASE is lazy: with no rules, avoid scanning the backlog solely for telemetry.
             // Read this inside the claim transaction so concurrent rule changes stay serialized.
             let throttled: bool = tx.query_row(&rate_limit::throttled_poll_sql(&sql, blocked), rusqlite::params_from_iter(parameters.iter()), |r| r.get(0))?;
-            sql.push_str(&format!(" AND NOT {blocked}"));
-            sql.push_str(" ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1");
+            // Fairness rotates among equal-priority due jobs by least-recently-served facet; when
+            // disabled the query is byte-for-byte the legacy priority+FIFO claim (zero overhead).
+            let claim_sql = if fairness_enabled {
+                let mut fair = String::from(
+                    "SELECT jobs.id, jobs.name, jobs.payload, jobs.parent_id, jobs.trace_id,
+                            jobs.execution_depth, jobs.attempts, jobs.state
+                     FROM jobs
+                     LEFT JOIN facet_dispatch d ON d.facet_key = COALESCE(jobs.rate_limit_facet, '')
+                     WHERE jobs.state IN ('Waiting', 'Delayed') AND jobs.available_at <= ?1",
+                );
+                if !req.queue_names.is_empty() {
+                    fair.push_str(" AND jobs.name IN (");
+                    fair.push_str(&vec!["?"; req.queue_names.len()].join(","));
+                    fair.push(')');
+                }
+                fair.push_str(&format!(" AND NOT {blocked}"));
+                fair.push_str(" ORDER BY jobs.priority ASC, COALESCE(d.last_served_seq, 0) ASC, jobs.created_at ASC, jobs.id ASC LIMIT 1");
+                fair
+            } else {
+                sql.push_str(&format!(" AND NOT {blocked}"));
+                sql.push_str(" ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1");
+                sql
+            };
             let job = tx
                 .query_row(
-                    &sql,
+                    &claim_sql,
                     rusqlite::params_from_iter(
                         std::iter::once(rusqlite::types::Value::Integer(now)).chain(
                             req.queue_names
@@ -141,6 +164,29 @@ impl QueueService for MyQueueService {
                     job.lease_expires_at_ms
                 ],
             )?;
+            if fairness_enabled {
+                // Record this facet as the most-recently-served so the next claim rotates past
+                // it. Commits atomically with the claim; a no-hit poll or rollback records nothing.
+                let facet: String = tx
+                    .query_row(
+                        "SELECT COALESCE(rate_limit_facet, '') FROM jobs WHERE id = ?1",
+                        [&job.id],
+                        |r| r.get(0),
+                    )?;
+                let next_seq: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(last_served_seq), 0) + 1 FROM facet_dispatch",
+                    [],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO facet_dispatch(facet_key, last_served_seq, last_served_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(facet_key) DO UPDATE SET
+                       last_served_seq = excluded.last_served_seq,
+                       last_served_at = excluded.last_served_at",
+                    rusqlite::params![facet, next_seq, now],
+                )?;
+            }
             tx.commit()?;
             if throttled { metrics.throttled(); }
             metrics.transition(Some(&prior_state), "Active", "claimed");
@@ -463,10 +509,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(std::env::VarError::NotPresent) => 0,
         Err(error) => return Err(error.into()),
     };
+    // Opt-in equal round-robin fairness across facets; default off keeps the claim path identical.
+    let fairness_enabled = std::env::var("ANVILMQ_FAIRNESS_ENABLED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false);
     let service = MyQueueService {
         db_manager,
         max_execution_depth: 10, // Max recursion depth guardrail
         max_chain_size,          // Runaway-chain quarantine cap; 0 disables
+        fairness_enabled,        // Equal round-robin tenant fairness; off = identical to legacy
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -494,6 +550,7 @@ mod tests {
             db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
             max_execution_depth: 10,
             max_chain_size: 0,
+            fairness_enabled: false,
         };
         // Seed the ancestry parent referenced by the enqueue helper so that supplied
         // parent_id/execution_depth pass ancestry validation. Parked in job_history so it

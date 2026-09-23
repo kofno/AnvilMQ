@@ -50,6 +50,7 @@ async fn completion_receipt_survives_reopening_database() {
             db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
             max_execution_depth: 10,
             max_chain_size: 0,
+            fairness_enabled: false,
         };
         id = service
             .add_job(Request::new(AddJobRequest {
@@ -68,6 +69,7 @@ async fn completion_receipt_survives_reopening_database() {
             db_manager: Arc::new(DatabaseManager::new(path.to_str().unwrap()).await.unwrap()),
             max_execution_depth: 10,
             max_chain_size: 0,
+            fairness_enabled: false,
         };
         complete(&service, &id, "worker", 1).await.unwrap();
         complete(&service, &id, "worker", 0).await.unwrap();
@@ -258,6 +260,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -275,6 +278,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -297,6 +301,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -345,6 +350,7 @@ async fn setup(max_attempts: u32) -> (MyQueueService, String) {
         db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -725,6 +731,7 @@ async fn schedule_and_policy_survive_restart() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     service
         .add_job(Request::new(AddJobRequest {
@@ -741,6 +748,7 @@ async fn schedule_and_policy_survive_restart() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     assert!(!claim(&service).await.found);
     let conn = service.db_manager.get_shared_connection();
@@ -976,6 +984,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     service
         .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
@@ -1001,6 +1010,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         db_manager: Arc::new(DatabaseManager::new(&path).await.unwrap()),
         max_execution_depth: 10,
         max_chain_size: 0,
+        fairness_enabled: false,
     };
     assert!(!claim(&service).await.found);
     let status = service
@@ -1022,4 +1032,165 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
     assert!(claim(&service).await.found);
     drop(service);
     tokio::fs::remove_file(path).await.unwrap();
+}
+
+// ---- Tenant fairness (equal round-robin) ----
+
+async fn fairness_service(enabled: bool) -> MyQueueService {
+    MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
+        max_execution_depth: 10,
+        max_chain_size: 0,
+        fairness_enabled: enabled,
+    }
+}
+
+async fn add(service: &MyQueueService, name: &str, facet: &str, priority: i32) {
+    service
+        .add_job(Request::new(AddJobRequest {
+            name: name.into(),
+            rate_limit_facet: facet.into(),
+            priority,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+}
+
+async fn claim_name(service: &MyQueueService) -> String {
+    claim(service).await.name
+}
+
+async fn facet_dispatch_keys(service: &MyQueueService) -> Vec<String> {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        let guard = conn.blocking_lock();
+        let mut stmt = guard
+            .prepare("SELECT facet_key FROM facet_dispatch ORDER BY facet_key")
+            .unwrap();
+        let keys = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        keys
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fairness_rotates_equal_priority_jobs_across_facets() {
+    let service = fairness_service(true).await;
+    for _ in 0..3 {
+        add(&service, "a", "tenant:a", 0).await;
+    }
+    for _ in 0..3 {
+        add(&service, "b", "tenant:b", 0).await;
+    }
+    // Make facet a's jobs strictly older so the first-claim tie resolves to a deterministically.
+    sql(
+        &service,
+        "UPDATE jobs SET created_at = CASE WHEN name = 'a' THEN 1 ELSE 2 END",
+    )
+    .await;
+    let mut order = Vec::new();
+    for _ in 0..6 {
+        order.push(claim_name(&service).await);
+    }
+    assert_eq!(order, vec!["a", "b", "a", "b", "a", "b"]);
+}
+
+#[tokio::test]
+async fn priority_is_a_hard_tier_over_fairness() {
+    let service = fairness_service(true).await;
+    // Serve tenant:a once so it is the most-recently-served facet.
+    add(&service, "a-seed", "tenant:a", 5).await;
+    assert_eq!(claim_name(&service).await, "a-seed");
+    // A higher-priority job of the just-served facet must beat a starved facet's lower-priority job.
+    add(&service, "a-hi", "tenant:a", 0).await;
+    add(&service, "b-lo", "tenant:b", 5).await;
+    assert_eq!(claim_name(&service).await, "a-hi");
+    assert_eq!(claim_name(&service).await, "b-lo");
+}
+
+#[tokio::test]
+async fn unfaceted_jobs_rotate_as_a_single_tenant() {
+    let service = fairness_service(true).await;
+    for _ in 0..2 {
+        add(&service, "u", "", 0).await;
+    }
+    for _ in 0..2 {
+        add(&service, "a", "tenant:a", 0).await;
+    }
+    sql(
+        &service,
+        "UPDATE jobs SET created_at = CASE WHEN name = 'u' THEN 1 ELSE 2 END",
+    )
+    .await;
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        order.push(claim_name(&service).await);
+    }
+    // Unfaceted jobs share one rotation slot instead of monopolizing back-to-back.
+    assert_eq!(order, vec!["u", "a", "u", "a"]);
+}
+
+#[tokio::test]
+async fn never_served_facet_is_picked_promptly() {
+    let service = fairness_service(true).await;
+    add(&service, "a-seed", "tenant:a", 0).await;
+    assert_eq!(claim_name(&service).await, "a-seed");
+    // An older tenant:a job and a brand-new facet's job: the never-served facet sorts first.
+    add(&service, "a-old", "tenant:a", 0).await;
+    add(&service, "new", "tenant:new", 0).await;
+    sql(
+        &service,
+        "UPDATE jobs SET created_at = CASE WHEN name = 'a-old' THEN 1 ELSE 2 END",
+    )
+    .await;
+    assert_eq!(claim_name(&service).await, "new");
+}
+
+#[tokio::test]
+async fn rate_limit_blocked_facet_is_skipped_and_takes_no_turn() {
+    use queue::v1::*;
+    let service = fairness_service(true).await;
+    service
+        .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
+            facet_pattern: "tenant:a".into(),
+            max_jobs: 0,
+            window_duration_ms: 60000,
+        }))
+        .await
+        .unwrap();
+    add(&service, "a", "tenant:a", 0).await;
+    add(&service, "b", "tenant:b", 0).await;
+    assert_eq!(claim_name(&service).await, "b");
+    // The blocked facet was never selected, so it consumed no rotation slot.
+    assert_eq!(facet_dispatch_keys(&service).await, vec!["tenant:b"]);
+}
+
+#[tokio::test]
+async fn fairness_disabled_preserves_priority_fifo_and_writes_nothing() {
+    let service = fairness_service(false).await;
+    for _ in 0..3 {
+        add(&service, "a", "tenant:a", 0).await;
+    }
+    for _ in 0..3 {
+        add(&service, "b", "tenant:b", 0).await;
+    }
+    sql(
+        &service,
+        "UPDATE jobs SET created_at = CASE WHEN name = 'a' THEN 1 ELSE 2 END",
+    )
+    .await;
+    let mut order = Vec::new();
+    for _ in 0..6 {
+        order.push(claim_name(&service).await);
+    }
+    // Legacy behavior: one facet's backlog drains fully before the other (no rotation).
+    assert_eq!(order, vec!["a", "a", "a", "b", "b", "b"]);
+    // Disabled path must not write the fairness table at all.
+    assert!(facet_dispatch_keys(&service).await.is_empty());
 }

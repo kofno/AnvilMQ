@@ -33,7 +33,9 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Max jobs per lineage (`trace_id`) before further enqueues are quarantined. |
+| `ANVILMQ_FAIRNESS_ENABLED` | `false` | Opt-in equal round-robin tenant fairness during dequeue, keyed on `rate_limit_facet`. Truthy values (`1`, `true`, `yes`) enable it; off by default with zero claim-path overhead. See [Tenant fairness](#tenant-fairness). |
 | `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
+| `ANVILMQ_FACET_DISPATCH_TTL_MS` | `604800000` (7d) | Idle age after which a fairness rotation row (`facet_dispatch`) with no live jobs is pruned by the retention sweeper. `0` disables the prune. |
 
 The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate.
 
@@ -92,7 +94,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
-- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented. This applies to both the dispatch-side rate limits and the admission-side ingress velocity limits.
+- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented. This applies to both the dispatch-side rate limits and the admission-side ingress velocity limits. Equal (unweighted) round-robin fairness across facets is available opt-in; see [Tenant fairness](#tenant-fairness).
 - The server defaults to loopback. A non-loopback bind requires an explicit `ANVILMQ_ADDR`; transport authentication/TLS are not implemented.
 - No Raft replication or global telemetry exists yet.
 
@@ -127,7 +129,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 - [x] Rule/counter tables and stored job facet.
 - [x] Exact-match rule management/usage RPCs and atomic fixed-window enforcement during dequeue.
-- [ ] Fairness across tenants/departments.
+- [x] Fairness across tenants/departments.
 
 ### Phase 5: Regional high availability
 
@@ -174,6 +176,21 @@ limits.close();
 
 `anvilmq_throttled_polls_total` counts committed polls that encounter at least one due, queue-matching throttled job, even if another job is dispatched. It has no tenant/facet labels and does not count rejected jobs individually. The three administrative RPCs also have bounded latency labels.
 
+## Tenant fairness
+
+By default, dequeue dispatches strictly by `priority ASC, created_at ASC, id ASC`, so at a given priority one tenant that floods the queue has all its earlier-enqueued jobs claimed before another tenant's later jobs (head-of-line monopolization). Setting `ANVILMQ_FAIRNESS_ENABLED` to a truthy value (`1`, `true`, `yes`) enables **equal round-robin fairness** so no single tenant/department monopolizes workers.
+
+- **Key.** Fairness is keyed on the existing `rate_limit_facet` stored on each job (the same tenant/business identity used for faceted rate limits) — no new field or RPC. Set it per job via the client's `rateLimitFacet` option.
+- **Model.** Equal (unweighted) round-robin: among due jobs at the lowest priority, the server dispatches the least-recently-served facet first, rotating so every active facet gets an equal turn. A per-facet dispatch sequence is tracked in a `facet_dispatch` table, upserted in the same transaction as the claim so rotation state and the claim commit atomically. A never-served facet sorts first, so new tenants are served promptly and then join the rotation.
+- **Priority is a hard tier.** Fairness rotates *only* among due jobs at the same lowest priority; a higher-priority job always beats a lower-priority one regardless of how recently its facet was served.
+- **Unfaceted jobs.** Jobs with no `rate_limit_facet` collectively form a single fairness group (via an empty-string sentinel), rotating as one tenant rather than one group per job.
+- **Rate limits still apply.** Rate-limit-blocked jobs are excluded from selection exactly as before; a blocked facet is never selected and therefore consumes no rotation turn. Fairness is distinct from rate limiting and does not change rate-limit behavior.
+- **Off is a strict no-op.** When disabled (the default), the claim query and behavior are byte-for-byte identical to the legacy priority+FIFO path, with no join, no extra writes, and no overhead.
+
+Idle `facet_dispatch` rows (a facet with no live jobs, untouched beyond `ANVILMQ_FACET_DISPATCH_TTL_MS`, default 7 days; `0` disables) are reclaimed by the retention sweeper in bounded batches, keeping the table bounded across a long-lived process. The global counter `anvilmq_facet_dispatch_pruned_total` (no tenant/facet labels) surfaces on `/metrics`.
+
+**Performance note.** Fair ordering adds a `LEFT JOIN facet_dispatch` and sorts the due candidate set by rotation sequence rather than early-terminating on the `idx_jobs_waiting_queue` partial index, so it trades a little claim-path work for fairness. The distinct-facet cardinality is naturally small, and the feature is fully opt-in — leave it off to keep the original index-driven claim.
+
 ## Ingress velocity limits
 
 Ingress velocity limits are an **admission-side** control: they throttle the rate at which jobs are *enqueued* for a facet, unlike the faceted rate limits above, which are a **dispatch-side** control that throttles the rate at which workers *claim* jobs. Ingress limits reject `AddJob` up front to protect the embedded writer from sustained or bursty enqueue overload; they are a separate mechanism with their own rules, counters, and RPCs, and do not interact with the dispatch-side limits.
@@ -207,6 +224,7 @@ Terminal jobs are copied into `job_history` and keyed enqueues leave dedup recor
 - The sweep runs every `ANVILMQ_RETENTION_INTERVAL_MS` (default `60000`) and deletes at most `ANVILMQ_RETENTION_BATCH` rows per statement (default `1000`), draining backlogs across ticks so the shared writer is never held for long.
 - An idempotency receipt is removed once its job is gone from both the live and history tables, so the dedup window tracks job retention exactly.
 - Idle runaway-chain counters (`chain_counters`, keyed by lineage `trace_id`) are pruned once untouched for `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` (default `604800000`, 7d; `0` disables the prune), bounding the counter table across a long-lived process. See [Ancestry validation and runaway-chain quarantine](#ancestry-validation-and-runaway-chain-quarantine).
+- Idle tenant-fairness rotation rows (`facet_dispatch`, keyed by `rate_limit_facet`) are pruned once a facet has no live jobs and has been untouched for `ANVILMQ_FACET_DISPATCH_TTL_MS` (default `604800000`, 7d; `0` disables the prune), bounding the table across a long-lived process. Dropping an idle facet is safe: a returning tenant is treated as never-served and served promptly. See [Tenant fairness](#tenant-fairness).
 - Age values below a safety floor (`2 x` the 30s lease) are rejected at startup so a terminal job cannot be pruned while a duplicate lifecycle RPC is still replaying against history. Set every dimension to `0` to disable the sweeper entirely.
 
 Space is reclaimed by SQLite page reuse at steady state; the sweeper does not run `VACUUM`, which would lock the writer. The `anvilmq_jobs{state}` gauges for terminal states flatten once retention keeps pace with completion throughput.
