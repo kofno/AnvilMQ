@@ -160,7 +160,7 @@ const result = await queue.add(
 console.log(result.id, result.replayed);
 ```
 
-Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. A matching replay returns the original enqueue state, which can be Waiting/Delayed even if the job has since completed.
+Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. The reply is an enqueue receipt, not a status query: a matching replay returns the job's ORIGINAL enqueue state (`Waiting`, or `Delayed` if a delay was set) even after the job has run. Treat `result.replayed === true` as "nothing new was created" and use `result.id` to look up live progress separately. See [Idempotent enqueue](../README.md#idempotent-enqueue) for the full model.
 
 Only keyed enqueue automatically retries `Unavailable` and `DeadlineExceeded`: three calls maximum, 100ms then 200ms waits, each with `rpcTimeoutMs`. Request data is serialized and options copied once before retrying. After exhaustion, the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work. This is not a durable producer buffer: use an outbox if submissions must survive producer-process loss before acknowledgment.
 

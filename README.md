@@ -37,7 +37,7 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 | `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
 | `ANVILMQ_FACET_DISPATCH_TTL_MS` | `604800000` (7d) | Idle age after which a fairness rotation row (`facet_dispatch`) with no live jobs is pruned by the retention sweeper. `0` disables the prune. |
 
-The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate.
+The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate. See [Idempotent enqueue](#idempotent-enqueue) for the full resolution model, timeline, and metrics, and [client/README.md](client/README.md#safe-enqueue-retries) for client-side retry helpers.
 
 Receipts survive restart and terminal job transitions and are retained indefinitely in this first version, independently of job history. They contain the normalized request including payload, so keyed jobs add storage overhead. There is no TTL or cleanup endpoint yet; deleting receipts removes the corresponding deduplication guarantee. Monitor receipt count and PVC usage. Use a new key for intentionally new work and retain the same key/request across producer retries/restarts. Handler side effects remain at least once. See [client usage](client/README.md).
 
@@ -152,6 +152,45 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Console click-through from a search result to the single-job detail view (`GET /v1/jobs/{id}`): select a row to open the full record inline — notably `last_error` for a failed job — so failure triage is a one-click step instead of a hand-built request.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
+
+## Idempotent enqueue
+
+Enqueue idempotency makes a repeated `AddJob` safe: when a producer retries the same submission — after a timed-out call, a dropped connection, or a crash and restart — the broker returns the original job instead of creating a duplicate. It is opt-in per request through `idempotency_key` and scoped to the exact queue `name`; unkeyed enqueues take the ordinary path and store nothing extra.
+
+### How a keyed enqueue is resolved
+
+On the first keyed enqueue the broker writes an enqueue receipt into `enqueue_receipts`, keyed by `(queue_name, idempotency_key)`. The receipt stores the normalized request bytes (captured before the job UUID and timestamps are generated), the resulting `job_id`, and the job's `initial_state`. The job insert and the receipt insert commit in the same immediate transaction, so a job never exists without its receipt or the reverse. A later keyed enqueue has three outcomes: new key -> insert job+receipt, return `replayed=false`; matching replay (byte-identical normalized request) -> return the original `job_id` and stored `initial_state` with `replayed=true`, creating no second job and consuming no attempt; conflict (receipt exists, request differs) -> return `AlreadyExists` and change nothing.
+
+### Receipt versus status
+
+A matching replay returns the job's INITIAL state (`Waiting`, or `Delayed` if you supplied `delay_ms > 0`) — frozen in the receipt — not the job's live state. It answers "was this already submitted, and what is its ID?", never "what is this job doing now?".
+
+```
+t0  AddJob(key=K)       -> job J created, state=Waiting, receipt{J,"Waiting"} written
+t1  worker claims J     -> J is Active
+t2  worker finishes J   -> J is Completed (later copied to history, maybe pruned)
+t3  retry AddJob(key=K) -> { id: J, state: "Waiting", replayed: true }
+```
+
+At t3 the job is finished, yet the reply still says `Waiting`. The meaningful signals are `replayed=true` (nothing new was created) and the returned id. Query the job by id for live progress. A receipt outlives its job — reclaimed only once the job is gone from both the live and history tables — so a replay can still report `Waiting` after the original was retention-pruned.
+
+### Designing keys
+
+Reuse the same key and the same request across retries and restarts of the same logical work; use a new key for genuinely new work. Because comparison is byte-for-byte on the normalized request, the payload must be serialized identically across retries.
+
+```typescript
+const receipt = await queue.add(
+  { invoiceId: "123" },
+  { idempotencyKey: "tenant-a:generate-invoice:123:v1" },
+);
+if (receipt.replayed) {
+  // A prior submission already created this job; do not treat it as new work.
+}
+```
+
+### Durability, cost, and metrics
+
+Receipts survive restarts and terminal transitions and, in this first version, have no standalone TTL: a receipt is removed only once retention has dropped its job from both the live and history tables, so the dedup window tracks job retention exactly. Each receipt stores the full normalized request including payload, so keyed jobs add storage. The `anvilmq_enqueue_receipts` gauge tracks the retained count, `anvilmq_enqueue_replays_total` counts matching replays, and `anvilmq_enqueue_conflicts_total` counts rejected key reuse. Idempotency covers job creation only — handler side effects remain at least once. An older broker that predates this feature silently ignores the unknown field, so keyed retries against it can still create duplicates.
 
 ## Faceted rate limits
 
