@@ -1,0 +1,39 @@
+## Promtail for the local sim. Discovers the sim's own containers through the Docker
+## socket (filtered to this compose project) and ships their logs to Loki. The broker
+## emits structured JSON (tracing) and the Bun workers/producer emit one JSON object per
+## line, so a tolerant json stage lifts `level` (broker) and `event` (app) into low-
+## cardinality stream labels; the full JSON line is preserved for `| json` drilldown.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: sim-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=anvilmq-sim"]
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: "container"
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: "compose_service"
+    pipeline_stages:
+      # Tolerant: non-JSON or missing keys simply yield no extracted value (line still ships).
+      - json:
+          expressions:
+            level: level
+            event: event
+      - labels:
+          level:
+          event:

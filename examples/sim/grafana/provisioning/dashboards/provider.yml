@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: AnvilMQ sim dashboards
+    orgId: 1
+    folder: AnvilMQ
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,708 @@
+{
+  "uid": "anvilmq-safety",
+  "title": "AnvilMQ safety controls (ancestry & dispatch throttle)",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": [
+    "anvilmq"
+  ],
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "refresh": "5s",
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "About",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Upstream safety controls.** Two independent protections, both exercised by the steady sim workload when `SIM_LIMIT_DEMO=1`.\n\n- **Ancestry-depth circuit breaker** — a self-recursive `RecursiveProbe` chain climbs via `enqueueChild` until an enqueue exceeds the max execution depth (default 10) and is rejected as `RESOURCE_EXHAUSTED`, incrementing `anvilmq_ancestry_rejections_total`. Lineages that outgrow the runaway-chain cap instead hit `anvilmq_chain_quarantines_total`.\n- **Dispatch-side faceted throttle** — a fixed-window claim-rate rule on facet `tenant:dispatch-throttle`. Over-rate jobs are admitted but not claimed; each poll that skips a due-but-throttled job increments `anvilmq_throttled_polls_total`. Per-facet throttle state is also queryable live via the `GetRateLimitStatus` RPC (`is_throttled`), which has no Prometheus series.\n\n**Rejected enqueues never create a job** (the guards return before the insert), so they leave no row in `/v1/failures` or `/v1/jobs/:id`. The only server-side breadcrumb is the broker's warn log — see the **Enqueue-rejection logs** panel at the bottom (from Loki), where each line's structured fields (`name`, `trace_id`, `parent_id`, `execution_depth`) identify the offending job and lineage."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Ancestry rejections/sec",
+      "description": "rate(anvilmq_ancestry_rejections_total). Enqueues rejected for a missing parent, inconsistent execution depth, or exceeding the max-depth circuit breaker. The RecursiveProbe chains drive this.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(anvilmq_ancestry_rejections_total[1m])",
+          "legendFormat": "ancestry rejected/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Ancestry rejected (cumulative)",
+      "description": "anvilmq_ancestry_rejections_total since process start.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 6,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "anvilmq_ancestry_rejections_total",
+          "legendFormat": "ancestry rejected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Chain quarantines/sec",
+      "description": "rate(anvilmq_chain_quarantines_total). Enqueues rejected because their lineage exceeded the runaway-chain cap (0 = disabled). Distinct from the per-enqueue depth breaker above.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 4,
+        "w": 6,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(anvilmq_chain_quarantines_total[1m])",
+          "legendFormat": "quarantined/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Dispatch throttled polls/sec",
+      "description": "rate(anvilmq_throttled_polls_total). Claim attempts that skipped a due-but-throttled job under the fixed-window dispatch rate rule (facet tenant:dispatch-throttle). Non-zero means jobs are pooling in Waiting behind the throttle.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(anvilmq_throttled_polls_total[1m])",
+          "legendFormat": "throttled polls/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Throttled polls (cumulative)",
+      "description": "anvilmq_throttled_polls_total since process start.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 6,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "anvilmq_throttled_polls_total",
+          "legendFormat": "throttled polls",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Waiting backlog (throttle pressure)",
+      "description": "anvilmq_jobs{state=\"Waiting\"}. While the dispatch facet is throttled, admitted jobs accumulate here and drain at the fixed-window rate rather than erroring.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 13,
+        "w": 6,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "anvilmq_jobs{state=\"Waiting\"}",
+          "legendFormat": "waiting",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Enqueue-rejection logs (broker)",
+      "description": "Broker warn logs for every rejected enqueue, from Loki: {compose_service=\"broker\"} |= \"enqueue rejected\". Covers ingress velocity, the depth circuit breaker, inconsistent depth, missing parent, and chain quarantine. Expand a line to see the structured fields (name, trace_id, parent_id, execution_depth) that identify the offending job/lineage. Use Explore for ad-hoc LogQL (e.g. add `| json | name=\"RecursiveProbe\"`).",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 11
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{compose_service=\"broker\"} |= \"enqueue rejected\"",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Enqueue rejections/sec by kind",
+      "description": "Per-kind admission-time enqueue rejection rate from anvilmq_enqueue_rejections_total. Covers all five kinds (ingress_velocity, parent_not_found, inconsistent_depth, circuit_breaker, chain_quarantine). Unlike the older aggregate counters, this splits by kind so you can tell recursion breakers from ingress throttles at a glance.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (kind) (rate(anvilmq_enqueue_rejections_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Durable enqueue rejections (/v1/rejections)",
+      "description": "Record-level drill-down of admission-time enqueue rejections from the read-only /v1/rejections feed. These enqueues never created a job row, so this is the only durable per-event trail. For a circuit_breaker or chain_quarantine row, trace_id is the lineage handle (search it in /v1/search) and parent_id is the depth-N job the offending handler tried to descend from. Records are retained independently of job history (ANVILMQ_RETENTION_REJECTIONS_AGE_MS, default 7d), so they survive even after the referenced jobs are pruned. Honors the dashboard time range via since_ms=${__from}.",
+      "type": "table",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "anvilmq-failures-infinity"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rejected_at"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Rejected at"
+              },
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              },
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "kind"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Kind"
+              },
+              {
+                "id": "custom.width",
+                "value": 150
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "name"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Function"
+              },
+              {
+                "id": "custom.width",
+                "value": 190
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "execution_depth"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Depth"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Trace ID (lineage)"
+              },
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "parent_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Parent job ID"
+              },
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "detail"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Detail"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto",
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 320
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Rejected at",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "anvilmq-failures-infinity"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/v1/rejections?limit=1000&since_ms=${__from}",
+          "url_options": {
+            "method": "GET"
+          },
+          "parser": "backend",
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "rejected_at",
+              "text": "rejected_at",
+              "type": "timestamp_epoch_ms"
+            },
+            {
+              "selector": "kind",
+              "text": "kind",
+              "type": "string"
+            },
+            {
+              "selector": "name",
+              "text": "name",
+              "type": "string"
+            },
+            {
+              "selector": "execution_depth",
+              "text": "execution_depth",
+              "type": "number"
+            },
+            {
+              "selector": "trace_id",
+              "text": "trace_id",
+              "type": "string"
+            },
+            {
+              "selector": "parent_id",
+              "text": "parent_id",
+              "type": "string"
+            },
+            {
+              "selector": "rate_limit_facet",
+              "text": "rate_limit_facet",
+              "type": "string"
+            },
+            {
+              "selector": "detail",
+              "text": "detail",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "rejected_at": 0,
+              "kind": 1,
+              "name": 2,
+              "execution_depth": 3,
+              "trace_id": 4,
+              "parent_id": 5,
+              "rate_limit_facet": 6,
+              "detail": 7
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
