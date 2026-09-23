@@ -2,6 +2,25 @@
 
 AnvilMQ is an early-stage Rust queue engine intended for autonomous regional Kubernetes deployments. The current implementation is a single-process gRPC server with embedded SQLite persistence, atomic enqueue/dequeue, and a caller-supplied execution-depth guard. Sub-millisecond latency, high availability, and tenant rate limiting are goals, not verified capabilities.
 
+## Components
+
+AnvilMQ is a single **broker** process that owns an embedded SQLite database; **producers** and **workers** are your own processes that talk to it over gRPC. There is no separate storage tier, coordinator, or message bus — the broker is the whole server.
+
+- **Broker.** The `QueueService` gRPC server. It owns the embedded SQLite store (a single shared writer connection with WAL, plus an isolated read-only replica for inspection) and performs every state transition as an immediate transaction. Workers never touch the database directly; all queue operations go through its RPCs.
+- **Producer.** Any client that enqueues work with `AddJob` (optionally with a delay, priority, ancestry `parent_id`, rate-limit facet, or `idempotency_key`). A producer need not stay connected after enqueue.
+- **Worker.** A client that pulls and runs jobs: `GetNextJob` claims one job under a time-boxed lease, `Heartbeat` renews the lease during long work, and `CompleteJob`/`FailJob` acknowledge the outcome. Each acknowledgment carries the job's `attempt` token so the broker can verify ownership. Handlers should be idempotent (see [Delivery and execution semantics](#delivery-and-execution-semantics)).
+- **Client library.** A repo-local TypeScript/Bun client wraps the gRPC contract as `Queue` (producer), `Worker`, and the administrative `RateLimits`/`IngressLimits` helpers. Any gRPC-capable language can generate its own bindings from `proto/queue.proto`.
+- **Store.** A single embedded SQLite database owned by the broker (jobs, history, enqueue receipts, and rate-limit/fairness bookkeeping). It is not shared with any other process.
+- **Two surfaces.** Queue operations use the gRPC control plane (`QueueService`). A separate HTTP port serves observability: `/metrics` (Prometheus), `/healthz`, `/readyz`, a built-in `/console`, and read-only inspection at `/v1/failures`, `/v1/search`, and `/v1/jobs/:id` — served from the read-only replica so inspection never contends with the write path.
+
+```mermaid
+flowchart LR
+  P[Producer] -->|AddJob| B[Broker: QueueService gRPC]
+  W[Worker] -->|GetNextJob / Heartbeat / CompleteJob / FailJob| B
+  B <--> DB[(Embedded SQLite WAL)]
+  B -->|/metrics /console /v1/*| O[Observability HTTP]
+```
+
 ## Current architecture
 
 For a versioned container, Helm chart, and packaged Bun client, see [evaluation releases and Azure deployment](docs/release-and-deploy.md). The chart deploys one broker with FULL durability and a dedicated PVC; it does not provide HA yet.
