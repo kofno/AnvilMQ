@@ -33,13 +33,7 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Max jobs per lineage (`trace_id`) before further enqueues are quarantined. |
-| `ANVILMQ_FAIRNESS_ENABLED` | `false` | Opt-in equal round-robin tenant fairness during dequeue, keyed on `rate_limit_facet`. Truthy values (`1`, `true`, `yes`) enable it; off by default with zero claim-path overhead. See [Tenant fairness](#tenant-fairness). |
 | `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
-| `ANVILMQ_FACET_DISPATCH_TTL_MS` | `604800000` (7d) | Idle age after which a fairness rotation row (`facet_dispatch`) with no live jobs is pruned by the retention sweeper. `0` disables the prune. |
-
-The same key with different payload bytes, metadata, priority, delay, retry settings, or rate-limit facet returns AlreadyExists. Default attempts/backoff caps and omitted metadata are normalized before comparison; generated trace IDs and timestamps are excluded. JSON key ordering is not normalized: producers must preserve the original serialized request. Keys are opaque and case-sensitive, scoped to queue name rather than facet; include tenant/business identity when appropriate. See [Idempotent enqueue](#idempotent-enqueue) for the full resolution model, timeline, and metrics, and [client/README.md](client/README.md#safe-enqueue-retries) for client-side retry helpers.
-
-Receipts survive restart and terminal job transitions and are retained indefinitely in this first version, independently of job history. They contain the normalized request including payload, so keyed jobs add storage overhead. There is no TTL or cleanup endpoint yet; deleting receipts removes the corresponding deduplication guarantee. Monitor receipt count and PVC usage. Use a new key for intentionally new work and retain the same key/request across producer retries/restarts. Handler side effects remain at least once. See [client usage](client/README.md).
 
 ### Delays and retry backoff
 
