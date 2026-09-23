@@ -1,6 +1,6 @@
 # AnvilMQ TypeScript client (Bun)
 
-This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a BullMQ-style starting point, not a compatible replacement or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are not implemented.
+This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a minimal starting point, not a compatible replacement for any existing client or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are not implemented.
 
 ## Setup and validation
 

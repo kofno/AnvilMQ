@@ -109,8 +109,8 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Immediate retries up to the attempt limit and stale-acknowledgment protection.
 - [x] Persisted worker leases, heartbeat renewal, and abandoned-job recovery.
 - [x] Retry backoff and persisted delayed scheduling.
-- [x] Background retention sweep bounding job history and idempotency receipts (age + per-name count), matching the replaced BullMQ deployment's `removeOnComplete`/`removeOnFail` policy.
-- [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. Not BullMQ-compatible.
+- [x] Background retention sweep bounding job history and idempotency receipts (age + per-name count), matching the retention policy of the queue system it replaces (bounded completed/failed history by age and per-name count).
+- [x] Initial TypeScript/Bun client with JSON enqueue, worker heartbeats, graceful draining, and a real gRPC demo/test. It defines its own gRPC contract and is not a drop-in replacement for any existing queue client.
 
 ### Phase 3: Safety controls
 
@@ -267,7 +267,7 @@ Both match facets exactly (no wildcards), key their counter solely by `rate_limi
 
 ## Retention
 
-Terminal jobs are copied into `job_history` and keyed enqueues leave dedup records in `enqueue_receipts`. Both are pruned by a background sweeper so on-disk state reaches a steady size instead of growing without bound. Defaults mirror the BullMQ deployment this replaces (`removeOnComplete { age: 24h, count: 1000 }`, `removeOnFail { age: 7d }`).
+Terminal jobs are copied into `job_history` and keyed enqueues leave dedup records in `enqueue_receipts`. Both are pruned by a background sweeper so on-disk state reaches a steady size instead of growing without bound. Defaults mirror the retention policy of the system this replaces: completed history bounded to ~24h and ~1000 per name, failed history to ~7d.
 
 - Completed jobs older than `ANVILMQ_RETENTION_COMPLETED_AGE_MS` (default `86400000`, 24h) are deleted; `0` disables age pruning.
 - At most `ANVILMQ_RETENTION_COMPLETED_COUNT` completed jobs are kept per job name, newest first (default `1000`); `0` disables count pruning.
