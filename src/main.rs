@@ -9,6 +9,7 @@ mod enqueue;
 #[cfg(test)]
 mod enqueue_tests;
 mod fts;
+mod ingress_limit;
 mod leases;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -191,6 +192,36 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<queue::v1::GetRateLimitStatusResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("GetRateLimitStatus");
         rate_limit::status(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn upsert_ingress_limit_rule(
+        &self,
+        request: Request<queue::v1::UpsertIngressLimitRuleRequest>,
+    ) -> Result<Response<queue::v1::UpsertIngressLimitRuleResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("UpsertIngressLimitRule");
+        ingress_limit::upsert(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete_ingress_limit_rule(
+        &self,
+        request: Request<queue::v1::DeleteIngressLimitRuleRequest>,
+    ) -> Result<Response<queue::v1::DeleteIngressLimitRuleResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("DeleteIngressLimitRule");
+        ingress_limit::delete(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_ingress_limit_status(
+        &self,
+        request: Request<queue::v1::GetIngressLimitStatusRequest>,
+    ) -> Result<Response<queue::v1::GetIngressLimitStatusResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("GetIngressLimitStatus");
+        ingress_limit::status(self.db_manager.clone(), request.into_inner())
             .await
             .map(Response::new)
     }

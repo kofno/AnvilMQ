@@ -203,3 +203,29 @@ export class RateLimits {
   status(facetKey: string): Promise<RateLimitStatus> { return this.connection.call("getRateLimitStatus", { facetKey }); }
   close() { this.connection.close(); }
 }
+
+export interface IngressLimitStatus {
+  facetKey: string; ruleExists: boolean; maxJobs: number; estimatedCount: number;
+  windowDurationMs: number; windowStartedAt: number; isThrottled: boolean;
+}
+/**
+ * Administrative RPCs for the admission-side sliding-window ingress velocity control.
+ * Distinct from {@link RateLimits}, which throttles the dispatch side (workers claiming
+ * jobs); these throttle the ENQUEUE rate for a facet and reject `AddJob` when a facet's
+ * recent enqueue velocity exceeds its limit. The server currently relies on trusted-network
+ * access.
+ */
+export class IngressLimits {
+  private connection: Connection;
+  constructor(options: ConnectionOptions = {}) { this.connection = new Connection(options); }
+  async upsert(facetKey: string, maxJobs: number, windowDurationMs: number): Promise<void> {
+    if (!Number.isInteger(maxJobs) || maxJobs < 0 || maxJobs > 0xffffffff) throw new Error("maxJobs must fit uint32");
+    if (!Number.isSafeInteger(windowDurationMs) || windowDurationMs <= 0) throw new Error("windowDurationMs must be a positive safe integer");
+    await this.connection.call("upsertIngressLimitRule", { facetPattern: facetKey, maxJobs, windowDurationMs });
+  }
+  async delete(facetKey: string): Promise<boolean> {
+    return (await this.connection.call<{ deleted: boolean }>("deleteIngressLimitRule", { facetKey })).deleted;
+  }
+  status(facetKey: string): Promise<IngressLimitStatus> { return this.connection.call("getIngressLimitStatus", { facetKey }); }
+  close() { this.connection.close(); }
+}

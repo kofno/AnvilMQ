@@ -9,6 +9,9 @@ service QueueService {
   rpc UpsertRateLimitRule (UpsertRateLimitRuleRequest) returns (UpsertRateLimitRuleResponse);
   rpc DeleteRateLimitRule (DeleteRateLimitRuleRequest) returns (DeleteRateLimitRuleResponse);
   rpc GetRateLimitStatus (GetRateLimitStatusRequest) returns (GetRateLimitStatusResponse);
+  rpc UpsertIngressLimitRule (UpsertIngressLimitRuleRequest) returns (UpsertIngressLimitRuleResponse);
+  rpc DeleteIngressLimitRule (DeleteIngressLimitRuleRequest) returns (DeleteIngressLimitRuleResponse);
+  rpc GetIngressLimitStatus (GetIngressLimitStatusRequest) returns (GetIngressLimitStatusResponse);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -107,4 +110,26 @@ message GetRateLimitStatusResponse {
   bool is_throttled = 5;
   bool rule_exists = 6;
   int64 window_duration_ms = 7;
+}
+
+// Admission-side sliding-window ingress velocity control. Distinct from the
+// dispatch-side fixed-window rate limits above: these throttle the ENQUEUE rate
+// for a facet, rejecting AddJob when recent enqueue velocity exceeds the limit.
+message UpsertIngressLimitRuleRequest {
+  string facet_pattern = 1; // Exact key only; wildcards are rejected.
+  uint32 max_jobs = 2; // Zero pauses ingress for this facet.
+  int64 window_duration_ms = 3;
+}
+message UpsertIngressLimitRuleResponse { bool success = 1; }
+message DeleteIngressLimitRuleRequest { string facet_key = 1; }
+message DeleteIngressLimitRuleResponse { bool deleted = 1; }
+message GetIngressLimitStatusRequest { string facet_key = 1; }
+message GetIngressLimitStatusResponse {
+  string facet_key = 1;
+  uint32 estimated_count = 2;
+  uint32 max_jobs = 3;
+  int64 window_duration_ms = 4;
+  int64 window_started_at = 5;
+  bool is_throttled = 6;
+  bool rule_exists = 7;
 }
