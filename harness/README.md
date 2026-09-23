@@ -129,3 +129,42 @@ After building the runner and starting the harness broker, run `./harness/sweep.
 See [FOLLOWUP.md](FOLLOWUP.md) for the 400/500/600 repeat and the backlog-sensitive throttle-query diagnosis.
 
 See [SCAN-FIX.md](SCAN-FIX.md) for the implemented no-rules fast path and the 400/600/800 validation results.
+
+### Isolated latency/throughput benchmark
+
+`./harness/benchmark.ps1` runs a variable-isolated benchmark that improves on the exploratory
+baseline. It builds both images once, then runs three scenario sets, each repetition from a
+**clean database** (a fresh unique `ANVILMQ_HARNESS_DB_FILE` plus a broker container recreate —
+no image rebuild), pinning and recording the environment (`docker info`, image list, durability):
+
+- **Set A — isolate arrival rate:** fixed producers/workers, sweep `-Rates`. Establishes the
+  **max sustainable completion throughput** — the highest rate whose backlog stays bounded and
+  whose completion keeps up — bracketed above by the first overloaded rate.
+- **Set B — isolate worker concurrency:** fixed `-FixedRate` and producer count, sweep
+  `-WorkerCounts`.
+- **Set D — durability comparison:** NORMAL vs FULL at one operating point.
+
+Each run reuses the `load` driver (separate warmup, per-second backlog timeline, enqueue and
+end-to-end p50/p95/p99, completion throughput during window and including drain) and adds a
+**bounded-backlog `sustained` verdict**: the backlog regression slope over the measurement window
+is within `LOAD_BACKLOG_SLOPE_MAX` (default 2 jobs/s) and during-window completion is at least
+`LOAD_KEEPUP_FRACTION` (default 0.98) of the enqueue rate, with correctness passing. Overloaded,
+non-sustained points are expected data, not orchestration errors, so the sweep records them and
+continues. `harness/summarize.ts` aggregates the repetitions into median plus min/max spread,
+computes the max-sustainable bracket, and judges reproducibility on completion throughput (spread
+over 1.5x is flagged non-reproducible); end-to-end p99 tail spread is reported separately, since it
+jitters run-to-run on a shared host even when throughput is stable. Reports land in
+`harness/artifacts/bench-<timestamp>-<id>/` with `summary.json` and `summary.md`.
+
+```powershell
+# Full matrix (three repetitions per point):
+./harness/benchmark.ps1
+# Run one set at a time into a shared directory (e.g. inspect Set A, then choose Set B's rate):
+./harness/benchmark.ps1 -Sets A,summary -Rates 200,250,300,350,400 -OutDir harness/artifacts/bench-run
+./harness/benchmark.ps1 -Sets B,D,summary -FixedRate 250 -OutDir harness/artifacts/bench-run -SkipBuild
+```
+
+Measured results and methodology are in [BENCHMARKS.md](BENCHMARKS.md). Distinct host ports
+(`-GrpcPort`/`-HttpPort`, default 50072/9099) let this run alongside the smoke harness; the runner
+still reaches the broker over the Compose network. These are local exploratory measurements on
+shared Docker Desktop resources, not production SLOs.

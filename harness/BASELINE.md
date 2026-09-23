@@ -1,5 +1,11 @@
 # Initial local performance baseline — 2026-09-16
 
+> **Superseded for capacity questions.** This is the original exploratory baseline. A rigorous,
+> variable-isolated follow-up — clean database per scenario, separate concurrency and arrival-rate
+> sweeps, a defined bounded-backlog criterion for maximum sustainable completion throughput, and
+> repeated runs with reported spread — is in [BENCHMARKS.md](BENCHMARKS.md). This document is
+> retained as the historical record.
+
 Both scenarios passed: every acknowledged job completed, with zero producer/worker errors and zero duplicate deliveries. The unlimited single-worker run accumulated a substantial backlog; the controlled 200 jobs/s run kept up.
 
 | Measurement | Unlimited, 1 producer / 1 worker | 200 jobs/s ceiling, 4 producers / 4 workers |

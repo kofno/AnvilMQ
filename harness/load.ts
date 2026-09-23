@@ -9,13 +9,31 @@ function number(name: string, fallback: number, min: number, max: number) {
   if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer in [${min}, ${max}]`);
   return value;
 }
+function float(name: string, fallback: number, min: number, max: number) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} must be a number in [${min}, ${max}]`);
+  return value;
+}
 const config = {
   producers: number("LOAD_PRODUCERS", 4, 1, 128), workers: number("LOAD_WORKERS", 4, 1, 128),
   durationSeconds: number("LOAD_DURATION_SECONDS", 15, 1, 300), warmupSeconds: number("LOAD_WARMUP_SECONDS", 3, 0, 60),
   payloadBytes: number("LOAD_PAYLOAD_BYTES", 1024, 0, 1000000), workMs: number("LOAD_WORK_MS", 0, 0, 30000),
   targetRate: number("LOAD_RATE", 0, 0, 100000), pollMs: number("LOAD_POLL_MS", 10, 1, 1000),
   drainSeconds: number("LOAD_DRAIN_SECONDS", 60, 1, 600),
+  // Bounded-backlog verdict thresholds. A scenario is "sustained" only when backlog is not
+  // accumulating (measurement-window regression slope at or below the max) and completion keeps
+  // up with arrival (during-window completion at or above the keep-up fraction of enqueue rate).
+  backlogSlopeMaxJobsPerSec: float("LOAD_BACKLOG_SLOPE_MAX", 2, 0, 100000),
+  completionKeepUpFraction: float("LOAD_KEEPUP_FRACTION", 0.98, 0, 1),
 };
+function regressionSlope(points: { x: number; y: number }[]) {
+  const n = points.length;
+  if (n < 2) return 0;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const p of points) { sx += p.x; sy += p.y; sxx += p.x * p.x; sxy += p.x * p.y; }
+  const denominator = n * sxx - sx * sx;
+  return denominator === 0 ? 0 : (n * sxy - sx * sy) / denominator;
+}
 const address = process.env.ANVILMQ_ADDR ?? "127.0.0.1:50061";
 const http = process.env.ANVILMQ_HTTP_URL ?? "http://127.0.0.1:9091";
 const results = process.env.ANVILMQ_RESULTS_DIR ?? "harness/artifacts";
@@ -88,11 +106,23 @@ async function phase(seconds: number, name: string) {
     clearInterval(sampler); sample();
   }
   const elapsedSeconds = (performance.now() - begin) / 1000;
+  const windowSamples = timeline.filter(t => t.elapsedSeconds <= seconds).map(t => ({ x: t.elapsedSeconds, y: t.backlog }));
+  const backlogSlopePerSecond = regressionSlope(windowSamples);
+  const finalWindowBacklog = windowSamples.length ? windowSamples[windowSamples.length - 1].y : 0;
+  const enqueuePerSecond = acknowledged / seconds;
+  const completionsPerSecondDuringWindow = duringWindow / seconds;
+  const completionDeficitPerSecond = enqueuePerSecond - completionsPerSecondDuringWindow;
+  const correctnessPassed = !drainTimedOut && !producerErrors && !workerErrors && !duplicates && completed === acknowledged;
+  const boundedBacklog = backlogSlopePerSecond <= config.backlogSlopeMaxJobsPerSec;
+  const keepingUp = completionsPerSecondDuringWindow >= config.completionKeepUpFraction * enqueuePerSecond;
+  const sustained = boundedBacklog && keepingUp && correctnessPassed;
   return {
-    passed: !drainTimedOut && !producerErrors && !workerErrors && !duplicates && completed === acknowledged,
+    passed: correctnessPassed,
+    sustained, boundedBacklog, keepingUp, backlogSlopePerSecond, finalWindowBacklog, completionDeficitPerSecond,
+    sustainedThresholds: { backlogSlopeMaxJobsPerSec: config.backlogSlopeMaxJobsPerSec, completionKeepUpFraction: config.completionKeepUpFraction },
     timeline, submitted, acknowledged, completed, completedDuringWindow: duringWindow, producerErrors, workerErrors, duplicates, drainTimedOut, errorExamples: examples,
     measurementSeconds: seconds, elapsedIncludingDrainSeconds: elapsedSeconds, drainSeconds: Math.max(0, elapsedSeconds - seconds),
-    enqueuePerSecond: acknowledged / seconds, completionsPerSecondDuringWindow: duringWindow / seconds, completionsPerSecondIncludingDrain: completed / elapsedSeconds,
+    enqueuePerSecond, completionsPerSecondDuringWindow, completionsPerSecondIncludingDrain: completed / elapsedSeconds,
     latencyMs: { enqueueRpc: enqueue.report(), submissionToHandler: startLatency.report(), submissionToCompletionAck: completion.report() },
   };
 }
@@ -110,7 +140,7 @@ try {
   const report = { runId, timestamp: new Date().toISOString(), config, environment: { bun: Bun.version, platform: process.platform, arch: process.arch, visibleCpuCount: cpus().length, visibleMemoryBytes: totalmem() }, ...result };
   const f = (n: number | null) => n === null ? "n/a" : n.toFixed(2);
   const rows = Object.entries(result.latencyMs).map(([name, v]) => `| ${name} | ${f(v.p50)} | ${f(v.p95)} | ${f(v.p99)} | ${f(v.max)} |`).join("\n");
-  const markdown = `# AnvilMQ load report\n\nRun: ${runId}\n\nResult: ${result.passed ? "PASS" : "FAIL"}\n\n${config.producers} producers, ${config.workers} workers, ${config.durationSeconds}s measured, ${config.warmupSeconds}s warmup, ${config.payloadBytes} padding bytes, ${config.workMs}ms handler delay; target ${config.targetRate || "unlimited"} jobs/s.\n\n- Enqueue: ${f(result.enqueuePerSecond)} jobs/s\n- Completion during window: ${f(result.completionsPerSecondDuringWindow)} jobs/s\n- Completion including drain: ${f(result.completionsPerSecondIncludingDrain)} jobs/s\n- Acknowledged/completed: ${result.acknowledged}/${result.completed}\n- Producer/worker errors: ${result.producerErrors}/${result.workerErrors}\n- Duplicate deliveries: ${result.duplicates}; drain timeout: ${result.drainTimedOut}\n- Drain/shutdown: ${f(result.drainSeconds)}s\n\n| Client latency (ms) | p50 | p95 | p99 | max |\n| --- | ---: | ---: | ---: | ---: |\n${rows}\n\nThese are client-observed timings, including container networking and JS scheduling. Submission-to-handler includes enqueue and queue wait; completion includes handler work and the completion RPC. Padding excludes JSON metadata/envelope bytes. Closed-loop producers have at most one outstanding enqueue each; target rate is a ceiling, not guaranteed offered load. No fault injection. Successful RPC samples only. Reservoir sampling begins after 200,000 observations per distribution. Compare only runs with matching durability, logging, host resources, and database history size.\n`;
+  const markdown = `# AnvilMQ load report\n\nRun: ${runId}\n\nResult: ${result.passed ? "PASS" : "FAIL"}\n\n${config.producers} producers, ${config.workers} workers, ${config.durationSeconds}s measured, ${config.warmupSeconds}s warmup, ${config.payloadBytes} padding bytes, ${config.workMs}ms handler delay; target ${config.targetRate || "unlimited"} jobs/s.\n\n- Enqueue: ${f(result.enqueuePerSecond)} jobs/s\n- Completion during window: ${f(result.completionsPerSecondDuringWindow)} jobs/s\n- Completion including drain: ${f(result.completionsPerSecondIncludingDrain)} jobs/s\n- Sustained (bounded backlog): ${result.sustained} — backlog slope ${f(result.backlogSlopePerSecond)} jobs/s (max ${f(result.sustainedThresholds.backlogSlopeMaxJobsPerSec)}), completion deficit ${f(result.completionDeficitPerSecond)} jobs/s, final-window backlog ${result.finalWindowBacklog}\n- Acknowledged/completed: ${result.acknowledged}/${result.completed}\n- Producer/worker errors: ${result.producerErrors}/${result.workerErrors}\n- Duplicate deliveries: ${result.duplicates}; drain timeout: ${result.drainTimedOut}\n- Drain/shutdown: ${f(result.drainSeconds)}s\n\n| Client latency (ms) | p50 | p95 | p99 | max |\n| --- | ---: | ---: | ---: | ---: |\n${rows}\n\nThese are client-observed timings, including container networking and JS scheduling. Submission-to-handler includes enqueue and queue wait; completion includes handler work and the completion RPC. Padding excludes JSON metadata/envelope bytes. Closed-loop producers have at most one outstanding enqueue each; target rate is a ceiling, not guaranteed offered load. "Sustained" means backlog stayed bounded (measurement-window regression slope within threshold) and completion kept up with arrival; it is not a production capacity guarantee. No fault injection. Successful RPC samples only. Reservoir sampling begins after 200,000 observations per distribution. Compare only runs with matching durability, logging, host resources, and database history size.\n`;
   for (const prefix of [runId, "latest"]) {
     await writeFile(join(results, `${prefix}.json`), JSON.stringify(report, null, 2));
     await writeFile(join(results, `${prefix}.md`), markdown);
