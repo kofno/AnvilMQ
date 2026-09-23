@@ -158,6 +158,113 @@
   }
   .muted { color: var(--muted); }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
+
+  /* Single-job detail overlay (drill-down from a result row's id). */
+  .detail-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(4, 6, 10, 0.62);
+    z-index: 50;
+    padding: 32px 16px;
+    overflow-y: auto;
+  }
+  .detail-backdrop.on { display: flex; align-items: flex-start; justify-content: center; }
+  .detail-panel {
+    width: 100%;
+    max-width: 720px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+    max-height: calc(100vh - 64px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .detail-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+  }
+  .detail-head h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+    word-break: break-all;
+  }
+  .detail-head h2 .mono { font-size: 12px; color: var(--muted); }
+  .detail-body { padding: 16px; overflow-y: auto; }
+  .detail-error {
+    padding: 10px 12px;
+    border-radius: 6px;
+    border: 1px solid #6b2f2c;
+    background: #2a1917;
+    color: var(--danger);
+    margin-bottom: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .detail-error.none { border-color: var(--border); background: var(--panel-2); color: var(--muted); }
+  .detail-error .lbl {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px 18px;
+    margin-bottom: 14px;
+  }
+  .detail-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .detail-field .lbl {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--muted);
+  }
+  .detail-field .val { word-break: break-word; }
+  .detail-field .val.mono { font-size: 12px; }
+  .payload-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 4px 0 6px;
+  }
+  .payload-head .lbl {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--muted);
+  }
+  .payload-note { font-size: 11px; color: var(--muted); }
+  pre.payload {
+    margin: 0;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    max-height: 320px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    white-space: pre;
+    color: var(--text);
+  }
+  .detail-loading { padding: 24px; text-align: center; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -242,6 +349,16 @@
   </div>
 </main>
 
+<div class="detail-backdrop" id="detailBackdrop" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+  <div class="detail-panel">
+    <div class="detail-head">
+      <h2 id="detailTitle">Job detail <span class="mono" id="detailId"></span></h2>
+      <button type="button" class="secondary" id="detailClose">Close</button>
+    </div>
+    <div class="detail-body" id="detailBody"></div>
+  </div>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -261,7 +378,11 @@
     notice: document.getElementById("notice"),
     lineageBanner: document.getElementById("lineageBanner"),
     lineageTrace: document.getElementById("lineageTrace"),
-    clearLineage: document.getElementById("clearLineage")
+    clearLineage: document.getElementById("clearLineage"),
+    detailBackdrop: document.getElementById("detailBackdrop"),
+    detailId: document.getElementById("detailId"),
+    detailBody: document.getElementById("detailBody"),
+    detailClose: document.getElementById("detailClose")
   };
 
   var lineageMode = false;
@@ -351,6 +472,26 @@
     return td;
   }
 
+  // Create a clickable id cell that opens the full single-job detail drill-down.
+  function idCell(id) {
+    var td = document.createElement("td");
+    td.className = "mono";
+    if (id === null || id === undefined || id === "") {
+      var dash = document.createElement("span");
+      dash.className = "muted";
+      dash.textContent = "\u2014";
+      td.appendChild(dash);
+      return td;
+    }
+    var link = document.createElement("span");
+    link.className = "link";
+    link.textContent = String(id);
+    link.title = "Show job detail";
+    link.addEventListener("click", function () { openDetail(id); });
+    td.appendChild(link);
+    return td;
+  }
+
   function textCell(value, className) {
     var td = document.createElement("td");
     if (className) { td.className = className; }
@@ -398,7 +539,7 @@
       tr.appendChild(textCell(humanize(row.finished_at)));
       tr.appendChild(textCell(row.last_error, "err"));
       tr.appendChild(traceCell(row.trace_id));
-      tr.appendChild(textCell(row.id, "mono"));
+      tr.appendChild(idCell(row.id));
       els.rows.appendChild(tr);
     }
   }
@@ -482,6 +623,217 @@
     runSearch(buildQuery());
   }
 
+  // ---- Single-job detail drill-down (GET /v1/jobs/{id}) ----
+
+  var detailOpen = false;
+  var currentDetailId = null;
+
+  function clearNode(node) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+  }
+
+  // Reflect the open job in the URL hash so a refresh or shared link reopens it. We use
+  // replaceState (no hashchange event) so this self-update never re-triggers openDetail.
+  function setHash(id) {
+    var target = "#job/" + encodeURIComponent(id);
+    if (location.hash !== target) {
+      history.replaceState(null, "", location.pathname + location.search + target);
+    }
+  }
+
+  function clearHash() {
+    if ((location.hash || "").indexOf("#job/") === 0) {
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  }
+
+  function jobFromHash() {
+    var h = location.hash || "";
+    if (h.indexOf("#job/") !== 0) { return null; }
+    var raw = h.slice(5);
+    if (!raw) { return null; }
+    try { return decodeURIComponent(raw); } catch (e) { return raw; }
+  }
+
+  function showLoadingDetail() {
+    clearNode(els.detailBody);
+    var d = document.createElement("div");
+    d.className = "detail-loading";
+    d.textContent = "Loading\u2026";
+    els.detailBody.appendChild(d);
+  }
+
+  function showDetailMessage(kind, text) {
+    clearNode(els.detailBody);
+    var span = document.createElement("span");
+    span.className = "notice " + kind;
+    span.textContent = text;
+    els.detailBody.appendChild(span);
+  }
+
+  // A single labelled value; null/blank values render as a muted em dash (never "null").
+  function detailField(grid, label, value, mono) {
+    var field = document.createElement("div");
+    field.className = "detail-field";
+    var lbl = document.createElement("span");
+    lbl.className = "lbl";
+    lbl.textContent = label;
+    field.appendChild(lbl);
+    var val = document.createElement("span");
+    if (value === null || value === undefined || value === "") {
+      val.className = "val muted";
+      val.textContent = "\u2014";
+    } else {
+      val.className = mono ? "val mono" : "val";
+      val.textContent = String(value);
+    }
+    field.appendChild(val);
+    grid.appendChild(field);
+  }
+
+  // Epoch-millis field humanized like the table; missing values fall through to the em dash.
+  function detailTimeField(grid, label, raw) {
+    var ok = typeof raw === "number" && isFinite(raw) && raw > 0;
+    detailField(grid, label, ok ? humanize(raw) : null, false);
+  }
+
+  function attemptsText(d) {
+    var a = typeof d.attempts === "number" ? String(d.attempts) : "\u2014";
+    var m = typeof d.max_attempts === "number" ? String(d.max_attempts) : "\u2014";
+    return a + " / " + m;
+  }
+
+  function payloadText(d) {
+    if (d.payload === null || d.payload === undefined) { return "\u2014"; }
+    if (d.payload_encoding === "base64") { return String(d.payload); }
+    try { return JSON.stringify(d.payload, null, 2); } catch (e) { return String(d.payload); }
+  }
+
+  function renderDetail(d) {
+    var body = els.detailBody;
+    clearNode(body);
+
+    // Prominent, full-width last_error near the top: the primary failure-triage signal.
+    var err = document.createElement("div");
+    if (d.last_error === null || d.last_error === undefined || d.last_error === "") {
+      err.className = "detail-error none";
+      err.textContent = "No error recorded.";
+    } else {
+      err.className = "detail-error";
+      var elbl = document.createElement("span");
+      elbl.className = "lbl";
+      elbl.textContent = "Last error";
+      err.appendChild(elbl);
+      var etext = document.createElement("span");
+      etext.textContent = String(d.last_error);
+      err.appendChild(etext);
+    }
+    body.appendChild(err);
+
+    var grid = document.createElement("div");
+    grid.className = "detail-grid";
+    detailField(grid, "Name", d.name, false);
+    detailField(grid, "State", d.state, false);
+    detailField(grid, "Source", d.source, false);
+    detailField(grid, "Priority", d.priority, false);
+    detailField(grid, "Attempts", attemptsText(d), false);
+    detailField(grid, "Execution depth", d.execution_depth, false);
+    detailTimeField(grid, "Created", d.created_at);
+    detailTimeField(grid, "Finished", d.finished_at);
+    detailField(grid, "Trace ID", d.trace_id, true);
+    detailField(grid, "Parent ID", d.parent_id, true);
+    detailField(grid, "Rate limit facet", d.rate_limit_facet, false);
+    detailField(grid, "Worker ID", d.worker_id, true);
+    detailTimeField(grid, "Lease expires", d.lease_expires_at_ms);
+    detailTimeField(grid, "Available at", d.available_at);
+    body.appendChild(grid);
+
+    var phead = document.createElement("div");
+    phead.className = "payload-head";
+    var plbl = document.createElement("span");
+    plbl.className = "lbl";
+    plbl.textContent = "Payload";
+    phead.appendChild(plbl);
+    if (d.payload_encoding === "base64") {
+      var note = document.createElement("span");
+      note.className = "payload-note";
+      note.textContent = "base64-encoded binary";
+      phead.appendChild(note);
+    }
+    body.appendChild(phead);
+
+    var pre = document.createElement("pre");
+    pre.className = "payload";
+    pre.textContent = payloadText(d);
+    body.appendChild(pre);
+  }
+
+  // Fetch and render one job's full record. Guards against blank/missing ids and against a
+  // late response arriving after the panel was closed or navigated to another job.
+  function openDetail(id) {
+    if (id === null || id === undefined || String(id) === "") { return; }
+    id = String(id);
+    currentDetailId = id;
+    detailOpen = true;
+    els.detailId.textContent = id;
+    els.detailBackdrop.classList.add("on");
+    setHash(id);
+    showLoadingDetail();
+
+    fetch("/v1/jobs/" + encodeURIComponent(id), { headers: { "Accept": "application/json" } })
+      .then(function (res) {
+        if (!detailOpen || currentDetailId !== id) { return; }
+        if (res.status === 200) {
+          return res.json().then(function (data) {
+            if (detailOpen && currentDetailId === id) { renderDetail(data); }
+          });
+        }
+        if (res.status === 400) { showDetailMessage("error", "Invalid job id."); return; }
+        if (res.status === 404) {
+          showDetailMessage("info", "No job found for this id. It may have aged out of retention.");
+          return;
+        }
+        if (res.status === 503) {
+          showDetailMessage("warn", "Reader busy, try again in a moment.");
+          return;
+        }
+        showDetailMessage("error", "Failed to load job detail (HTTP " + res.status + ").");
+      })
+      .catch(function () {
+        if (detailOpen && currentDetailId === id) {
+          showDetailMessage("error", "Network error contacting the broker. Try again.");
+        }
+      });
+  }
+
+  function closeDetail() {
+    if (!detailOpen) { return; }
+    detailOpen = false;
+    currentDetailId = null;
+    els.detailBackdrop.classList.remove("on");
+    els.detailId.textContent = "";
+    clearNode(els.detailBody);
+    clearHash();
+  }
+
+  function onHashChange() {
+    var id = jobFromHash();
+    if (id) {
+      if (!detailOpen || currentDetailId !== id) { openDetail(id); }
+    } else if (detailOpen) {
+      closeDetail();
+    }
+  }
+
+  els.detailClose.addEventListener("click", closeDetail);
+  els.detailBackdrop.addEventListener("click", function (e) {
+    if (e.target === els.detailBackdrop) { closeDetail(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (detailOpen && (e.key === "Escape" || e.keyCode === 27)) { closeDetail(); }
+  });
+  window.addEventListener("hashchange", onHashChange);
+
   els.form.addEventListener("submit", function (e) {
     e.preventDefault();
     lineageMode = false;
@@ -508,6 +860,9 @@
 
   // Initial state: guide the operator to add a filter.
   setNotice("info", "Add at least one filter (search text, name, state, trace, or time window) to run a query.");
+
+  // Reopen a deep-linked job detail (#job/<id>) on load.
+  onHashChange();
 })();
 </script>
 </body>

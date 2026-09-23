@@ -142,9 +142,10 @@ By default `q` is the escaped-LIKE substring scan described above. Setting `ANVI
 ## Console
 
 `GET /console` serves a built-in, read-only search console: a single HTML page that drives the
-`/v1/search` API from the browser. It is served same-origin off the broker's existing HTTP server,
-so no CORS is involved, and the JSON API remains the source of truth — the console is purely a
-consumer of the public `/v1/search` endpoint and adds no private or side-channel API.
+`/v1/search` and `/v1/jobs/{id}` APIs from the browser. It is served same-origin off the broker's
+existing HTTP server, so no CORS is involved, and the JSON API remains the source of truth — the
+console is purely a consumer of the public `/v1/search` and `/v1/jobs/{id}` endpoints and adds no
+private or side-channel API.
 
 The page is fully self-contained: its inline CSS and vanilla JavaScript are embedded in the binary
 (`include_str!`) with no build step and no external CDN or network dependency, so it works
@@ -161,6 +162,15 @@ Features:
 - **Lineage drill-down**: clicking a `trace_id` pins it as the filter, clears the free-text query,
   re-runs the search, and re-sorts the chain by `execution_depth` ascending so the fan-out lineage
   reads top-down. A "clear lineage / back to search" control returns to normal search.
+- **Job-detail click-through**: clicking a row's `id` opens the full single-job record inline in a
+  modal overlay, fetched same-origin from `GET /v1/jobs/{id}`. It renders every field the endpoint
+  returns (state, source, priority, attempts/max, timestamps, ancestry, worker/lease info, and the
+  payload) with a failed job's `last_error` surfaced prominently at the top for one-click triage.
+  The payload is pretty-printed when JSON and shown verbatim (noted as base64-encoded binary) when
+  the bytes are not UTF-8 JSON. The overlay shows a loading state, maps non-200s to clear in-panel
+  messages (400 invalid id, 404 unknown / aged-out, 503 reader busy), and closes via a Close button,
+  the ESC key, or a backdrop click. The open job is reflected in the URL hash (`#job/<id>`) so a
+  refresh or shared link reopens it; the trace-id lineage drill-down remains a separate action.
 - Graceful response handling: HTTP 400 shows an "add at least one filter" hint (not an error), 503
   shows a "reader busy, try again" notice, and other non-200 responses show a generic error.
 
