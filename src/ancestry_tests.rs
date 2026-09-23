@@ -269,3 +269,92 @@ async fn multi_level_derivation_increments_and_shares_trace() {
         parent = child;
     }
 }
+
+async fn read_rejections(
+    service: &MyQueueService,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.blocking_lock();
+        let mut stmt = conn
+            .prepare("SELECT kind, name, trace_id, parent_id FROM enqueue_rejections ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+async fn count_jobs(service: &MyQueueService) -> i64 {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.blocking_lock();
+        conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn circuit_breaker_rejection_is_durably_recorded_with_lineage() {
+    let service = service_with(":memory:", 0).await;
+    // Build a lineage up to the max allowed depth (10), each hop deriving parent_depth + 1.
+    let mut root = job("chain");
+    root.metadata = meta("", "", 0);
+    let mut parent = add(&service, root).await.unwrap();
+    for _ in 0..service.max_execution_depth {
+        let mut child = job("chain");
+        child.metadata = meta(&parent.id, "", 0);
+        parent = add(&service, child).await.unwrap();
+    }
+    let jobs_before = count_jobs(&service).await;
+
+    // The next child derives depth 11 (> 10) and trips the circuit breaker at admission.
+    let mut over = job("chain");
+    over.metadata = meta(&parent.id, "", 0);
+    let err = add(&service, over).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    assert!(err.message().contains("Circuit breaker tripped"));
+
+    // The rejected child persisted no job row (the admission tx rolled back)...
+    assert_eq!(count_jobs(&service).await, jobs_before);
+    // ...but the rejection is durably captured exactly once, with full lineage.
+    let rows = read_rejections(&service).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "circuit_breaker");
+    assert_eq!(rows[0].1, "chain");
+    assert!(rows[0].2.is_some(), "trace_id recorded");
+    assert_eq!(rows[0].3.as_deref(), Some(parent.id.as_str()));
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_enqueue_rejections_total{kind=\"circuit_breaker\"} 1\n"));
+}
+
+#[tokio::test]
+async fn missing_parent_rejection_is_durably_recorded() {
+    let service = service_with(":memory:", 0).await;
+    let mut child = job("emails");
+    child.metadata = meta("does-not-exist", "", 0);
+    let err = add(&service, child).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    assert_eq!(count_jobs(&service).await, 0);
+    let rows = read_rejections(&service).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "parent_not_found");
+    assert_eq!(rows[0].1, "emails");
+    assert_eq!(rows[0].3.as_deref(), Some("does-not-exist"));
+}

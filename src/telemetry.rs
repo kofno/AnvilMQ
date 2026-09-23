@@ -47,6 +47,14 @@ const DURATION_BOUNDS_MS: [i64; 10] = [1, 10, 100, 500, 1000, 5000, 15000, 60000
 // Retention sweeper deletion counters. Bounded cardinality: 3 targets x 3 reasons.
 const RETENTION_TARGETS: [&str; 3] = ["completed", "failed", "receipt"];
 const RETENTION_REASONS: [&str; 3] = ["age", "count", "orphan"];
+/// Admission-time enqueue rejection kinds, in the order of the kind-labeled counter array.
+pub const REJECTION_KINDS: [&str; 5] = [
+    "ingress_velocity",
+    "parent_not_found",
+    "inconsistent_depth",
+    "circuit_breaker",
+    "chain_quarantine",
+];
 
 fn escape_label(value: &str) -> String {
     value
@@ -312,6 +320,8 @@ pub struct Metrics {
     chain_counters_pruned: AtomicU64,
     facet_dispatch_pruned: AtomicU64,
     ingress_rejections: AtomicU64,
+    enqueue_rejections_by_kind: [AtomicU64; 5],
+    rejections_pruned: AtomicU64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -418,10 +428,22 @@ impl Metrics {
             self.facet_dispatch_pruned.fetch_add(n, Relaxed);
         }
     }
+    /// Aged-out forensic enqueue-rejection rows reclaimed by the retention sweeper.
+    pub fn rejections_pruned(&self, n: u64) {
+        if n > 0 {
+            self.rejections_pruned.fetch_add(n, Relaxed);
+        }
+    }
     /// Enqueue rejected because the facet's sliding-window ingress velocity exceeded its
     /// configured admission limit (or the facet is paused with `max_jobs == 0`).
     pub fn ingress_rejection(&self) {
         self.ingress_rejections.fetch_add(1, Relaxed);
+    }
+    /// Records one durably-persisted admission-time enqueue rejection, labeled by kind.
+    pub fn rejection_recorded(&self, kind: &str) {
+        if let Some(i) = REJECTION_KINDS.iter().position(|k| *k == kind) {
+            self.enqueue_rejections_by_kind[i].fetch_add(1, Relaxed);
+        }
     }
     pub fn render(&self) -> String {
         let mut out = String::from("# HELP anvilmq_jobs Persisted jobs by state including retained history.\n# TYPE anvilmq_jobs gauge\n");
@@ -474,6 +496,14 @@ impl Metrics {
         out += &format!("# HELP anvilmq_ancestry_rejections_total Enqueues rejected for missing parent or inconsistent execution depth.\n# TYPE anvilmq_ancestry_rejections_total counter\nanvilmq_ancestry_rejections_total {}\n# HELP anvilmq_chain_quarantines_total Enqueues rejected because their lineage exceeded the runaway-chain cap.\n# TYPE anvilmq_chain_quarantines_total counter\nanvilmq_chain_quarantines_total {}\n# HELP anvilmq_chain_counters_pruned_total Idle per-lineage counter rows reclaimed by the retention sweeper.\n# TYPE anvilmq_chain_counters_pruned_total counter\nanvilmq_chain_counters_pruned_total {}\n", self.ancestry_rejections.load(Relaxed), self.chain_quarantines.load(Relaxed), self.chain_counters_pruned.load(Relaxed));
         out += &format!("# HELP anvilmq_ingress_rejected_total Enqueues rejected by the sliding-window ingress velocity control.\n# TYPE anvilmq_ingress_rejected_total counter\nanvilmq_ingress_rejected_total {}\n", self.ingress_rejections.load(Relaxed));
         out += &format!("# HELP anvilmq_facet_dispatch_pruned_total Idle per-facet fairness rotation rows reclaimed by the retention sweeper.\n# TYPE anvilmq_facet_dispatch_pruned_total counter\nanvilmq_facet_dispatch_pruned_total {}\n", self.facet_dispatch_pruned.load(Relaxed));
+        out += "# HELP anvilmq_enqueue_rejections_total Admission-time enqueue rejections by kind.\n# TYPE anvilmq_enqueue_rejections_total counter\n";
+        for (i, kind) in REJECTION_KINDS.iter().enumerate() {
+            out += &format!(
+                "anvilmq_enqueue_rejections_total{{kind=\"{kind}\"}} {}\n",
+                self.enqueue_rejections_by_kind[i].load(Relaxed)
+            );
+        }
+        out += &format!("# HELP anvilmq_rejections_pruned_total Aged-out forensic enqueue-rejection rows reclaimed by the retention sweeper.\n# TYPE anvilmq_rejections_pruned_total counter\nanvilmq_rejections_pruned_total {}\n", self.rejections_pruned.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out
@@ -518,6 +548,7 @@ pub fn router(db: Arc<DatabaseManager>, reader: Arc<Reader>, fts_enabled: bool) 
         .route("/readyz", get(ready))
         .route("/console", get(console))
         .route("/v1/failures", get(failures))
+        .route("/v1/rejections", get(rejections))
         .route("/v1/search", get(search))
         .route("/v1/jobs/:id", get(job_detail))
         .with_state(AppState {
@@ -655,7 +686,107 @@ async fn failures(
     Ok(Json(rows))
 }
 
-/// Default and hard-capped page size for the search API.
+/// Query parameters for `GET /v1/rejections`.
+#[derive(Deserialize)]
+pub struct RejectionsParams {
+    /// Optional exact rejection-kind filter (e.g. `circuit_breaker`).
+    kind: Option<String>,
+    /// Optional exact job-name filter.
+    name: Option<String>,
+    /// Optional exact lineage (`trace_id`) filter.
+    trace_id: Option<String>,
+    /// Optional lower bound on `rejected_at` (inclusive); only rows rejected at or after this.
+    since_ms: Option<i64>,
+    /// Page size; defaults to 100 and is hard-capped at 1000.
+    limit: Option<usize>,
+}
+
+/// One durably-recorded admission-time enqueue rejection.
+#[derive(Serialize)]
+pub struct RejectionRow {
+    id: i64,
+    rejected_at: i64,
+    kind: String,
+    name: String,
+    trace_id: Option<String>,
+    parent_id: Option<String>,
+    execution_depth: Option<i64>,
+    rate_limit_facet: Option<String>,
+    detail: String,
+}
+
+/// Recent admission-time enqueue rejections feed, served read-only off the WAL replica connection.
+///
+/// Enqueue rejections (ingress velocity, ancestry, circuit-breaker, chain-quarantine) never
+/// persist a job row, so before this feed the only record was an aggregate counter plus a
+/// transient log line. `enqueue_rejections` captures each refusal durably for post-hoc forensics;
+/// this endpoint exposes that record-level drill-down. The read runs on the isolated `Reader`, so
+/// it never contends on the single-writer mutex.
+async fn rejections(
+    State(app): State<AppState>,
+    Query(params): Query<RejectionsParams>,
+) -> Result<Json<Vec<RejectionRow>>, StatusCode> {
+    let limit = params
+        .limit
+        .unwrap_or(FAILURES_DEFAULT_LIMIT)
+        .min(FAILURES_MAX_LIMIT) as i64;
+    let kind = params.kind;
+    let name = params.name;
+    let trace_id = params.trace_id;
+    let since_ms = params.since_ms;
+    let rows = app
+        .reader
+        .query(move |conn| {
+            // Fully parameterized; user input never interpolated into SQL. Backed by
+            // idx_rejections_name_rejected / idx_rejections_rejected_at.
+            let mut sql = String::from(
+                "SELECT id, rejected_at, kind, name, trace_id, parent_id, execution_depth, rate_limit_facet, detail \
+                 FROM enqueue_rejections WHERE 1=1",
+            );
+            let mut args: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(kind) = kind {
+                sql.push_str(" AND kind = ?");
+                args.push(rusqlite::types::Value::Text(kind));
+            }
+            if let Some(name) = name {
+                sql.push_str(" AND name = ?");
+                args.push(rusqlite::types::Value::Text(name));
+            }
+            if let Some(trace_id) = trace_id {
+                sql.push_str(" AND trace_id = ?");
+                args.push(rusqlite::types::Value::Text(trace_id));
+            }
+            if let Some(since) = since_ms {
+                sql.push_str(" AND rejected_at >= ?");
+                args.push(rusqlite::types::Value::Integer(since));
+            }
+            sql.push_str(" ORDER BY rejected_at DESC, id DESC LIMIT ?");
+            args.push(rusqlite::types::Value::Integer(limit));
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args), |r| {
+                Ok(RejectionRow {
+                    id: r.get(0)?,
+                    rejected_at: r.get(1)?,
+                    kind: r.get(2)?,
+                    name: r.get(3)?,
+                    trace_id: r.get(4)?,
+                    parent_id: r.get(5)?,
+                    execution_depth: r.get(6)?,
+                    rate_limit_facet: r.get(7)?,
+                    detail: r.get(8)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|error| match error {
+            ReaderError::Busy | ReaderError::Timeout | ReaderError::Unavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    Ok(Json(rows))
+}
 const SEARCH_DEFAULT_LIMIT: usize = 100;
 const SEARCH_MAX_LIMIT: usize = 1000;
 /// Escape character for LIKE patterns. User input has `\`, `%`, and `_` escaped against this so
