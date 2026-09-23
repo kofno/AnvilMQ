@@ -1,0 +1,22 @@
+{
+  "name": "@anvilmq/sim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained local AnvilMQ example with synthetic workloads, metrics, logs, dashboards, and feature demos.",
+  "scripts": {
+    "semantics": "bun src/semantics-check.ts",
+    "search": "bun src/search-demo.ts",
+    "fairness": "bun src/fairness-demo.ts",
+    "ingress": "bun src/ingress-demo.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.0",
+    "@grpc/proto-loader": "^0.8.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

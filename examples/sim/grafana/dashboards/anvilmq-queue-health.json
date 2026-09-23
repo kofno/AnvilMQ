@@ -1,0 +1,352 @@
+{
+  "uid": "anvilmq-queue-health",
+  "title": "AnvilMQ queue health",
+  "description": "Queue throughput, completed/failed jobs, failure ratio, p95 duration, waiting/active depth, and retention, using AnvilMQ metrics.",
+  "schemaVersion": 39,
+  "version": 4,
+  "editable": true,
+  "tags": ["anvilmq", "sim", "queue-health"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }
+    },
+    {
+      "id": 2,
+      "title": "Job throughput by name (completed/s)",
+      "description": "Completed jobs per second, grouped by job name.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"completed\"}[1m]))", "legendFormat": "{{name}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Enqueue rate by name (added/s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"enqueued\"}[1m]))", "legendFormat": "{{name}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Completed vs failed (all names)",
+      "description": "Completed jobs, terminal failures, and retries per second.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 9, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(anvilmq_jobs_by_name_total{event=\"completed\"}[1m]))", "legendFormat": "completed", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "B", "expr": "sum(rate(anvilmq_jobs_by_name_total{event=\"failed\"}[1m]))", "legendFormat": "failed (exhausted)", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "C", "expr": "sum(rate(anvilmq_transitions_total{event=\"retried\"}[1m]))", "legendFormat": "retried", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Failure ratio",
+      "description": "Exhausted failures / (completed + failed).",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 9, "w": 6, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.05 }, { "color": "red", "value": 0.2 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(anvilmq_jobs_by_name_total{event=\"failed\"}[5m])) / clamp_min(sum(rate(anvilmq_jobs_by_name_total{event=~\"completed|failed\"}[5m])), 0.001)", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Jobs by state",
+      "description": "Overall queue state; terminal states include retained history.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 18, "y": 9, "w": 6, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "anvilmq_jobs", "legendFormat": "{{state}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Latency & backlog",
+      "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 }
+    },
+    {
+      "id": 8,
+      "title": "p95 job duration by name",
+      "description": "p95 duration by job name. AnvilMQ duration is enqueue->terminal (includes queue wait, retries, backoff).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 18, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (name, le) (rate(anvilmq_job_duration_seconds_bucket[5m])))", "legendFormat": "{{name}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "p95 RPC latency by method",
+      "description": "Broker handler latency by RPC method.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 18, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (method, le) (rate(anvilmq_rpc_duration_seconds_bucket[5m])))", "legendFormat": "{{method}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Waiting backlog by name",
+      "description": "Waiting jobs by name. Sampled every 5s.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 26, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "anvilmq_backlog_jobs{scope=\"queue\", kind=\"waiting\"}", "legendFormat": "{{queue}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Active by name",
+      "description": "Active jobs by name. Sampled every 5s.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 8, "y": 26, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "anvilmq_backlog_jobs{scope=\"queue\", kind=\"active\"}", "legendFormat": "{{queue}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Oldest due age by name",
+      "description": "Age of the oldest due job at sample time for queue-latency/backlog-age alerting.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 16, "y": 26, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "anvilmq_oldest_due_age_seconds{scope=\"queue\"}", "legendFormat": "{{queue}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Retention (history bounding: anvilmq_retention_deleted_total)",
+      "gridPos": { "x": 0, "y": 34, "w": 24, "h": 1 }
+    },
+    {
+      "id": 14,
+      "title": "Retained history & receipts (levels)",
+      "description": "anvilmq_jobs terminal-state gauges plus retained idempotency receipts. Without retention these climb without bound; the sweeper holds them to the configured age/count window.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "anvilmq_jobs{state=\"Completed\"}", "legendFormat": "history: completed", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "B", "expr": "anvilmq_jobs{state=\"Failed\"}", "legendFormat": "history: failed", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "C", "expr": "anvilmq_enqueue_receipts", "legendFormat": "idempotency receipts", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Retention deletions/s by target & reason",
+      "description": "rate(anvilmq_retention_deleted_total). target=completed|failed|receipt, reason=age|count|orphan.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 35, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum by (target, reason) (rate(anvilmq_retention_deleted_total[1m]))", "legendFormat": "{{target}}/{{reason}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Total rows pruned",
+      "description": "Cumulative anvilmq_retention_deleted_total since broker start. anvilmq_retention_errors_total should stay 0.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 20, "y": 35, "w": 4, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        { "refId": "A", "expr": "sum(anvilmq_retention_deleted_total)", "legendFormat": "pruned", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Per-function overview (one row per job name)",
+      "gridPos": { "x": 0, "y": 43, "w": 24, "h": 1 }
+    },
+    {
+      "id": 18,
+      "title": "Per-function overview (throughput, failure rate, latency)",
+      "description": "One sortable row per job name, built from Prometheus named series (anvilmq_jobs_by_name_total, anvilmq_job_duration_seconds). Sort by failure rate to surface problem functions. Covers names registered under ANVILMQ_METRICS_MODE, bounded by the broker cap.",
+      "type": "table",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 44, "w": 24, "h": 12 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Failure rate" }, "properties": [
+            { "id": "unit", "value": "percentunit" },
+            { "id": "decimals", "value": 2 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.02 }, { "color": "red", "value": 0.05 } ] } }
+          ] },
+          { "matcher": { "id": "byName", "options": "Throughput (completed/s)" }, "properties": [ { "id": "unit", "value": "ops" }, { "id": "decimals", "value": 2 } ] },
+          { "matcher": { "id": "byName", "options": "Enqueue (added/s)" }, "properties": [ { "id": "unit", "value": "ops" }, { "id": "decimals", "value": 2 } ] },
+          { "matcher": { "id": "byName", "options": "p95 latency" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "decimals", "value": 2 } ] },
+          { "matcher": { "id": "byName", "options": "Completed (total)" }, "properties": [ { "id": "unit", "value": "short" } ] },
+          { "matcher": { "id": "byName", "options": "Failed (total)" }, "properties": [ { "id": "unit", "value": "short" }, { "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "text", "value": null }, { "color": "red", "value": 1 } ] } } ] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false },
+        "sortBy": [ { "displayName": "Failure rate", "desc": true } ]
+      },
+      "targets": [
+        { "refId": "Throughput", "format": "table", "instant": true, "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"completed\"}[1m]))", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "Enqueue", "format": "table", "instant": true, "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"enqueued\"}[1m]))", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "FailRate", "format": "table", "instant": true, "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"failed\"}[5m])) / clamp_min(sum by (name) (rate(anvilmq_jobs_by_name_total{event=~\"completed|failed\"}[5m])), 0.001)", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "P95", "format": "table", "instant": true, "expr": "histogram_quantile(0.95, sum by (name, le) (rate(anvilmq_job_duration_seconds_bucket[5m])))", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "Completed", "format": "table", "instant": true, "expr": "sum by (name) (anvilmq_jobs_by_name_total{event=\"completed\"})", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "Failed", "format": "table", "instant": true, "expr": "sum by (name) (anvilmq_jobs_by_name_total{event=\"failed\"})", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ],
+      "transformations": [
+        { "id": "joinByField", "options": { "byField": "name", "mode": "outer" } },
+        { "id": "organize", "options": {
+          "excludeByName": { "Time": true, "Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true, "Time 5": true, "Time 6": true },
+          "renameByName": {
+            "name": "Function",
+            "Value #Throughput": "Throughput (completed/s)",
+            "Value #Enqueue": "Enqueue (added/s)",
+            "Value #FailRate": "Failure rate",
+            "Value #P95": "p95 latency",
+            "Value #Completed": "Completed (total)",
+            "Value #Failed": "Failed (total)"
+          },
+          "indexByName": {
+            "name": 0,
+            "Value #Throughput": 1,
+            "Value #Enqueue": 2,
+            "Value #FailRate": 3,
+            "Value #P95": 4,
+            "Value #Completed": 5,
+            "Value #Failed": 6
+          }
+        } }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "Failed functions (recent)",
+      "gridPos": { "x": 0, "y": 56, "w": 24, "h": 1 }
+    },
+    {
+      "id": 20,
+      "title": "Recently failed functions (terminal, retries excluded)",
+      "description": "Functions with at least one terminal failure in the last 15m. Count is anvilmq_jobs_by_name_total{event=\"failed\"}, which fires only when attempts are exhausted (or a lease expires with no retry), so retries are not counted. Sorted by recent failure count. Use the recent failures dashboard for error messages or the read-only history API for job details.",
+      "type": "table",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 57, "w": 12, "h": 9 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Failures (15m)" }, "properties": [
+            { "id": "unit", "value": "short" },
+            { "id": "decimals", "value": 0 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 } ] } }
+          ] },
+          { "matcher": { "id": "byName", "options": "Failure rate" }, "properties": [
+            { "id": "unit", "value": "percentunit" },
+            { "id": "decimals", "value": 2 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.02 }, { "color": "red", "value": 0.05 } ] } }
+          ] },
+          { "matcher": { "id": "byName", "options": "Failed (total)" }, "properties": [ { "id": "unit", "value": "short" }, { "id": "decimals", "value": 0 } ] },
+          { "matcher": { "id": "byName", "options": "p95 latency" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "decimals", "value": 2 } ] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false },
+        "sortBy": [ { "displayName": "Failures (15m)", "desc": true } ]
+      },
+      "targets": [
+        { "refId": "Failures", "format": "table", "instant": true, "expr": "sum by (name) (increase(anvilmq_jobs_by_name_total{event=\"failed\"}[15m]))", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "FailRate", "format": "table", "instant": true, "expr": "sum by (name) (rate(anvilmq_jobs_by_name_total{event=\"failed\"}[5m])) / clamp_min(sum by (name) (rate(anvilmq_jobs_by_name_total{event=~\"completed|failed\"}[5m])), 0.001)", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "FailedTotal", "format": "table", "instant": true, "expr": "sum by (name) (anvilmq_jobs_by_name_total{event=\"failed\"})", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "P95", "format": "table", "instant": true, "expr": "histogram_quantile(0.95, sum by (name, le) (rate(anvilmq_job_duration_seconds_bucket[5m])))", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ],
+      "transformations": [
+        { "id": "joinByField", "options": { "byField": "name", "mode": "outer" } },
+        { "id": "organize", "options": {
+          "excludeByName": { "Time": true, "Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true },
+          "renameByName": {
+            "name": "Function",
+            "Value #Failures": "Failures (15m)",
+            "Value #FailRate": "Failure rate",
+            "Value #FailedTotal": "Failed (total)",
+            "Value #P95": "p95 latency"
+          },
+          "indexByName": {
+            "name": 0,
+            "Value #Failures": 1,
+            "Value #FailRate": 2,
+            "Value #FailedTotal": 3,
+            "Value #P95": 4
+          }
+        } },
+        { "id": "filterByValue", "options": { "type": "include", "match": "all", "filters": [ { "fieldName": "Failures (15m)", "config": { "id": "greater", "options": { "value": 0 } } } ] } }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Failures over time by function (when did they fail)",
+      "description": "sum by (name) (increase(anvilmq_jobs_by_name_total{event=\"failed\"}[1m])) filtered to failing functions. Bars show when terminal failures occurred; retries are excluded.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 57, "w": 12, "h": 9 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (increase(anvilmq_jobs_by_name_total{event=\"failed\"}[1m])) > 0", "legendFormat": "{{name}}", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    }
+  ]
+}

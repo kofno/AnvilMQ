@@ -1,0 +1,165 @@
+# Self-contained local AnvilMQ example: broker, synthetic workers, producer, and
+# observability stack. Host ports bind to loopback; data lives in disposable volumes.
+# Workers connect only to the local broker and observability stack.
+#
+#   From examples/sim: docker compose up -d --build
+#   Grafana:    http://127.0.0.1:3000  (admin / admin)
+#   Prometheus: http://127.0.0.1:9490
+#   Broker:     grpc 127.0.0.1:50071, metrics http://127.0.0.1:9092/metrics
+name: anvilmq-sim
+
+x-node-build: &node-build
+  build:
+    context: ../..
+    dockerfile: examples/sim/Dockerfile.node
+
+services:
+  broker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      ANVILMQ_ADDR: 0.0.0.0:50051
+      ANVILMQ_HTTP_ADDR: 0.0.0.0:9090
+      ANVILMQ_DB_PATH: /data/sim.db
+      ANVILMQ_DURABILITY: ${ANVILMQ_DURABILITY-NORMAL}
+      # Bounded per-name metric allowlist. Must match the job names in src/queues.ts.
+      ANVILMQ_METRICS_QUEUES: "IngestEvent,ProcessTask,ProcessSubtask,WriteRecord,Delay,Stress,Throw,RecursiveProbe"
+      # Auto-register every job name as its own per-name series (bounded by a cap) instead of only
+      # the allowlist above, so the per-function dashboard shows all names. Override to `allowlist`
+      # to fall back to the bounded ANVILMQ_METRICS_QUEUES set.
+      ANVILMQ_METRICS_MODE: ${ANVILMQ_METRICS_MODE-all}
+      # Opt-in equal round-robin tenant fairness during dequeue, keyed on rate_limit_facet.
+      # Enabled here so src/fairness-demo.ts shows round-robin rotation across tenants;
+      # set to false and recreate the broker to observe the legacy FIFO monopolization contrast.
+      ANVILMQ_FAIRNESS_ENABLED: ${ANVILMQ_FAIRNESS_ENABLED-true}
+      # Opt-in full-text search over job_history metadata (name / trace_id / last_error). Enabled
+      # here so /v1/search resolves free-text `q` via the FTS5 MATCH index instead of escaped-LIKE,
+      # which the search demo (src/search-demo.ts) exercises. Off by default in the broker.
+      ANVILMQ_FTS_ENABLED: ${ANVILMQ_FTS_ENABLED-1}
+      # Retention sweeper. Production defaults are 24h/1000 completed + 7d failed, which never
+      # fire in a short sim; these overridable values keep a rolling ~2-5 min window so the
+      # history-bounding effect is visible on the Grafana "Retention" row within minutes.
+      ANVILMQ_RETENTION_COMPLETED_AGE_MS: ${ANVILMQ_RETENTION_COMPLETED_AGE_MS-120000}
+      ANVILMQ_RETENTION_COMPLETED_COUNT: ${ANVILMQ_RETENTION_COMPLETED_COUNT-0}
+      ANVILMQ_RETENTION_FAILED_AGE_MS: ${ANVILMQ_RETENTION_FAILED_AGE_MS-300000}
+      ANVILMQ_RETENTION_FAILED_COUNT: ${ANVILMQ_RETENTION_FAILED_COUNT-0}
+      ANVILMQ_RETENTION_INTERVAL_MS: ${ANVILMQ_RETENTION_INTERVAL_MS-15000}
+      # Max rows deleted per statement per tick. Prune capacity = BATCH / (INTERVAL_MS/1000).
+      # Raise this (or shorten the interval) above peak completion throughput or history keeps
+      # growing under load; the sim fan-out can exceed the conservative default.
+      ANVILMQ_RETENTION_BATCH: ${ANVILMQ_RETENTION_BATCH-1000}
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:50071:50051"
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - broker-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9090/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  workers:
+    <<: *node-build
+    command: ["/app/examples/sim/src/workers.ts"]
+    environment:
+      ANVILMQ_ADDR: broker:50051
+      ANVILMQ_HTTP_URL: http://broker:9090
+      # Concurrent single-job workers per job name.
+      SIM_WORKER_CONCURRENCY: ${SIM_WORKER_CONCURRENCY-2}
+      # Simulated handler latency (ms) standing in for downstream service calls.
+      SIM_WORK_MS: ${SIM_WORK_MS-15}
+      # Fan-out multipliers for the task chain (kept small to stay under depth 10).
+      SIM_TASKS_PER_EVENT: ${SIM_TASKS_PER_EVENT-2}
+      SIM_SUBTASKS_PER_TASK: ${SIM_SUBTASKS_PER_TASK-3}
+      RUST_LOG: info
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  producer:
+    <<: *node-build
+    command: ["/app/examples/sim/src/producer.ts"]
+    environment:
+      ANVILMQ_ADDR: broker:50051
+      ANVILMQ_HTTP_URL: http://broker:9090
+      # prod = steady synthetic mix at ~13 top-level jobs/s by default.
+      # soak = high-volume push toward SIM_MAX_JOBS.
+      SIM_PROFILE: ${SIM_PROFILE-prod}
+      SIM_RATE: ${SIM_RATE-13}
+      SIM_DURATION_SECONDS: ${SIM_DURATION_SECONDS-0}
+      SIM_MAX_JOBS: ${SIM_MAX_JOBS-0}
+      # Limit-tripping demo woven into the steady prod workload (see src/producer.ts):
+      # periodically trips the admission-side ingress rule and the dispatch-side claim rate rule
+      # on dedicated facets, plus a low rate of self-recursive RecursiveProbe chains that trip the
+      # ancestry-depth circuit breaker. Watch anvilmq_ingress_rejected_total, anvilmq_throttled_polls_total,
+      # and anvilmq_ancestry_rejections_total. Set to 0 to disable.
+      SIM_LIMIT_DEMO: ${SIM_LIMIT_DEMO-}
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=3d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9490:9090"
+    depends_on:
+      - broker
+
+  grafana:
+    image: grafana/grafana:11.6.11
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+
+  # Structured-log store for broker/worker/producer log drilldown in Grafana (Explore + the
+  # logs panel on the safety-controls dashboard). Single-binary, filesystem-backed, throwaway.
+  loki:
+    image: grafana/loki:3.4.2
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+
+  # Discovers this compose project's containers via the Docker socket and ships their logs
+  # to Loki. Read-only socket mount; scrapes only anvilmq-sim containers.
+  promtail:
+    image: grafana/promtail:3.4.2
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+volumes:
+  broker-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

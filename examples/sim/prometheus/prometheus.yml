@@ -1,0 +1,10 @@
+# Scrapes only the local sim broker. No demo/prod targets.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: anvilmq
+    static_configs:
+      - targets: ["broker:9090"]
+        labels:
+          cluster: sim

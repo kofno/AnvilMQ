@@ -1,0 +1,12 @@
+# Bun image running the synthetic workers and producer against the broker.
+# Deps install at /app, a shared parent of /app/examples/sim and /app/client.
+FROM oven/bun:1.2.14
+WORKDIR /app
+COPY examples/sim/package.json examples/sim/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY client /app/client
+COPY proto /app/proto
+COPY examples/sim /app/examples/sim
+ENV ANVILMQ_ADDR=broker:50051 ANVILMQ_HTTP_URL=http://broker:9090
+ENTRYPOINT ["bun"]
+CMD ["/app/examples/sim/src/workers.ts"]

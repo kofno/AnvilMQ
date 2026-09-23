@@ -1,0 +1,110 @@
+{
+  "uid": "anvilmq-ingress",
+  "title": "AnvilMQ ingress velocity limits",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "About",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 3 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Admission-side sliding-window ingress velocity control.** The broker rejects `AddJob` up front when a facet's recent enqueue velocity exceeds its configured limit, protecting the embedded writer from bursty enqueue overload. Run `examples/sim/src/ingress-demo.ts` to install a rule and drive a burst above it; the rejection panels below light up as the surplus is shed."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Ingress rejections/sec",
+      "description": "rate(anvilmq_ingress_rejected_total). Enqueues shed by the sliding-window ingress control while a facet exceeds its configured admission limit.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 3, "w": 12, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 },
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(anvilmq_ingress_rejected_total[1m])",
+          "legendFormat": "rejected/s",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Ingress rejected (cumulative)",
+      "description": "anvilmq_ingress_rejected_total since process start.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 3, "w": 6, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "anvilmq_ingress_rejected_total",
+          "legendFormat": "rejected",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Task completions/sec (ProcessTask)",
+      "description": "sum(rate(anvilmq_jobs_by_name_total{name=\"ProcessTask\",event=\"completed\"})). Includes admitted demo tasks and other tasks in the synthetic workload; this metric is not facet-specific.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 18, "y": 3, "w": 6, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 },
+          "color": { "mode": "fixed", "fixedColor": "green" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(anvilmq_jobs_by_name_total{name=\"ProcessTask\",event=\"completed\"}[1m]))",
+          "legendFormat": "completed/s",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    }
+  ]
+}

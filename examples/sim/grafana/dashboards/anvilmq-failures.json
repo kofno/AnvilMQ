@@ -1,0 +1,284 @@
+{
+  "uid": "anvilmq-failures",
+  "title": "AnvilMQ recent failures",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": [
+    "anvilmq"
+  ],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Recent terminal failures",
+      "description": "Terminal (exhausted) failures from the read-only /v1/failures feed, one row per failed job. In-flight retries are excluded because only jobs that gave up reach job_history. The table honors the dashboard time range: ${__from} (epoch ms range start) is passed as the feed's since_ms lower bound. Served via the Infinity datasource; the base URL lives on the provisioned datasource so the query URL is relative. last_error is the key troubleshooting signal.",
+      "type": "table",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "finished_at"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Finished at"
+              },
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              },
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "name"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Function"
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last_error"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Last error"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto",
+                  "wrapText": true
+                }
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 400
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "attempts"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Attempts"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "execution_depth"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Depth"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Trace ID"
+              },
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Job ID"
+              },
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Finished at",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "${datasource}"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/v1/failures?limit=1000&since_ms=${__from}",
+          "url_options": {
+            "method": "GET"
+          },
+          "parser": "backend",
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "finished_at",
+              "text": "finished_at",
+              "type": "timestamp_epoch_ms"
+            },
+            {
+              "selector": "name",
+              "text": "name",
+              "type": "string"
+            },
+            {
+              "selector": "last_error",
+              "text": "last_error",
+              "type": "string"
+            },
+            {
+              "selector": "attempts",
+              "text": "attempts",
+              "type": "number"
+            },
+            {
+              "selector": "execution_depth",
+              "text": "execution_depth",
+              "type": "number"
+            },
+            {
+              "selector": "trace_id",
+              "text": "trace_id",
+              "type": "string"
+            },
+            {
+              "selector": "id",
+              "text": "id",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "finished_at": 0,
+              "name": 1,
+              "last_error": 2,
+              "attempts": 3,
+              "execution_depth": 4,
+              "trace_id": 5,
+              "id": 6
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Infinity",
+        "type": "datasource",
+        "query": "yesoreyeram-infinity-datasource"
+      }
+    ]
+  }
+}
