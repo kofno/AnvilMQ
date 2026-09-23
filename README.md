@@ -12,6 +12,46 @@ For a versioned container, Helm chart, and packaged Bun client, see [evaluation 
 - WAL with configurable `ANVILMQ_DURABILITY=NORMAL|FULL` (default NORMAL). NORMAL permits loss of recent acknowledged writes after OS/power failure; FULL requests commit synchronization on retained storage. Startup logs the applied settings. See the [durability contract](docs/durability.md) for storage assumptions and operational guidance.
 - Initial schema creation and additive ownership/error-history migrations run in a transaction. Existing jobs are preserved.
 
+## Delivery and execution semantics
+
+AnvilMQ delivers each job **at least once**. It does **not** provide exactly-once execution of a handler's external side effects, and it does not try to. This is a deliberate choice; this section states the guarantee and defends it.
+
+### The guarantee
+
+Within the configured attempt limit and the storage's durability settings:
+
+- **No acknowledged job is silently lost.** Every transition (enqueue, claim, heartbeat, completion, failure, recovery) is an immediate, durable transaction, so a committed job survives restarts and is eventually completed, retried, or moved to Failed history.
+- **A job may run more than once.** If the broker cannot be certain a claimed job finished, it re-dispatches the job after its lease expires, so handlers must be idempotent.
+
+That is the whole trade-off: under crashes and partitions a queue can guarantee it never loses a job (at-least-once) or never duplicates a job (at-most-once), but not both. AnvilMQ chooses never-lose, because a dropped job is usually far worse than a duplicate an idempotent handler can absorb.
+
+### Why exactly-once execution isn't offered
+
+A worker performs side effects in external systems the broker does not control. Exactly-once execution would require performing the side effect and durably recording "done" as one atomic step. Whenever the worker or broker can crash between those two, that atomicity is impossible in general: the broker cannot distinguish "the handler finished but the acknowledgment was lost" from "the handler never ran." Duplicates therefore arise from:
+
+- **A lost completion acknowledgment** — the handler committed its side effect, then the `CompleteJob` call (or the worker) died before the broker recorded it; the lease expires and recovery re-runs the job.
+- **A lease reclaimed under a slow handler** — a long pause (GC, I/O stall, or clock skew) lets the 30-second lease expire while the worker is still running, so recovery hands the job to another worker and both may execute it.
+- **A retried enqueue** — a producer that resends `AddJob` after a timed-out-but-committed call creates a second job unless it supplied an `idempotency_key`.
+
+Systems that advertise exactly-once either confine every side effect to the same transactional store as the queue (not possible for general external effects) or actually mean *effectively once*: at-least-once delivery plus de-duplication at the effect boundary. AnvilMQ takes the honest version of that.
+
+### Reaching *effectively once*
+
+The broker de-duplicates everything it can reach and hands you stable keys for the rest:
+
+- **Ownership-checked acknowledgments.** Completion, failure, and heartbeat require a matching, unexpired claim carrying the dequeue's `attempt` token, so a stale claim can never acknowledge or renew a newer one.
+- **Completion idempotency.** Replaying `CompleteJob` for an already-completed job returns success from history without re-writing history or double-counting metrics. This de-duplicates the broker-side transition, not the external effect.
+- **Enqueue idempotency.** An opt-in `idempotency_key` collapses producer retries into one job; see [Idempotent enqueue](#idempotent-enqueue).
+- **A stable job identity.** Every dispatch carries the job `id`, unchanged across re-executions; use it (or your own business key) as the natural key for effect de-duplication. Do not key on the `attempt` number — a duplicate run has a different attempt.
+
+Make handler side effects idempotent (natural keys, upserts, conditional writes, or a transactional outbox keyed on the job `id`) and at-least-once delivery becomes effectively-once at the point where exactly-once can actually be enforced: inside the system that owns the side effect.
+
+### Why this is the right choice
+
+- **It is honest.** The guarantee matches what a crash-safe queue can truly deliver, with no hidden window where a job is silently dropped or assumed to run exactly once when it cannot be.
+- **It stays fast and local.** True exactly-once across external systems needs a distributed commit protocol spanning the worker's downstream dependencies, which contradicts AnvilMQ's embedded, low-latency design. At-least-once keeps the hot path a single local transaction.
+- **It composes with best practice.** Idempotent handlers are already the norm for reliable processing; AnvilMQ supplies the primitives (stable `id`, `attempt` ownership, enqueue dedup key, completion replay) so you enforce exactly-once effects exactly where you can — at the boundary you control.
+
 ## Implemented behavior
 
 ### Enqueue
@@ -69,7 +109,7 @@ The daemon runs recovery immediately on startup and every five seconds thereafte
 
 Lease duration is currently a fixed `LEASE_DURATION_MS = 30_000` in `src/leases.rs`; the recovery interval is five seconds in `src/main.rs`. Runtime configuration is not implemented. Expirations persist across restarts and use the server's wall clock; keep the host clock synchronized. Forward clock jumps can expire work early, and backward jumps can delay recovery.
 
-Delivery follows at-least-once processing semantics within the configured attempt limit and existing storage durability constraints. Recovery can cause duplicate execution, so job handlers must make side effects idempotent. This does not provide exactly-once external execution.
+Delivery is at-least-once; see [Delivery and execution semantics](#delivery-and-execution-semantics).
 
 On upgrade, stop old workers before starting this version. The additive migration preserves existing jobs and treats legacy Active jobs without a lease as expired for immediate recovery. Existing unexpired leases are preserved on restart. Older clients that cannot heartbeat must finish within 30 seconds.
 
