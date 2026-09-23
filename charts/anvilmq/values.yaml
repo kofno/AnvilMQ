@@ -44,3 +44,21 @@ dashboards:
   # Namespace for the ConfigMap; empty uses the release namespace. The Grafana
   # sidecar must be allowed to watch this namespace.
   namespace: ""
+# Optional provisioning of a Grafana Infinity datasource for the recent-failures
+# table dashboard (anvilmq-failures). The dashboard reads GET /v1/failures as JSON
+# through the yesoreyeram-infinity-datasource plugin. Disabled by default: it
+# requires the Infinity plugin to be installed in Grafana (e.g. via
+# GF_INSTALL_PLUGINS / grafana.plugins). The chart cannot install the plugin.
+infinityDatasource:
+  enabled: false
+  # Datasource display name; also used as its provisioned uid.
+  name: AnvilMQ Failures
+  # Base URL for the datasource. Empty defaults to the in-cluster broker service
+  # DNS and HTTP port (see charts/anvilmq/templates/service.yaml).
+  url: ""
+  # Datasource sidecar discovery label. The default matches kube-prometheus-stack.
+  sidecarLabel: grafana_datasource
+  sidecarValue: "1"
+  # Namespace for the ConfigMap; empty uses the release namespace. The Grafana
+  # sidecar must be allowed to watch this namespace.
+  namespace: ""
