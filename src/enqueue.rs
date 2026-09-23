@@ -73,6 +73,20 @@ pub async fn enqueue(
             }
         }
         let now = leases::now_ms(&tx).map_err(internal)?;
+        // Sliding-window ingress admission control. Runs after the idempotency replay
+        // early-return (so replays never consume quota) and before any job insert. A
+        // rejection returns Err, which drops the uncommitted tx and rolls back, so nothing
+        // is written and no quota is consumed. Only facets with a rule are throttled.
+        if !req.rate_limit_facet.is_empty()
+            && !crate::ingress_limit::admit(&tx, &req.rate_limit_facet, now).map_err(internal)?
+        {
+            metrics.ingress_rejection();
+            tracing::warn!(facet = %req.rate_limit_facet, "enqueue rejected: ingress velocity limit");
+            return Err(Status::resource_exhausted(format!(
+                "ingress velocity limit exceeded for facet {}",
+                req.rate_limit_facet
+            )));
+        }
         let available_at = now.checked_add(req.delay_ms).ok_or_else(|| Status::invalid_argument("delay timestamp overflows"))?;
         let id = uuid::Uuid::new_v4().to_string();
         let state = if req.delay_ms > 0 { "Delayed" } else { "Waiting" };

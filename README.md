@@ -92,7 +92,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
-- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented.
+- Rate limits support exact facets and fixed windows; wildcard matching and weighted tenant fairness are not implemented. This applies to both the dispatch-side rate limits and the admission-side ingress velocity limits.
 - The server defaults to loopback. A non-loopback bind requires an explicit `ANVILMQ_ADDR`; transport authentication/TLS are not implemented.
 - No Raft replication or global telemetry exists yet.
 
@@ -121,7 +121,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Persist metadata and reject supplied execution depth above the limit.
 - [x] Validate ancestry and quarantine runaway chains.
 - [x] Built-in parentage: the server derives `execution_depth` from the resolved parent when unset and validates a supplied non-zero depth against it, and the client exposes an `enqueueChild` helper that propagates the parent's lineage.
-- [ ] Sliding-window ingress velocity controls.
+- [x] Sliding-window ingress velocity controls.
 
 ### Phase 4: Faceted rate limiting
 
@@ -173,6 +173,29 @@ limits.close();
 ```
 
 `anvilmq_throttled_polls_total` counts committed polls that encounter at least one due, queue-matching throttled job, even if another job is dispatched. It has no tenant/facet labels and does not count rejected jobs individually. The three administrative RPCs also have bounded latency labels.
+
+## Ingress velocity limits
+
+Ingress velocity limits are an **admission-side** control: they throttle the rate at which jobs are *enqueued* for a facet, unlike the faceted rate limits above, which are a **dispatch-side** control that throttles the rate at which workers *claim* jobs. Ingress limits reject `AddJob` up front to protect the embedded writer from sustained or bursty enqueue overload; they are a separate mechanism with their own rules, counters, and RPCs, and do not interact with the dispatch-side limits.
+
+`UpsertIngressLimitRule(facet_pattern, max_jobs, window_duration_ms)` creates or replaces an exact-match rule. Wildcards (`*`, `?`), blank keys, surrounding whitespace, and nonpositive/overflowing durations are rejected. `max_jobs=0` pauses ingress for that facet (every enqueue is rejected). **Every upsert resets usage**, including an identical update; do not repeatedly upsert rules as a reconciliation heartbeat.
+
+`DeleteIngressLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetIngressLimitStatus(facet_key)` reports rule existence, the current sliding-window estimate, limit, duration, current window start, and throttling. It is read-only: it projects the estimate for the current instant without rolling or persisting the stored buckets. Missing rules mean unrestricted ingress.
+
+Enforcement uses a sliding-window-counter approximation: two adjacent fixed windows (the current and previous counts) weighted by their overlap with the trailing window, giving `estimated = previous * weight + current` where `weight` decays linearly from the full previous count at a window's start to zero at its end. This is O(1) per facet with no per-event row growth. An enqueue is rejected when the estimate would reach `max_jobs` (or the facet is paused); otherwise it consumes one unit. The counter update commits in the same immediate transaction as the job insert, so a rejected enqueue writes nothing and consumes no quota, and an accepted enqueue's consumption is atomic with the insert. Quota is shared across all queue names with the same `rate_limit_facet`. Idempotent replays of an already-accepted key return the original receipt and do **not** consume quota. Rules and counters persist across restarts. These are enqueue admission controls, not concurrency limits or dispatch-rate limits, and they depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
+
+The TypeScript client exports `IngressLimits`, shaped like `RateLimits`:
+
+```typescript
+const ingress = new IngressLimits();
+await ingress.upsert("practice:123", 100, 60000);
+console.log(await ingress.status("practice:123"));
+await queue.add(data, { rateLimitFacet: "practice:123" }); // rejected once the window fills
+// await ingress.delete("practice:123");
+ingress.close();
+```
+
+`anvilmq_ingress_rejected_total` is a global counter of enqueues rejected by this control. It has no tenant/facet labels to keep metric cardinality bounded. The three administrative RPCs also have bounded latency labels.
 
 ## Retention
 

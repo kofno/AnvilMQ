@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
-import { Queue, Worker, RateLimits } from "../src/index";
+import { Queue, Worker, RateLimits, IngressLimits } from "../src/index";
 import { verifyCompletionAmbiguity } from "./completion-proxy";
 
 async function until(check: () => boolean, timeout = 60000) {
@@ -42,6 +42,17 @@ test("real gRPC: lifecycle, lease recovery, and ambiguous completion retries", a
       expect(await limits.delete("demo:paused")).toBe(true);
       expect((await limits.status("demo:paused")).ruleExists).toBe(false);
     } finally { limits.close(); }
+    const ingress = new IngressLimits({ address });
+    const paused = new Queue<{ n: number }>("ingress-demo", { address }); queues.push(paused);
+    try {
+      // A one-per-window rule admits the first enqueue and rejects the second in-window.
+      await ingress.upsert("ingress:tenant", 1, 60000);
+      await paused.add({ n: 1 }, { rateLimitFacet: "ingress:tenant" });
+      expect((await ingress.status("ingress:tenant")).estimatedCount).toBe(1);
+      await expect(paused.add({ n: 2 }, { rateLimitFacet: "ingress:tenant" })).rejects.toBeDefined();
+      expect(await ingress.delete("ingress:tenant")).toBe(true);
+      expect((await ingress.status("ingress:tenant")).ruleExists).toBe(false);
+    } finally { ingress.close(); }
     const queue = new Queue<{ kind: string }>("test", { address }); queues.push(queue);
     const seen: { kind: string; attempt: number; at: number }[] = [];
     const added = Date.now();

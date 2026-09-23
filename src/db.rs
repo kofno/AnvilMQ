@@ -238,6 +238,19 @@ impl DatabaseManager {
                 window_expires_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ingress_limit_rules (
+                facet_pattern TEXT PRIMARY KEY,
+                max_jobs INTEGER NOT NULL,
+                window_duration_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ingress_limit_counters (
+                facet_key TEXT PRIMARY KEY,
+                current_window_start INTEGER NOT NULL,
+                current_count INTEGER NOT NULL,
+                previous_count INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS chain_counters (
                 trace_id TEXT PRIMARY KEY,
                 job_count INTEGER NOT NULL,

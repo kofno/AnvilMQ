@@ -191,3 +191,157 @@ async fn receipt_insert_failure_rolls_back_job_and_metrics() {
     .unwrap();
     assert!(!add(&service, input()).await.unwrap().replayed);
 }
+
+use crate::queue::v1::{
+    DeleteIngressLimitRuleRequest, GetIngressLimitStatusRequest, UpsertIngressLimitRuleRequest,
+};
+
+fn facet_req(name: &str, facet: &str) -> AddJobRequest {
+    AddJobRequest {
+        name: name.into(),
+        payload: name.as_bytes().to_vec(),
+        rate_limit_facet: facet.into(),
+        ..Default::default()
+    }
+}
+
+async fn set_ingress(service: &MyQueueService, facet: &str, max_jobs: u32, window_ms: i64) {
+    service
+        .upsert_ingress_limit_rule(Request::new(UpsertIngressLimitRuleRequest {
+            facet_pattern: facet.into(),
+            max_jobs,
+            window_duration_ms: window_ms,
+        }))
+        .await
+        .unwrap();
+}
+
+async fn ingress_estimate(service: &MyQueueService, facet: &str) -> u32 {
+    service
+        .get_ingress_limit_status(Request::new(GetIngressLimitStatusRequest {
+            facet_key: facet.into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .estimated_count
+}
+
+#[tokio::test]
+async fn ingress_admits_up_to_limit_then_rejects_and_counts_metric() {
+    let service = service(":memory:").await;
+    set_ingress(&service, "tenant", 2, 60_000).await;
+    assert!(add(&service, facet_req("a", "tenant")).await.is_ok());
+    assert!(add(&service, facet_req("b", "tenant")).await.is_ok());
+    let rejected = add(&service, facet_req("c", "tenant")).await.unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_ingress_rejected_total 1\n"));
+}
+
+#[tokio::test]
+async fn ingress_facet_without_rule_is_unrestricted() {
+    let service = service(":memory:").await;
+    for i in 0..50 {
+        assert!(add(&service, facet_req(&format!("j{i}"), "free"))
+            .await
+            .is_ok());
+    }
+    let status = service
+        .get_ingress_limit_status(Request::new(GetIngressLimitStatusRequest {
+            facet_key: "free".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!status.rule_exists);
+}
+
+#[tokio::test]
+async fn ingress_upsert_resets_usage() {
+    let service = service(":memory:").await;
+    set_ingress(&service, "t", 1, 60_000).await;
+    assert!(add(&service, facet_req("a", "t")).await.is_ok());
+    assert_eq!(
+        add(&service, facet_req("b", "t")).await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+    // An identical upsert clears the counter, so admissions resume immediately.
+    set_ingress(&service, "t", 1, 60_000).await;
+    assert!(add(&service, facet_req("c", "t")).await.is_ok());
+}
+
+#[tokio::test]
+async fn ingress_delete_removes_rule() {
+    let service = service(":memory:").await;
+    set_ingress(&service, "t", 1, 60_000).await;
+    assert!(add(&service, facet_req("a", "t")).await.is_ok());
+    assert_eq!(
+        add(&service, facet_req("b", "t")).await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+    let deleted = service
+        .delete_ingress_limit_rule(Request::new(DeleteIngressLimitRuleRequest {
+            facet_key: "t".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted;
+    assert!(deleted);
+    // No rule => unrestricted again.
+    assert!(add(&service, facet_req("c", "t")).await.is_ok());
+}
+
+#[tokio::test]
+async fn ingress_max_jobs_zero_pauses() {
+    let service = service(":memory:").await;
+    set_ingress(&service, "t", 0, 60_000).await;
+    assert_eq!(
+        add(&service, facet_req("a", "t")).await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+}
+
+#[tokio::test]
+async fn ingress_replay_does_not_consume_quota() {
+    let service = service(":memory:").await;
+    set_ingress(&service, "t", 1, 60_000).await;
+    let mut keyed = facet_req("a", "t");
+    keyed.idempotency_key = "dedup:1".into();
+    assert!(!add(&service, keyed.clone()).await.unwrap().replayed);
+    assert_eq!(ingress_estimate(&service, "t").await, 1);
+    // Replaying the accepted key returns the receipt without consuming ingress quota.
+    for _ in 0..5 {
+        assert!(add(&service, keyed.clone()).await.unwrap().replayed);
+    }
+    assert_eq!(ingress_estimate(&service, "t").await, 1);
+}
+
+#[tokio::test]
+async fn ingress_admissions_resume_after_window_elapses() {
+    let service = service(":memory:").await;
+    let window = 60_000i64;
+    set_ingress(&service, "t", 1, window).await;
+    assert!(add(&service, facet_req("a", "t")).await.is_ok());
+    assert_eq!(
+        add(&service, facet_req("b", "t")).await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+    // Simulate two elapsed windows by aging the stored window start.
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .execute(
+                "UPDATE ingress_limit_counters SET current_window_start = current_window_start - ?1",
+                [window * 3],
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(add(&service, facet_req("c", "t")).await.is_ok());
+}
