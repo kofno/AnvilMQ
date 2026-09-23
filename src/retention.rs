@@ -91,10 +91,7 @@ impl RetentionConfig {
                 "ANVILMQ_FACET_DISPATCH_TTL_MS",
                 d.facet_dispatch_ttl_ms,
             )?,
-            rejections_age_ms: env_i64(
-                "ANVILMQ_RETENTION_REJECTIONS_AGE_MS",
-                d.rejections_age_ms,
-            )?,
+            rejections_age_ms: env_i64("ANVILMQ_RETENTION_REJECTIONS_AGE_MS", d.rejections_age_ms)?,
         };
         cfg.validate()?;
         Ok(cfg)
