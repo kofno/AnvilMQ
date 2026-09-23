@@ -33,6 +33,17 @@
         "folder": { "type": "string" },
         "namespace": { "type": "string" }
       }
+    },
+    "infinityDatasource": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "name": { "type": "string", "minLength": 1 },
+        "url": { "type": "string" },
+        "sidecarLabel": { "type": "string", "minLength": 1 },
+        "sidecarValue": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string" }
+      }
     }
   }
 }

@@ -1,0 +1,30 @@
+{{- if .Values.infinityDatasource.enabled -}}
+{{- $label := .Values.infinityDatasource.sidecarLabel | default "grafana_datasource" -}}
+{{- $value := .Values.infinityDatasource.sidecarValue | default "1" -}}
+{{- $namespace := .Values.infinityDatasource.namespace | default .Release.Namespace -}}
+{{- $name := .Values.infinityDatasource.name | default "AnvilMQ Failures" -}}
+{{- $url := .Values.infinityDatasource.url -}}
+{{- if not $url -}}
+{{- $url = printf "http://%s.%s.svc.cluster.local:9090" (include "anvilmq.name" .) $namespace -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "anvilmq.name" . }}-infinity-datasource
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "anvilmq.labels" . | nindent 4 }}
+    {{ $label }}: {{ $value | quote }}
+data:
+  anvilmq-failures-datasource.yaml: |-
+    apiVersion: 1
+    datasources:
+      - name: {{ $name | quote }}
+        type: yesoreyeram-infinity-datasource
+        access: proxy
+        url: {{ $url | quote }}
+        isDefault: false
+        editable: false
+        jsonData:
+          global_queries: []
+{{- end }}
