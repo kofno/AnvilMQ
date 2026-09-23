@@ -1057,6 +1057,11 @@ mod tests {
         use axum::response::IntoResponse;
         let page = console().await;
         assert!(page.0.contains("AnvilMQ Search Console"));
+        // Job-detail click-through wiring is embedded in the served page: the drill-down
+        // handler, the detail panel element, and the same-origin single-job fetch.
+        assert!(page.0.contains("function openDetail("));
+        assert!(page.0.contains("id=\"detailBackdrop\""));
+        assert!(page.0.contains("/v1/jobs/"));
         let response = page.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
