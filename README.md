@@ -192,7 +192,7 @@ Receipts survive restarts and terminal transitions and, in this first version, h
 
 `DeleteRateLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetRateLimitStatus(facet_key)` reports rule existence, effective count, limit, duration, window expiration, and throttling. An expired or unstarted window reports count/deadline zero without writing to the database. Missing rules mean unrestricted claims.
 
-Windows start on the first claim and remain fixed until expiry (`expires <= now` resets on the next claim). Quota is shared across all queue names with the same `rate_limit_facet`. Each claim consumes one unit, including retries and recovered jobs. Completion/failure does not refund usage. Counter changes and the claim commit together; failed claims roll back quota consumption. Rules and counters persist across restarts. These are dispatch-rate limits, not concurrency limits or enqueue admission controls.
+Windows start on the first claim and remain fixed until expiry (`expires <= now` resets on the next claim). The `rate_limit_facet` is a free-form label set per job at enqueue (the client's `rateLimitFacet` option), not a per-queue setting; a queue here is just the job `name`. Because the counter is keyed solely by facet, every job carrying a given facet draws on one shared quota regardless of the `name` it was enqueued under. Each claim consumes one unit, including retries and recovered jobs. Completion/failure does not refund usage. Counter changes and the claim commit together; failed claims roll back quota consumption. Rules and counters persist across restarts. These are dispatch-rate limits, not concurrency limits or enqueue admission controls.
 
 Dequeue skips throttled candidates and preserves priority/age ordering among eligible jobs; a blocked tenant cannot prevent an eligible different facet from progressing. This is not a round-robin fairness guarantee. If all matching jobs are throttled, polling returns `found=false`; the client continues normal polling. Jobs without a matching rule remain unrestricted. Limits depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
 
@@ -232,7 +232,7 @@ Ingress velocity limits are an **admission-side** control: they throttle the rat
 
 `DeleteIngressLimitRule(facet_key)` removes the rule and counter; repeated deletion returns `deleted=false`. `GetIngressLimitStatus(facet_key)` reports rule existence, the current sliding-window estimate, limit, duration, current window start, and throttling. It is read-only: it projects the estimate for the current instant without rolling or persisting the stored buckets. Missing rules mean unrestricted ingress.
 
-Enforcement uses a sliding-window-counter approximation: two adjacent fixed windows (the current and previous counts) weighted by their overlap with the trailing window, giving `estimated = previous * weight + current` where `weight` decays linearly from the full previous count at a window's start to zero at its end. This is O(1) per facet with no per-event row growth. An enqueue is rejected when the estimate would reach `max_jobs` (or the facet is paused); otherwise it consumes one unit. The counter update commits in the same immediate transaction as the job insert, so a rejected enqueue writes nothing and consumes no quota, and an accepted enqueue's consumption is atomic with the insert. Quota is shared across all queue names with the same `rate_limit_facet`. Idempotent replays of an already-accepted key return the original receipt and do **not** consume quota. Rules and counters persist across restarts. These are enqueue admission controls, not concurrency limits or dispatch-rate limits, and they depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
+Enforcement uses a sliding-window-counter approximation: two adjacent fixed windows (the current and previous counts) weighted by their overlap with the trailing window, giving `estimated = previous * weight + current` where `weight` decays linearly from the full previous count at a window's start to zero at its end. This is O(1) per facet with no per-event row growth. An enqueue is rejected when the estimate would reach `max_jobs` (or the facet is paused); otherwise it consumes one unit. The counter update commits in the same immediate transaction as the job insert, so a rejected enqueue writes nothing and consumes no quota, and an accepted enqueue's consumption is atomic with the insert. Quota is keyed solely by `rate_limit_facet` (a per-job label, not per queue/`name`), so all jobs sharing a facet draw on one quota. Idempotent replays of an already-accepted key return the original receipt and do **not** consume quota. Rules and counters persist across restarts. These are enqueue admission controls, not concurrency limits or dispatch-rate limits, and they depend on caller-supplied facets and trusted administrative access; they are not an authorization boundary.
 
 The TypeScript client exports `IngressLimits`, shaped like `RateLimits`:
 
@@ -246,6 +246,24 @@ ingress.close();
 ```
 
 `anvilmq_ingress_rejected_total` is a global counter of enqueues rejected by this control. It has no tenant/facet labels to keep metric cardinality bounded. The three administrative RPCs also have bounded latency labels.
+
+### Fixed vs sliding windows
+
+The two controls deliberately use different window algorithms.
+
+Dispatch-side faceted rate limits use a **fixed window**: a per-facet counter anchored by the first claim that hard-resets once its window expires (`window_expires_at <= now`). It is the cheapest correct option — one row, one integer compare — but it can admit up to roughly 2×`max_jobs` across a boundary (`max_jobs` at the tail of one window, then `max_jobs` again at the head of the next).
+
+Admission-side ingress limits use a **sliding-window counter** to smooth that burst. They keep two adjacent buckets (current and previous) and estimate `previous * weight + current`, where `weight` decays linearly from 1.0 at the current window's start to 0.0 at its end. The previous window's count bleeds off gradually instead of snapping to zero, so any trailing-window span is bounded to about `max_jobs`. This stays O(1) per facet with no per-event rows, at the cost of one extra bucket and a float; it approximates by assuming the previous window's events were spread evenly.
+
+| | Faceted rate limits (dispatch) | Ingress velocity limits (admission) |
+| --- | --- | --- |
+| Throttles | job **claims** | job **enqueues** |
+| Window model | fixed, hard reset at expiry | sliding-window counter (decaying previous) |
+| Boundary burst | up to ~2×`max_jobs` | bounded to ≈`max_jobs` |
+| Per-facet state | count + expiry | two buckets + start |
+| Reject cost | skipped in claim SQL, no write | checked before insert, no write |
+
+Both match facets exactly (no wildcards), key their counter solely by `rate_limit_facet`, are O(1) per facet, and commit the counter change in the same immediate transaction as the claim or the insert, so a rejected operation writes nothing.
 
 ## Retention
 
