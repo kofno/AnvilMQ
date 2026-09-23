@@ -147,6 +147,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Read-only job/history search API served off the replica connection: opt-in FTS5 index maintained by triggers at history-insert/delete time (off the hot enqueue path, off by default, retention-bounded), including whole-token prefix search via an explicit trailing `*` (`upstrea*`). Enable with `ANVILMQ_FTS_ENABLED`; see [search observability](docs/observability.md#search).
 - [x] Read-only job/history search API served off the replica connection (`GET /v1/search`): structured filters plus escaped-LIKE free-text search over `job_history` (no write-path cost, retention-bounded), with an opt-in FTS5 `MATCH` path when `ANVILMQ_FTS_ENABLED` is set.
 - [x] Read-only single-job detail endpoint (`GET /v1/jobs/{id}`) served off the replica connection: the full record for one job — including the payload and ancestry — unioning the live `jobs` table and `job_history` via a `source` discriminator.
+- [ ] Console click-through from a search result to the single-job detail view (`GET /v1/jobs/{id}`): select a row to open the full record inline — notably `last_error` for a failed job — so failure triage is a one-click step instead of a hand-built request.
 - [ ] Asynchronous regional telemetry aggregation.
 - [ ] Latency and throughput benchmarks with documented durability settings.
 
