@@ -195,8 +195,20 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 ### Phase 5: Regional high availability
 
+Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](harness/BENCHMARKS.md)) and observed production load: a single broker's sustainable completion throughput sits well above current demand, so availability and durability — not throughput or partitioning — are the remaining gap. The phase is split into production operability first, then consensus.
+
+#### Phase 5a: Production operability (next)
+
+- [ ] Runtime configuration for lease duration, recovery interval, durability mode, and the rate-limit/ingress/depth knobs (currently compile-time constants).
+- [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs.
+- [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook.
+- [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
+- [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
+
+#### Phase 5b: Consensus and replicated high availability (deferred)
+
 - [ ] Raft consensus and replicated state transitions.
-- [ ] Kubernetes configuration, persistent storage, and failure testing.
+- [ ] Kubernetes configuration and multi-replica failure testing for near-zero-downtime failover.
 
 ### Phase 6: Observability
 
@@ -214,7 +226,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 - [x] Console click-through from a search result to the single-job detail view (`GET /v1/jobs/{id}`): select a row to open the full record inline — notably `last_error` for a failed job — so failure triage is a one-click step instead of a hand-built request.
 - [x] Durable admission-time enqueue-rejection records (`enqueue_rejections`) with a read-only feed (`GET /v1/rejections`) served off the replica connection: every rejected enqueue — which creates no job row — is captured with `kind`, `name`, `trace_id`, `parent_id`, `execution_depth`, `rate_limit_facet`, and `detail` for post-hoc forensics, counted per-kind by `anvilmq_enqueue_rejections_total{kind}`, and retention-bounded by `ANVILMQ_RETENTION_REJECTIONS_AGE_MS`.
 - [ ] Asynchronous regional telemetry aggregation.
-- [ ] Latency and throughput benchmarks with documented durability settings.
+- [x] Latency and throughput benchmarks with documented durability settings — an isolated, variable-controlled harness with a defined sustainable-throughput criterion and a NORMAL-versus-FULL durability comparison. See [harness/BENCHMARKS.md](harness/BENCHMARKS.md).
 
 ## Idempotent enqueue
 
