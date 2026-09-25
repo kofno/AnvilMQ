@@ -208,9 +208,13 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 
 #### Phase 5a: Production operability (next)
 
-- [ ] Runtime configuration for durability mode and the rate-limit/ingress/depth knobs (currently compile-time constants). Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are now runtime-configurable; the per-sweep recovery batch size remains a compile-time constant (`LIMIT 100`).
-- [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the graceful-shutdown WAL checkpoint is now implemented (the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`).
-- [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook. The broker-side snapshot writer has landed — consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default). Shipping snapshots to object storage via a swappable upload sidecar and the restore runbook remain.
+- Runtime configuration for operational knobs:
+  - [x] Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are runtime-configurable and validated at startup; durability mode is already runtime-selectable via `ANVILMQ_DURABILITY`.
+  - [ ] Expose the remaining compile-time constants — the execution-depth breaker limit and the per-sweep recovery batch size (`LIMIT 100`) — as validated runtime configuration.
+- [x] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`.
+- Backup, restore, and point-in-time recovery — scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook:
+  - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).
+  - [ ] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook.
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
 
