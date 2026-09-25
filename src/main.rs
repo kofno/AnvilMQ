@@ -490,12 +490,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Built before database_path is moved into pressure::spawn below.
     let reader = Arc::new(reader::Reader::from_env(database_path.clone()));
     let sampler = pressure::spawn(database_path, db_manager.metrics.clone());
+    // A single shutdown event fans out to both servers so they stop accepting new connections and
+    // drain in-flight work together. Capacity 1 is enough: we only ever send one notification.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received; draining in-flight work");
+            let _ = shutdown_tx.send(());
+        });
+    }
     let http_addr = std::env::var("ANVILMQ_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9090".into())
         .parse()?;
-    let http = axum::Server::try_bind(&http_addr)?.serve(
-        telemetry::router(db_manager.clone(), reader.clone(), fts_enabled).into_make_service(),
-    );
+    let http = {
+        let mut rx = shutdown_tx.subscribe();
+        axum::Server::try_bind(&http_addr)?
+            .serve(
+                telemetry::router(db_manager.clone(), reader.clone(), fts_enabled)
+                    .into_make_service(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.recv().await;
+            })
+    };
     let recovery_db = db_manager.clone();
     let lease_duration_ms =
         parse_lease_duration_ms(std::env::var("ANVILMQ_LEASE_DURATION_MS").ok().as_deref())
@@ -578,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .unwrap_or(false);
+    let shutdown_db = db_manager.clone();
     let service = MyQueueService {
         db_manager,
         max_execution_depth: 10, // Max recursion depth guardrail
@@ -588,18 +608,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
 
-    let grpc = Server::builder()
-        .add_service(QueueServiceServer::new(service))
-        .serve(addr);
-    let result: Result<(), Box<dyn std::error::Error>> = tokio::select! { result = grpc => result.map_err(Into::into), result = http => result.map_err(Into::into) };
+    let grpc = {
+        let mut rx = shutdown_tx.subscribe();
+        Server::builder()
+            .add_service(QueueServiceServer::new(service))
+            .serve_with_shutdown(addr, async move {
+                let _ = rx.recv().await;
+            })
+    };
+
+    // Run both servers until one drains (via the shutdown signal) or errors on its own. If either
+    // future returns first, notify the other so it also stops, then await it so we never hang.
+    tokio::pin!(grpc);
+    tokio::pin!(http);
+    let mut grpc_result: Option<Result<(), Box<dyn std::error::Error>>> = None;
+    let mut http_result: Option<Result<(), Box<dyn std::error::Error>>> = None;
+    tokio::select! {
+        result = &mut grpc => {
+            grpc_result = Some(result.map_err(Into::into));
+            let _ = shutdown_tx.send(());
+        }
+        result = &mut http => {
+            http_result = Some(result.map_err(Into::into));
+            let _ = shutdown_tx.send(());
+        }
+    }
+    if grpc_result.is_none() {
+        grpc_result = Some((&mut grpc).await.map_err(Into::into));
+    }
+    if http_result.is_none() {
+        http_result = Some((&mut http).await.map_err(Into::into));
+    }
+
+    // Both servers have drained. Stop the background tasks so nothing else writes, then checkpoint
+    // the WAL. A checkpoint failure is logged but never blocks a clean exit.
     recovery.abort();
     sampler.abort();
     if let Some(retention) = retention {
         retention.abort();
     }
-    result?;
+    if let Err(error) = shutdown_db.checkpoint().await {
+        tracing::warn!(%error, "wal checkpoint failed during shutdown; continuing");
+    }
+    tracing::info!("graceful shutdown complete");
+
+    // Surface any server error (after best-effort cleanup + checkpoint) so failures still exit non-zero.
+    grpc_result.transpose()?;
+    http_result.transpose()?;
 
     Ok(())
+}
+
+/// Completes when the process receives SIGTERM (unix) or Ctrl-C (all platforms), the signals
+/// Kubernetes and interactive sessions use to request termination. Windows has no SIGTERM, so the
+/// terminate branch is gated to unix and stubbed elsewhere.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[cfg(test)]
