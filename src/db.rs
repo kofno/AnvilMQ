@@ -74,6 +74,52 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn checkpoint_truncates_wal_and_is_noop_in_memory() {
+        // In-memory databases journal in MEMORY mode; checkpoint must be a harmless no-op.
+        let mem = DatabaseManager::new(":memory:").await.unwrap();
+        mem.checkpoint().await.unwrap();
+
+        // File-backed databases run in WAL mode; a non-empty WAL must be truncated by checkpoint.
+        let path =
+            std::env::temp_dir().join(format!("anvil-checkpoint-{}.db", uuid::Uuid::new_v4()));
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let db = DatabaseManager::new(path.to_str().unwrap()).await.unwrap();
+        let conn = db.get_shared_connection();
+        {
+            let write_conn = Arc::clone(&conn);
+            tokio::task::spawn_blocking(move || {
+                let conn = write_conn.blocking_lock();
+                // Disable auto-checkpointing so the WAL is guaranteed non-empty before we checkpoint.
+                conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+                conn.execute_batch("CREATE TABLE probe(id INTEGER PRIMARY KEY, blob BLOB);")
+                    .unwrap();
+                for i in 0..500 {
+                    conn.execute("INSERT INTO probe(id, blob) VALUES(?, zeroblob(4096))", [i])
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let wal_before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_before > 0, "expected a non-empty WAL before checkpoint");
+
+        db.checkpoint().await.unwrap();
+
+        let wal_after = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            wal_after < wal_before,
+            "expected WAL to shrink after TRUNCATE checkpoint (before={wal_before}, after={wal_after})"
+        );
+
+        drop(conn);
+        drop(db);
+        for extra in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), extra));
+        }
+    }
+
     #[test]
     fn migration_preserves_legacy_jobs_and_is_repeatable() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -179,6 +225,46 @@ impl DatabaseManager {
             let conn = conn.blocking_lock();
             crate::fts::setup_blocking(&conn)?;
             crate::fts::backfill_blocking(&conn, batch)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Checkpoints the write-ahead log against the shared writer connection to bound WAL growth
+    /// across the pod lifecycle and speed up the next startup. Runs `PRAGMA wal_checkpoint(TRUNCATE)`
+    /// on a blocking thread; if that reports busy it falls back to `PASSIVE`. It is a safe no-op when
+    /// the database is not in WAL mode (the in-memory unit-test databases use MEMORY journaling), and
+    /// the checkpoint outcome is logged at info. Callers treat a returned error as non-fatal.
+    pub async fn checkpoint(&self) -> SqlResult<()> {
+        let conn = self.get_shared_connection();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+            if !journal.eq_ignore_ascii_case("wal") {
+                tracing::info!(journal_mode = %journal, "wal checkpoint skipped; database not in wal mode");
+                return Ok(());
+            }
+            let run = |mode: &str| -> SqlResult<(i64, i64, i64)> {
+                conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+            };
+            // `busy` (column 0) is non-zero when TRUNCATE could not obtain the necessary locks; retry
+            // with PASSIVE, which never blocks, so shutdown still reclaims what it safely can.
+            let (busy, wal_frames, pages_checkpointed) = match run("TRUNCATE")? {
+                result if result.0 == 0 => result,
+                _ => {
+                    tracing::warn!("wal checkpoint TRUNCATE reported busy; falling back to PASSIVE");
+                    run("PASSIVE")?
+                }
+            };
+            tracing::info!(
+                busy,
+                wal_frames,
+                pages_checkpointed,
+                "wal checkpoint complete"
+            );
+            Ok(())
         })
         .await
         .unwrap()

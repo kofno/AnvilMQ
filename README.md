@@ -146,6 +146,10 @@ Delivery is at-least-once; see [Delivery and execution semantics](#delivery-and-
 
 On upgrade, stop old workers before starting this version. The additive migration preserves existing jobs and treats legacy Active jobs without a lease as expired for immediate recovery. Existing unexpired leases are preserved on restart. Older clients that cannot heartbeat must finish within 30 seconds.
 
+### Graceful shutdown
+
+The daemon shuts down cleanly on `SIGTERM` (the signal Kubernetes sends on pod termination) or `Ctrl-C`. On the signal both the gRPC and HTTP servers stop accepting new connections and drain in-flight requests, then the background tasks (recovery, pressure sampler, and the retention sweeper when enabled) are stopped so nothing else writes. Finally the daemon performs a WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`) on the writer connection to reclaim the write-ahead log so restarts stay fast and the WAL does not grow unbounded across the pod lifecycle. The checkpoint is a no-op when the database is not in WAL mode and is best-effort: a checkpoint error is logged but never blocks a clean exit. Committed data is crash-safe regardless of shutdown path; the drain-and-checkpoint sequence is bounded and fits well within the StatefulSet's 30s `terminationGracePeriodSeconds`.
+
 ### Completion, failure, and retries
 
 `CompleteJob` verifies that the job is Active and owned by the requesting worker, inserts a Completed history record, and deletes the live job in one immediate transaction. History preserves payload, ancestry, priority, attempt counts, creation time, finish time, worker, facet, and the most recent failure message (if any).
@@ -205,7 +209,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 #### Phase 5a: Production operability (next)
 
 - [ ] Runtime configuration for durability mode and the rate-limit/ingress/depth knobs (currently compile-time constants). Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are now runtime-configurable; the per-sweep recovery batch size remains a compile-time constant (`LIMIT 100`).
-- [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs.
+- [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the graceful-shutdown WAL checkpoint is now implemented (the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`).
 - [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook.
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
