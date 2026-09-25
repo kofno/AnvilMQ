@@ -7,6 +7,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::sync::Arc;
 use tonic::Status;
 
+/// Default worker lease duration. Overridable at startup via `ANVILMQ_LEASE_DURATION_MS`;
+/// the configured value is carried on `MyQueueService::lease_duration_ms`.
 pub const LEASE_DURATION_MS: i64 = 30_000;
 
 // Read wall time after acquiring the write lock, never before waiting for it.
@@ -26,6 +28,7 @@ impl MyQueueService {
             ));
         }
         let conn = self.db_manager.get_shared_connection();
+        let lease_duration_ms = self.lease_duration_ms;
         tokio::task::spawn_blocking(move || {
             let internal = |e: rusqlite::Error| Status::internal(e.to_string());
             let mut conn = conn.blocking_lock();
@@ -43,7 +46,7 @@ impl MyQueueService {
                 return Err(Status::failed_precondition("claim is stale or expired"));
             }
             // Never shorten a lease if the system clock moves backwards.
-            let expiry = expiry.unwrap().max(now + LEASE_DURATION_MS);
+            let expiry = expiry.unwrap().max(now + lease_duration_ms);
             tx.execute("UPDATE jobs SET lease_expires_at_ms = ?1, updated_at = ?2 WHERE id = ?3", rusqlite::params![expiry, now, req.id]).map_err(internal)?;
             tx.commit().map_err(internal)?;
             Ok(HeartbeatResponse { lease_expires_at_ms: expiry })

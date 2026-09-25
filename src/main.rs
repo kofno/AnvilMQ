@@ -38,6 +38,7 @@ pub struct MyQueueService {
     max_execution_depth: u32,
     max_chain_size: u64,
     fairness_enabled: bool,
+    lease_duration_ms: i64,
 }
 
 #[tonic::async_trait]
@@ -68,6 +69,7 @@ impl QueueService for MyQueueService {
         }
         let metrics = self.db_manager.metrics.clone();
         let fairness_enabled = self.fairness_enabled;
+        let lease_duration_ms = self.lease_duration_ms;
         let conn_arc = self.db_manager.get_shared_connection();
         let job = tokio::task::spawn_blocking(move || -> rusqlite::Result<GetNextJobResponse> {
             let mut conn = conn_arc.blocking_lock();
@@ -151,7 +153,7 @@ impl QueueService for MyQueueService {
                 .checked_add(1)
                 .ok_or(rusqlite::Error::InvalidQuery)?;
             let now = leases::now_ms(&tx)?;
-            job.lease_expires_at_ms = now + leases::LEASE_DURATION_MS;
+            job.lease_expires_at_ms = now + lease_duration_ms;
             tx.execute(
                 "UPDATE jobs SET state = 'Active', worker_id = ?1, attempts = ?2,
                  updated_at = ?4, lease_expires_at_ms = ?5
@@ -390,6 +392,48 @@ impl MyQueueService {
     }
 }
 
+/// Default worker lease recovery sweep cadence, overridable via `ANVILMQ_RECOVERY_INTERVAL_MS`.
+const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
+
+/// Sub-second leases churn recovery, so the configured lease must be at least this long.
+const MIN_LEASE_DURATION_MS: i64 = 1_000;
+
+/// Parse `ANVILMQ_LEASE_DURATION_MS`. Absent -> default; present must be an integer >= 1000.
+fn parse_lease_duration_ms(raw: Option<&str>) -> Result<i64, String> {
+    match raw {
+        None => Ok(leases::LEASE_DURATION_MS),
+        Some(value) => {
+            let parsed = value.trim().parse::<i64>().map_err(|_| {
+                format!("ANVILMQ_LEASE_DURATION_MS must be an integer, got {value:?}")
+            })?;
+            if parsed < MIN_LEASE_DURATION_MS {
+                return Err(format!(
+                    "ANVILMQ_LEASE_DURATION_MS={parsed} must be >= {MIN_LEASE_DURATION_MS} (sub-second leases churn recovery)"
+                ));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_RECOVERY_INTERVAL_MS`. Absent -> default; present must be a positive integer.
+fn parse_recovery_interval_ms(raw: Option<&str>) -> Result<u64, String> {
+    match raw {
+        None => Ok(DEFAULT_RECOVERY_INTERVAL_MS),
+        Some(value) => {
+            let parsed = value.trim().parse::<i64>().map_err(|_| {
+                format!("ANVILMQ_RECOVERY_INTERVAL_MS must be an integer, got {value:?}")
+            })?;
+            if parsed <= 0 {
+                return Err(format!(
+                    "ANVILMQ_RECOVERY_INTERVAL_MS={parsed} must be positive"
+                ));
+            }
+            Ok(parsed as u64)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
@@ -453,8 +497,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telemetry::router(db_manager.clone(), reader.clone(), fts_enabled).into_make_service(),
     );
     let recovery_db = db_manager.clone();
+    let lease_duration_ms =
+        parse_lease_duration_ms(std::env::var("ANVILMQ_LEASE_DURATION_MS").ok().as_deref())
+            .map_err(std::io::Error::other)?;
+    let recovery_interval_ms = parse_recovery_interval_ms(
+        std::env::var("ANVILMQ_RECOVERY_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
+    tracing::info!(
+        lease_duration_ms,
+        recovery_interval_ms,
+        "lease and recovery configured"
+    );
     let recovery = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(recovery_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -472,7 +531,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let retention_cfg = retention::RetentionConfig::from_env().map_err(std::io::Error::other)?;
+    let retention_cfg =
+        retention::RetentionConfig::from_env(lease_duration_ms).map_err(std::io::Error::other)?;
     let retention = if retention_cfg.enabled() {
         tracing::info!(?retention_cfg, "retention sweeper enabled");
         let retention_db = db_manager.clone();
@@ -523,6 +583,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_execution_depth: 10, // Max recursion depth guardrail
         max_chain_size,          // Runaway-chain quarantine cap; 0 disables
         fairness_enabled,        // Equal round-robin tenant fairness; off = identical to legacy
+        lease_duration_ms,       // Worker lease TTL; ANVILMQ_LEASE_DURATION_MS (default 30s)
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -546,11 +607,16 @@ mod tests {
     use super::*;
 
     async fn service() -> MyQueueService {
+        service_with_lease(leases::LEASE_DURATION_MS).await
+    }
+
+    async fn service_with_lease(lease_duration_ms: i64) -> MyQueueService {
         let service = MyQueueService {
             db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
             max_execution_depth: 10,
             max_chain_size: 0,
             fairness_enabled: false,
+            lease_duration_ms,
         };
         // Seed the ancestry parent referenced by the enqueue helper so that supplied
         // parent_id/execution_depth pass ancestry validation. Parked in job_history so it
@@ -597,6 +663,52 @@ mod tests {
             .await
             .unwrap()
             .into_inner()
+    }
+
+    #[test]
+    fn lease_duration_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_lease_duration_ms(None).unwrap(),
+            leases::LEASE_DURATION_MS
+        );
+        assert_eq!(parse_lease_duration_ms(Some("45000")).unwrap(), 45_000);
+        assert_eq!(parse_lease_duration_ms(Some(" 1000 ")).unwrap(), 1_000);
+        assert!(parse_lease_duration_ms(Some("0")).is_err());
+        assert!(parse_lease_duration_ms(Some("-5")).is_err());
+        assert!(parse_lease_duration_ms(Some("abc")).is_err());
+        // Sub-second leases are rejected by the floor.
+        assert!(parse_lease_duration_ms(Some("999")).is_err());
+    }
+
+    #[test]
+    fn recovery_interval_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_recovery_interval_ms(None).unwrap(),
+            DEFAULT_RECOVERY_INTERVAL_MS
+        );
+        assert_eq!(parse_recovery_interval_ms(Some("2500")).unwrap(), 2_500);
+        assert!(parse_recovery_interval_ms(Some("0")).is_err());
+        assert!(parse_recovery_interval_ms(Some("-1")).is_err());
+        assert!(parse_recovery_interval_ms(Some("nope")).is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_lease_duration_applies_to_claim() {
+        let service = service_with_lease(120_000).await;
+        enqueue(&service, "email", 0, 0).await;
+        let job = claim(&service, &["email"]).await;
+        assert!(job.found);
+        let conn = service.db_manager.get_shared_connection();
+        let now =
+            tokio::task::spawn_blocking(move || leases::now_ms(&conn.blocking_lock()).unwrap())
+                .await
+                .unwrap();
+        let remaining = job.lease_expires_at_ms - now;
+        // Reflects the configured 120s lease, not the 30s default.
+        assert!(
+            (110_000..=120_000).contains(&remaining),
+            "remaining={remaining}"
+        );
     }
 
     #[tokio::test]

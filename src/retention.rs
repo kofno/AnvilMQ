@@ -11,8 +11,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use std::sync::Arc;
 use tonic::Status;
 
-/// A prune below this age could delete a terminal job while a duplicate lifecycle RPC is
-/// still being retried against `job_history` (completion replay) — reject such configs.
+/// A prune below `RetentionConfig::min_age_ms` could delete a terminal job while a duplicate
+/// lifecycle RPC is still being retried against `job_history` (completion replay) — reject such
+/// configs. The floor tracks the configured lease duration (`lease * 2`); this constant is the
+/// default derived from `LEASE_DURATION_MS`.
 const MIN_AGE_MS: i64 = LEASE_DURATION_MS * 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +37,9 @@ pub struct RetentionConfig {
     pub facet_dispatch_ttl_ms: i64,
     /// Delete `enqueue_rejections` forensic rows older than this. `0` disables.
     pub rejections_age_ms: i64,
+    /// Safety floor for age-based prunes: the configured lease duration times two. A terminal
+    /// job younger than this may still see a completion-replay RPC against `job_history`.
+    pub min_age_ms: i64,
 }
 
 impl Default for RetentionConfig {
@@ -56,6 +61,7 @@ impl Default for RetentionConfig {
             facet_dispatch_ttl_ms: 604_800_000,
             // Retain admission-time rejection forensics for a week, then reclaim.
             rejections_age_ms: 604_800_000,
+            min_age_ms: MIN_AGE_MS,
         }
     }
 }
@@ -72,7 +78,9 @@ fn env_i64(key: &str, default: i64) -> Result<i64, String> {
 }
 
 impl RetentionConfig {
-    pub fn from_env() -> Result<Self, String> {
+    /// Build config from `ANVILMQ_*` env vars. `lease_duration_ms` is the runtime-configured
+    /// worker lease and sets the age-prune safety floor (`lease * 2`).
+    pub fn from_env(lease_duration_ms: i64) -> Result<Self, String> {
         let d = Self::default();
         let cfg = Self {
             completed_age_ms: env_i64("ANVILMQ_RETENTION_COMPLETED_AGE_MS", d.completed_age_ms)?,
@@ -92,19 +100,21 @@ impl RetentionConfig {
                 d.facet_dispatch_ttl_ms,
             )?,
             rejections_age_ms: env_i64("ANVILMQ_RETENTION_REJECTIONS_AGE_MS", d.rejections_age_ms)?,
+            min_age_ms: lease_duration_ms.saturating_mul(2),
         };
         cfg.validate()?;
         Ok(cfg)
     }
 
     fn validate(&self) -> Result<(), String> {
+        let min_age_ms = self.min_age_ms;
         for (key, age) in [
             ("ANVILMQ_RETENTION_COMPLETED_AGE_MS", self.completed_age_ms),
             ("ANVILMQ_RETENTION_FAILED_AGE_MS", self.failed_age_ms),
         ] {
-            if age != 0 && age < MIN_AGE_MS {
+            if age != 0 && age < min_age_ms {
                 return Err(format!(
-                    "{key}={age} is below the {MIN_AGE_MS}ms safety floor (use 0 to disable)"
+                    "{key}={age} is below the {min_age_ms}ms safety floor (use 0 to disable)"
                 ));
             }
         }
@@ -354,6 +364,7 @@ mod tests {
             chain_counter_ttl_ms: 0,
             facet_dispatch_ttl_ms: 0,
             rejections_age_ms: 0,
+            min_age_ms: MIN_AGE_MS,
         }
     }
 
@@ -549,6 +560,17 @@ mod tests {
         c.completed_age_ms = 1_000;
         assert!(c.validate().is_err());
         c.completed_age_ms = MIN_AGE_MS;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn safety_floor_tracks_configured_lease() {
+        // A larger configured lease raises the floor to lease * 2.
+        let mut c = cfg();
+        c.min_age_ms = 120_000; // lease of 60s
+        c.completed_age_ms = 90_000;
+        assert!(c.validate().is_err());
+        c.completed_age_ms = 120_000;
         assert!(c.validate().is_ok());
     }
 

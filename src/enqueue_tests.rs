@@ -14,6 +14,7 @@ async fn service(path: &str) -> MyQueueService {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     }
 }
 async fn add(service: &MyQueueService, req: AddJobRequest) -> Result<AddJobResponse, Status> {
