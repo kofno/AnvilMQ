@@ -51,6 +51,7 @@ async fn completion_receipt_survives_reopening_database() {
             max_execution_depth: 10,
             max_chain_size: 0,
             fairness_enabled: false,
+            lease_duration_ms: leases::LEASE_DURATION_MS,
         };
         id = service
             .add_job(Request::new(AddJobRequest {
@@ -70,6 +71,7 @@ async fn completion_receipt_survives_reopening_database() {
             max_execution_depth: 10,
             max_chain_size: 0,
             fairness_enabled: false,
+            lease_duration_ms: leases::LEASE_DURATION_MS,
         };
         complete(&service, &id, "worker", 1).await.unwrap();
         complete(&service, &id, "worker", 0).await.unwrap();
@@ -261,6 +263,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -279,6 +282,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -302,6 +306,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert_eq!(
         leases::recover_expired(service.db_manager.clone())
@@ -351,6 +356,7 @@ async fn setup(max_attempts: u32) -> (MyQueueService, String) {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -732,6 +738,7 @@ async fn schedule_and_policy_survive_restart() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     service
         .add_job(Request::new(AddJobRequest {
@@ -749,6 +756,7 @@ async fn schedule_and_policy_survive_restart() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert!(!claim(&service).await.found);
     let conn = service.db_manager.get_shared_connection();
@@ -985,6 +993,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     service
         .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
@@ -1011,6 +1020,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert!(!claim(&service).await.found);
     let status = service
@@ -1042,6 +1052,7 @@ async fn fairness_service(enabled: bool) -> MyQueueService {
         max_execution_depth: 10,
         max_chain_size: 0,
         fairness_enabled: enabled,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     }
 }
 

@@ -133,9 +133,14 @@ Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue
 
 For live jobs, heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Already committed completions can be replayed as described below. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
 
-The daemon runs recovery immediately on startup and every five seconds thereafter. Each immediate transaction handles up to 100 expired claims. Jobs with attempts remaining are rescheduled using their backoff policy with ownership and lease cleared; exhausted jobs move atomically to Failed history. Recovery records `Worker lease expired`, preserves the attempt count, and logs recovered counts or errors. Failed batches roll back and retry on the next tick. Large backlogs may take multiple ticks to drain.
+The daemon runs recovery immediately on startup and every five seconds thereafter by default (configurable via `ANVILMQ_RECOVERY_INTERVAL_MS`). Each immediate transaction handles up to 100 expired claims. Jobs with attempts remaining are rescheduled using their backoff policy with ownership and lease cleared; exhausted jobs move atomically to Failed history. Recovery records `Worker lease expired`, preserves the attempt count, and logs recovered counts or errors. Failed batches roll back and retry on the next tick. Large backlogs may take multiple ticks to drain.
 
-Lease duration is currently a fixed `LEASE_DURATION_MS = 30_000` in `src/leases.rs`; the recovery interval is five seconds in `src/main.rs`. Runtime configuration is not implemented. Expirations persist across restarts and use the server's wall clock; keep the host clock synchronized. Forward clock jumps can expire work early, and backward jumps can delay recovery.
+Lease duration defaults to 30 seconds (`LEASE_DURATION_MS = 30_000` in `src/leases.rs`) and is configurable at startup via `ANVILMQ_LEASE_DURATION_MS`, which must be an integer of at least `1000` (sub-second leases churn recovery). The recovery interval defaults to five seconds and is configurable via `ANVILMQ_RECOVERY_INTERVAL_MS` (positive integer milliseconds). Both are validated at startup, and a present-but-invalid value is a hard startup error. Raising the lease duration also raises the retention safety floor to `lease * 2`. Expirations persist across restarts and use the server's wall clock; keep the host clock synchronized. Forward clock jumps can expire work early, and backward jumps can delay recovery.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ANVILMQ_LEASE_DURATION_MS` | `30000` | Worker lease TTL in milliseconds, applied to fresh claims and heartbeat renewals. Must be an integer `>= 1000`; a present-but-invalid value fails startup. Also sets the retention age-prune safety floor (`lease * 2`). |
+| `ANVILMQ_RECOVERY_INTERVAL_MS` | `5000` | Cadence in milliseconds of the background sweep that recovers expired claims. Must be a positive integer; a present-but-invalid value fails startup. Does not change the per-sweep recovery batch size (fixed at 100). |
 
 Delivery is at-least-once; see [Delivery and execution semantics](#delivery-and-execution-semantics).
 
@@ -199,7 +204,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 
 #### Phase 5a: Production operability (next)
 
-- [ ] Runtime configuration for lease duration, recovery interval, durability mode, and the rate-limit/ingress/depth knobs (currently compile-time constants).
+- [ ] Runtime configuration for durability mode and the rate-limit/ingress/depth knobs (currently compile-time constants). Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are now runtime-configurable; the per-sweep recovery batch size remains a compile-time constant (`LIMIT 100`).
 - [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs.
 - [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook.
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.

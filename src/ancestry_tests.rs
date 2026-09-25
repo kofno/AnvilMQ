@@ -6,6 +6,7 @@ async fn service_with(path: &str, max_chain_size: u64) -> MyQueueService {
         max_execution_depth: 10,
         max_chain_size,
         fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
     }
 }
 
