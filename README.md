@@ -148,7 +148,7 @@ On upgrade, stop old workers before starting this version. The additive migratio
 
 ### Graceful shutdown
 
-The daemon shuts down cleanly on `SIGTERM` (the signal Kubernetes sends on pod termination) or `Ctrl-C`. On the signal both the gRPC and HTTP servers stop accepting new connections and drain in-flight requests, then the background tasks (recovery, pressure sampler, and the retention sweeper when enabled) are stopped so nothing else writes. Finally the daemon performs a WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`) on the writer connection to reclaim the write-ahead log so restarts stay fast and the WAL does not grow unbounded across the pod lifecycle. The checkpoint is a no-op when the database is not in WAL mode and is best-effort: a checkpoint error is logged but never blocks a clean exit. Committed data is crash-safe regardless of shutdown path; the drain-and-checkpoint sequence is bounded and fits well within the StatefulSet's 30s `terminationGracePeriodSeconds`.
+The daemon shuts down cleanly on `SIGTERM` (the signal Kubernetes sends on pod termination) or `Ctrl-C`. On the signal both the gRPC and HTTP servers stop accepting new connections and drain in-flight requests, then the background tasks (recovery, pressure sampler, the retention sweeper, and the snapshot writer when enabled) are stopped so nothing else writes. Finally the daemon performs a WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`) on the writer connection to reclaim the write-ahead log so restarts stay fast and the WAL does not grow unbounded across the pod lifecycle. The checkpoint is a no-op when the database is not in WAL mode and is best-effort: a checkpoint error is logged but never blocks a clean exit. Committed data is crash-safe regardless of shutdown path; the drain-and-checkpoint sequence is bounded and fits well within the StatefulSet's 30s `terminationGracePeriodSeconds`.
 
 ### Completion, failure, and retries
 
@@ -210,7 +210,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 
 - [ ] Runtime configuration for durability mode and the rate-limit/ingress/depth knobs (currently compile-time constants). Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are now runtime-configurable; the per-sweep recovery batch size remains a compile-time constant (`LIMIT 100`).
 - [ ] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the graceful-shutdown WAL checkpoint is now implemented (the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`).
-- [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook.
+- [ ] Backup, restore, and point-in-time recovery: scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook. The broker-side snapshot writer has landed — consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default). Shipping snapshots to object storage via a swappable upload sidecar and the restore runbook remain.
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
 
@@ -380,6 +380,27 @@ The sweeper shares the single writer connection with every enqueue, claim, and c
 
 The `idx_history_state_finished` and `idx_history_name_state_finished` indexes keep each delete cheap (shorter holds), at the cost of minor index maintenance on the completion write path. Deletes run on the blocking thread pool, so they never starve the async runtime — the writer lock is the only contention point.
 
+## Backups
+
+A background snapshot writer produces consistent, self-contained copies of the embedded database on a schedule so a recent recovery point survives loss of a pod and its local volume. It is opt-in and disabled by default (`ANVILMQ_BACKUP_ENABLED`), so existing and CI behavior is unchanged until it is turned on.
+
+- Each snapshot is produced with `VACUUM INTO`, which writes a fully committed, non-WAL copy of the last committed state — a single, self-contained, shippable artifact.
+- The snapshot runs on a **dedicated read connection** the backup task opens to the same database file, never on the shared writer. WAL mode lets this second reader observe a consistent committed snapshot without taking the writer mutex, so backups never stall enqueues, recovery, or retention.
+- Snapshots are written to a temp file (`.snapshot-<unix_ms>.db.tmp`) and then atomically renamed to `snapshot-<unix_ms>.db`, so a future uploader only ever sees complete files. No temp file is left behind on success. Timestamped names are fixed-width and sort chronologically.
+- After each write, older local snapshots are pruned so only the most recent `ANVILMQ_BACKUP_RETAIN` remain.
+- The cadence is configurable via `ANVILMQ_BACKUP_INTERVAL_MS` (default 2 min, within a 1–5 min recovery-point band).
+- A backup failure is logged at error and increments `anvilmq_backup_failures_total`; it never crashes the broker, which retries on the next tick. `anvilmq_last_backup_timestamp_ms` lets operators alert on stale backups.
+- Against a non-file-backed database (e.g. the in-memory unit-test databases) a run is a harmless no-op.
+
+This covers **local snapshot production only**. Shipping snapshots to object storage — via a swappable upload sidecar — and the full restore runbook are follow-up slices in this phase; no object-store dependency is compiled into the broker.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ANVILMQ_BACKUP_ENABLED` | `false` | Opt-in switch for the snapshot writer. Truthy values (`1`, `true`, `yes`) enable it; off by default. |
+| `ANVILMQ_BACKUP_INTERVAL_MS` | `120000` (2 min) | Snapshot cadence in milliseconds. Must be `> 0`; a present-but-invalid value fails startup. |
+| `ANVILMQ_BACKUP_DIR` | `backups` | Directory for local snapshots, created if missing. Must be non-empty when backups are enabled. |
+| `ANVILMQ_BACKUP_RETAIN` | `3` | Number of most-recent local snapshots to keep. Must be `>= 1`; older snapshots are pruned after each write. |
+
 ## Observability
 
 The HTTP listener defaults to `127.0.0.1:9090`; override with `ANVILMQ_HTTP_ADDR`. A bind failure stops startup. These endpoints are unauthenticated; expose them only on a trusted network.
@@ -417,6 +438,11 @@ Metrics have only fixed state, event, method, and histogram-bound labels:
 | `anvilmq_recovery_errors_total` | Recovery batches that failed and will be retried |
 | `anvilmq_retention_deleted_total{target,reason}` | History/receipt rows pruned by the retention sweeper; `target` is completed, failed, or receipt and `reason` is age, count, or orphan |
 | `anvilmq_retention_errors_total` | Retention sweep batches that failed and will be retried |
+| `anvilmq_backups_total` | Successful local snapshots written by the backup writer |
+| `anvilmq_backup_failures_total` | Backup runs that failed and will be retried on the next tick |
+| `anvilmq_last_backup_timestamp_ms` | Wall-clock time of the last successful snapshot (unix ms); alert on staleness |
+| `anvilmq_last_backup_duration_ms` | Duration of the last successful snapshot in milliseconds |
+| `anvilmq_last_backup_size_bytes` | Size of the last successful snapshot in bytes |
 | `anvilmq_enqueue_replays_total` | Matching keyed enqueue retries since startup; rising rates can indicate lost responses or producer retry pressure |
 | `anvilmq_enqueue_conflicts_total` | Key reuse with different request contents since startup; investigate producer identity/serialization mistakes |
 | `anvilmq_enqueue_receipts` | Retained idempotency records, initialized from storage; monitor alongside PVC usage |
