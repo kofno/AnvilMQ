@@ -4,6 +4,7 @@ use tonic::{transport::Server, Request, Response, Status};
 
 #[cfg(test)]
 mod ancestry_tests;
+mod backup;
 mod db;
 mod enqueue;
 #[cfg(test)]
@@ -489,6 +490,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Isolated read-only WAL replica connection for observability reads (e.g. /v1/failures).
     // Built before database_path is moved into pressure::spawn below.
     let reader = Arc::new(reader::Reader::from_env(database_path.clone()));
+    // Captured before `database_path` is moved into pressure::spawn; the backup task opens its own
+    // dedicated connection to this same file.
+    let backup_db_path = database_path.clone();
     let sampler = pressure::spawn(database_path, db_manager.metrics.clone());
     // A single shutdown event fans out to both servers so they stop accepting new connections and
     // drain in-flight work together. Capacity 1 is enough: we only ever send one notification.
@@ -578,6 +582,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let backup_cfg = backup::BackupConfig::from_env().map_err(std::io::Error::other)?;
+    let backup = if backup_cfg.enabled() {
+        tracing::info!(?backup_cfg, "snapshot writer enabled");
+        let backup_metrics = db_manager.metrics.clone();
+        Some(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(backup_cfg.interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match backup::run_once(backup_db_path.clone(), backup_cfg.clone()).await {
+                    Ok(Some(outcome)) => {
+                        backup_metrics.backup_success(
+                            outcome.timestamp_ms,
+                            outcome.duration_ms,
+                            outcome.size_bytes,
+                        );
+                        tracing::info!(
+                            path = %outcome.path.display(),
+                            size_bytes = outcome.size_bytes,
+                            duration_ms = outcome.duration_ms,
+                            pruned = outcome.pruned,
+                            "snapshot written"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        backup_metrics.backup_failure();
+                        tracing::error!(%error, "snapshot failed; retrying next tick");
+                    }
+                }
+            }
+        }))
+    } else {
+        tracing::info!("snapshot writer disabled");
+        None
+    };
+
     let addr = std::env::var("ANVILMQ_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".into())
         .parse()?;
@@ -646,6 +688,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sampler.abort();
     if let Some(retention) = retention {
         retention.abort();
+    }
+    if let Some(backup) = backup {
+        backup.abort();
     }
     if let Err(error) = shutdown_db.checkpoint().await {
         tracing::warn!(%error, "wal checkpoint failed during shutdown; continuing");

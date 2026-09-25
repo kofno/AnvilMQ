@@ -322,6 +322,11 @@ pub struct Metrics {
     ingress_rejections: AtomicU64,
     enqueue_rejections_by_kind: [AtomicU64; 5],
     rejections_pruned: AtomicU64,
+    backups_total: AtomicU64,
+    backup_failures_total: AtomicU64,
+    last_backup_timestamp_ms: AtomicI64,
+    last_backup_duration_ms: AtomicI64,
+    last_backup_size_bytes: AtomicI64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -405,6 +410,18 @@ impl Metrics {
     }
     pub fn retention_error(&self) {
         self.retention_errors.fetch_add(1, Relaxed);
+    }
+    /// Record a successful snapshot: bump the counter and store the last snapshot's wall-clock
+    /// time (unix ms), duration, and size so operators can alert on stale backups.
+    pub fn backup_success(&self, timestamp_ms: i64, duration_ms: i64, size_bytes: i64) {
+        self.backups_total.fetch_add(1, Relaxed);
+        self.last_backup_timestamp_ms.store(timestamp_ms, Relaxed);
+        self.last_backup_duration_ms.store(duration_ms, Relaxed);
+        self.last_backup_size_bytes.store(size_bytes, Relaxed);
+    }
+    /// Record a failed snapshot run. The broker keeps running and retries on the next tick.
+    pub fn backup_failure(&self) {
+        self.backup_failures_total.fetch_add(1, Relaxed);
     }
     /// Enqueue rejected because a supplied `parent_id` did not resolve or the child's
     /// `execution_depth` was not exactly `parent + 1`.
@@ -490,6 +507,31 @@ impl Metrics {
         out += &format!(
             "anvilmq_retention_errors_total {}\n",
             self.retention_errors.load(Relaxed)
+        );
+        out += "# HELP anvilmq_backups_total Successful local snapshots written by the backup writer.\n# TYPE anvilmq_backups_total counter\n";
+        out += &format!(
+            "anvilmq_backups_total {}\n",
+            self.backups_total.load(Relaxed)
+        );
+        out += "# HELP anvilmq_backup_failures_total Failed backup runs.\n# TYPE anvilmq_backup_failures_total counter\n";
+        out += &format!(
+            "anvilmq_backup_failures_total {}\n",
+            self.backup_failures_total.load(Relaxed)
+        );
+        out += "# HELP anvilmq_last_backup_timestamp_ms Wall-clock time of the last successful snapshot in unix milliseconds.\n# TYPE anvilmq_last_backup_timestamp_ms gauge\n";
+        out += &format!(
+            "anvilmq_last_backup_timestamp_ms {}\n",
+            self.last_backup_timestamp_ms.load(Relaxed)
+        );
+        out += "# HELP anvilmq_last_backup_duration_ms Duration of the last successful snapshot in milliseconds.\n# TYPE anvilmq_last_backup_duration_ms gauge\n";
+        out += &format!(
+            "anvilmq_last_backup_duration_ms {}\n",
+            self.last_backup_duration_ms.load(Relaxed)
+        );
+        out += "# HELP anvilmq_last_backup_size_bytes Size of the last successful snapshot in bytes.\n# TYPE anvilmq_last_backup_size_bytes gauge\n";
+        out += &format!(
+            "anvilmq_last_backup_size_bytes {}\n",
+            self.last_backup_size_bytes.load(Relaxed)
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
