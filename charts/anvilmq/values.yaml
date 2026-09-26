@@ -20,6 +20,19 @@ resources:
   limits:
     cpu: "2"
     memory: 1Gi
+# Broker engine operational knobs. Every key is OPTIONAL: an empty string (or
+# false) means "use the broker's built-in default", and the chart emits the
+# matching ANVILMQ_* env var ONLY when a value is set. Defaults and range
+# validation therefore stay single-sourced in the binary — the chart never
+# duplicates them. A present-but-invalid value fails broker startup, so keep
+# these lenient here. Numerics are strings so `| quote` works and "" is falsy.
+engine:
+  maxExecutionDepth: "" # ANVILMQ_MAX_EXECUTION_DEPTH — recursion breaker limit (broker default 10, min 1; always on, only retunable).
+  maxChainSize: "" # ANVILMQ_MAX_CHAIN_SIZE — runaway-chain quarantine cap (broker default 0 = disabled, non-negative).
+  leaseDurationMs: "" # ANVILMQ_LEASE_DURATION_MS — worker lease TTL ms (broker default 30000, min 1000).
+  recoveryIntervalMs: "" # ANVILMQ_RECOVERY_INTERVAL_MS — expired-lease sweep cadence ms (broker default 5000, > 0).
+  recoveryBatchSize: "" # ANVILMQ_RECOVERY_BATCH_SIZE — leases reclaimed per sweep (broker default 100, min 1).
+  fairnessEnabled: false # ANVILMQ_FAIRNESS_ENABLED — equal round-robin fairness across facets (broker default false).
 nodeSelector: {}
 tolerations: []
 affinity: {}

@@ -1,0 +1,60 @@
+# AnvilMQ production-hardened values overlay.
+#
+# Apply on top of the chart defaults with:
+#   helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml
+#
+# This overlay sets ONLY the keys that differ from the safe chart defaults. It
+# is an opinionated hardened baseline; retune the engine and backup values to
+# your workload. Snapshot upload stays disabled here so the shipped profile is
+# schema-valid out of the box and never launches a misconfigured sidecar — see
+# the note on `backup.upload` below to turn it on.
+
+# NORMAL over FULL is a deliberate throughput choice. FULL fsyncs on every
+# commit, which caps sustained completion throughput at roughly 55 ops/s —
+# below the observed peak of ~80 ops/s. NORMAL removes that per-commit fsync
+# ceiling; the recovery point is then bounded by the local snapshot cadence
+# (backup.intervalMs) rather than by per-commit durability.
+durability: NORMAL
+
+logLevel: info
+
+# Sized for a busy single-node broker. Requests reserve steady-state headroom;
+# limits cap bursts without letting the pod monopolize a large node.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# Operational knobs. Each is optional; the chart emits the ANVILMQ_* env var
+# only when set, so anything left "" falls back to the broker's built-in
+# default and validation.
+engine:
+  maxExecutionDepth: "10" # Recursion breaker limit (pinned at the broker default; always on, only retunable).
+  maxChainSize: "" # Runaway-chain quarantine cap. Left at the broker default (0 = disabled); set a positive cap once the workload's legitimate max chain length is known.
+  leaseDurationMs: "30000" # Worker lease TTL ms.
+  recoveryIntervalMs: "5000" # Expired-lease sweep cadence ms.
+  recoveryBatchSize: "100" # Leases reclaimed per sweep.
+  fairnessEnabled: true # Equal round-robin across facets so one tenant/department can't starve others. Note: this changes claim ordering versus the default (unfair) dispatch path.
+
+# Local snapshot writer on: a recent recovery point survives loss of the pod
+# and its volume. Cadence and retain sit in the 1–5 min recovery-point band.
+backup:
+  enabled: true
+  intervalMs: 120000
+  retain: 3
+  # Snapshot upload to Azure Blob Storage is DISABLED here on purpose. To ship
+  # snapshots off-node, fill in the placeholders below and set enabled: true
+  # (either edit this file or pass the values via --set on the CLI). Requires
+  # Azure Workload Identity wired to a user-assigned managed identity — see the
+  # Backups section of the README.
+  upload:
+    enabled: false
+    account: "" # fill in: target storage account name
+    container: "" # fill in: target blob container name
+    prefix: "" # optional key prefix within the container (no leading/trailing slash)
+    workloadIdentity:
+      clientId: "" # fill in: user-assigned managed identity client ID
+      tenantId: "" # fill in: identity tenant ID
