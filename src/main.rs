@@ -396,6 +396,9 @@ impl MyQueueService {
 /// Default worker lease recovery sweep cadence, overridable via `ANVILMQ_RECOVERY_INTERVAL_MS`.
 const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
 
+/// Default execution-depth circuit-breaker limit, overridable via `ANVILMQ_MAX_EXECUTION_DEPTH`.
+const DEFAULT_MAX_EXECUTION_DEPTH: u32 = 10;
+
 /// Sub-second leases churn recovery, so the configured lease must be at least this long.
 const MIN_LEASE_DURATION_MS: i64 = 1_000;
 
@@ -431,6 +434,38 @@ fn parse_recovery_interval_ms(raw: Option<&str>) -> Result<u64, String> {
                 ));
             }
             Ok(parsed as u64)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_MAX_EXECUTION_DEPTH`. Absent -> default; present must be an integer >= 1.
+fn parse_max_execution_depth(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(DEFAULT_MAX_EXECUTION_DEPTH),
+        Some(value) => {
+            let parsed = value.trim().parse::<u32>().map_err(|_| {
+                format!("ANVILMQ_MAX_EXECUTION_DEPTH must be an integer, got {value:?}")
+            })?;
+            if parsed < 1 {
+                return Err(format!("ANVILMQ_MAX_EXECUTION_DEPTH={parsed} must be >= 1"));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_RECOVERY_BATCH_SIZE`. Absent -> default; present must be an integer >= 1.
+fn parse_recovery_batch_size(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(leases::DEFAULT_RECOVERY_BATCH_SIZE),
+        Some(value) => {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                format!("ANVILMQ_RECOVERY_BATCH_SIZE must be an integer, got {value:?}")
+            })?;
+            if parsed < 1 {
+                return Err(format!("ANVILMQ_RECOVERY_BATCH_SIZE={parsed} must be >= 1"));
+            }
+            Ok(parsed)
         }
     }
 }
@@ -529,9 +564,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref(),
     )
     .map_err(std::io::Error::other)?;
+    let recovery_batch_size =
+        parse_recovery_batch_size(std::env::var("ANVILMQ_RECOVERY_BATCH_SIZE").ok().as_deref())
+            .map_err(std::io::Error::other)?;
+    let max_execution_depth =
+        parse_max_execution_depth(std::env::var("ANVILMQ_MAX_EXECUTION_DEPTH").ok().as_deref())
+            .map_err(std::io::Error::other)?;
     tracing::info!(
         lease_duration_ms,
         recovery_interval_ms,
+        recovery_batch_size,
+        max_execution_depth,
         "lease and recovery configured"
     );
     let recovery = tokio::spawn(async move {
@@ -540,7 +583,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match leases::recover_expired(recovery_db.clone()).await {
+            match leases::recover_expired(recovery_db.clone(), recovery_batch_size).await {
                 Ok(count) if count > 0 => tracing::info!(count, "expired claims recovered"),
                 Ok(_) => {}
                 Err(error) => {
@@ -642,10 +685,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_db = db_manager.clone();
     let service = MyQueueService {
         db_manager,
-        max_execution_depth: 10, // Max recursion depth guardrail
-        max_chain_size,          // Runaway-chain quarantine cap; 0 disables
-        fairness_enabled,        // Equal round-robin tenant fairness; off = identical to legacy
-        lease_duration_ms,       // Worker lease TTL; ANVILMQ_LEASE_DURATION_MS (default 30s)
+        max_execution_depth, // Max recursion depth guardrail; ANVILMQ_MAX_EXECUTION_DEPTH (default 10)
+        max_chain_size,      // Runaway-chain quarantine cap; 0 disables
+        fairness_enabled,    // Equal round-robin tenant fairness; off = identical to legacy
+        lease_duration_ms,   // Worker lease TTL; ANVILMQ_LEASE_DURATION_MS (default 30s)
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -740,7 +783,7 @@ mod tests {
     async fn service_with_lease(lease_duration_ms: i64) -> MyQueueService {
         let service = MyQueueService {
             db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
-            max_execution_depth: 10,
+            max_execution_depth: DEFAULT_MAX_EXECUTION_DEPTH,
             max_chain_size: 0,
             fairness_enabled: false,
             lease_duration_ms,
@@ -817,6 +860,32 @@ mod tests {
         assert!(parse_recovery_interval_ms(Some("0")).is_err());
         assert!(parse_recovery_interval_ms(Some("-1")).is_err());
         assert!(parse_recovery_interval_ms(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn max_execution_depth_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_max_execution_depth(None).unwrap(),
+            DEFAULT_MAX_EXECUTION_DEPTH
+        );
+        assert_eq!(parse_max_execution_depth(Some("25")).unwrap(), 25);
+        assert_eq!(parse_max_execution_depth(Some(" 5 ")).unwrap(), 5);
+        assert!(parse_max_execution_depth(Some("0")).is_err());
+        assert!(parse_max_execution_depth(Some("-1")).is_err());
+        assert!(parse_max_execution_depth(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn recovery_batch_size_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_recovery_batch_size(None).unwrap(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        );
+        assert_eq!(parse_recovery_batch_size(Some("250")).unwrap(), 250);
+        assert_eq!(parse_recovery_batch_size(Some(" 50 ")).unwrap(), 50);
+        assert!(parse_recovery_batch_size(Some("0")).is_err());
+        assert!(parse_recovery_batch_size(Some("-1")).is_err());
+        assert!(parse_recovery_batch_size(Some("nope")).is_err());
     }
 
     #[tokio::test]

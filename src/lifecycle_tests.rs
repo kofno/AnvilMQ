@@ -134,9 +134,12 @@ async fn heartbeat_renews_only_valid_claims() {
         .into_inner();
     assert!(renewed.lease_expires_at_ms >= job.lease_expires_at_ms);
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         0
     );
     complete(&service, &id, "worker", 1).await.unwrap();
@@ -173,7 +176,10 @@ async fn expiration_requeues_and_fences_previous_attempt() {
         tonic::Code::FailedPrecondition
     );
     let (recovered, late) = tokio::join!(
-        leases::recover_expired(service.db_manager.clone()),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        ),
         complete(&service, &id, "worker", 1)
     );
     assert_eq!(recovered.unwrap(), 1);
@@ -200,15 +206,21 @@ async fn expiration_requeues_and_fences_previous_attempt() {
     );
     sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0").await;
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         0
     );
     let stored = snapshot(&service).await;
@@ -224,7 +236,10 @@ async fn recovery_and_heartbeat_serialize_without_losing_renewal() {
     claim(&service).await;
     let (renewed, recovered) = tokio::join!(
         heartbeat(&service, &id, "worker", 1),
-        leases::recover_expired(service.db_manager.clone())
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
     );
     renewed.unwrap();
     assert_eq!(recovered.unwrap(), 0);
@@ -237,19 +252,25 @@ async fn recovery_transfer_rolls_back_on_failure() {
     claim(&service).await;
     sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0; CREATE TRIGGER reject_recovery BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END;").await;
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap_err()
-            .code(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap_err()
+        .code(),
         tonic::Code::Internal
     );
     assert_eq!(snapshot(&service).await.0, "Active");
     sql(&service, "DROP TRIGGER reject_recovery").await;
     // A leaked history insert would make this retry fail its unique constraint.
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(snapshot(&service).await.0, "Failed");
@@ -285,9 +306,12 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         0
     );
     assert!(
@@ -309,9 +333,12 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
     };
     assert_eq!(
-        leases::recover_expired(service.db_manager.clone())
-            .await
-            .unwrap(),
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(claim(&service).await.attempts, 2);
@@ -672,9 +699,12 @@ async fn delayed_jobs_and_backoff_wait_until_due() {
         "UPDATE jobs SET lease_expires_at_ms = 0 WHERE name = 'scheduled'",
     )
     .await;
-    leases::recover_expired(service.db_manager.clone())
-        .await
-        .unwrap();
+    leases::recover_expired(
+        service.db_manager.clone(),
+        leases::DEFAULT_RECOVERY_BATCH_SIZE,
+    )
+    .await
+    .unwrap();
     assert!(!claim(&service).await.found);
     let conn = service.db_manager.get_shared_connection();
     let delay: i64 = tokio::task::spawn_blocking(move || {
