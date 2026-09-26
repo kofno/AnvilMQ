@@ -216,7 +216,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 - [x] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`.
 - Backup, restore, and point-in-time recovery — scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook:
   - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).
-  - [ ] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook. The upload sidecar has landed (an `az storage blob upload-batch` poll loop shipping `/data/backups` to Azure Blob Storage via Workload Identity, wired into the Helm chart and off by default — see [Backups](#backups)); the restore runbook remains outstanding.
+  - [x] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook. The upload sidecar ships `/data/backups` to Azure Blob Storage via an `az storage blob upload-batch` poll loop authenticated with Workload Identity, wired into the Helm chart and off by default (see [Backups](#backups)); the restore runbook — single-writer safety rule, Kubernetes maintenance-pod procedure, PVC-lost path, and local flow — is documented in [docs/restore-runbook.md](docs/restore-runbook.md).
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
 
@@ -445,7 +445,7 @@ backup:
 
 **Remote retention is out of band.** The sidecar never deletes remote blobs. Prune old remote snapshots with an **Azure Blob lifecycle-management rule** (age-based deletion scoped to the container/prefix). Local retention (`retain`) and remote retention are therefore independent.
 
-**Restore runbook.** Restoring a broker from a remote snapshot is the next slice (3c) and is not yet documented here.
+**Restore runbook.** To bring a broker back up from a local or remote snapshot — including the single-writer safety rule, the Kubernetes maintenance-pod procedure, and the PVC-lost path — see [docs/restore-runbook.md](docs/restore-runbook.md).
 
 ## Observability
 
