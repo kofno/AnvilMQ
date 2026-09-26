@@ -16,12 +16,18 @@ spec:
     metadata:
       labels:
         {{- include "anvilmq.selectorLabels" . | nindent 8 }}
+        {{- if .Values.backup.upload.enabled }}
+        azure.workload.identity/use: "true"
+        {{- end }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- if .Values.backup.upload.enabled }}
+      serviceAccountName: {{ include "anvilmq.name" . }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -61,6 +67,16 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: ANVILMQ_METRICS_QUEUES
               value: {{ join "," .Values.metricsQueues | quote }}
+            {{- if .Values.backup.enabled }}
+            - name: ANVILMQ_BACKUP_ENABLED
+              value: "true"
+            - name: ANVILMQ_BACKUP_DIR
+              value: /data/backups
+            - name: ANVILMQ_BACKUP_INTERVAL_MS
+              value: {{ .Values.backup.intervalMs | quote }}
+            - name: ANVILMQ_BACKUP_RETAIN
+              value: {{ .Values.backup.retain | quote }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051
@@ -93,10 +109,66 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+        {{- if .Values.backup.upload.enabled }}
+        - name: backup-upload
+          image: {{ printf "%s:%s" .Values.backup.upload.image.repository .Values.backup.upload.image.tag | quote }}
+          imagePullPolicy: {{ .Values.backup.upload.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Azure Workload Identity: the webhook injects AZURE_CLIENT_ID,
+            # AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and AZURE_AUTHORITY_HOST
+            # from the pod label + annotated ServiceAccount. No secrets needed.
+            # Give `az` a writable config/profile dir on the scratch emptyDir so
+            # the root filesystem can stay read-only.
+            - name: AZURE_CONFIG_DIR
+              value: /azure
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dest_prefix="{{ with .Values.backup.upload.prefix }}{{ . }}{{ end }}"
+              while true; do
+                if az login --service-principal \
+                    -u "$AZURE_CLIENT_ID" \
+                    -t "$AZURE_TENANT_ID" \
+                    --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" \
+                    --allow-no-subscriptions >/dev/null; then
+                  az storage blob upload-batch \
+                    --account-name {{ .Values.backup.upload.account | quote }} \
+                    --destination "{{ .Values.backup.upload.container }}${dest_prefix:+/$dest_prefix}" \
+                    --source /data/backups \
+                    --pattern 'snapshot-*.db' \
+                    --auth-mode login \
+                    --overwrite false \
+                    || echo "blob upload failed; retrying next tick"
+                else
+                  echo "az login failed; retrying next tick"
+                fi
+                sleep {{ .Values.backup.upload.pollSeconds }}
+              done
+          resources:
+            {{- toYaml .Values.backup.upload.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: cli-scratch
+              mountPath: /azure
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 128Mi
+        {{- if .Values.backup.upload.enabled }}
+        - name: cli-scratch
+          emptyDir:
+            sizeLimit: 128Mi
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

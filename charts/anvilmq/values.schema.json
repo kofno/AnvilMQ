@@ -44,6 +44,52 @@
         "sidecarValue": { "type": "string", "minLength": 1 },
         "namespace": { "type": "string" }
       }
+    },
+    "backup": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "intervalMs": { "type": "integer", "minimum": 1 },
+        "retain": { "type": "integer", "minimum": 1 },
+        "upload": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string", "minLength": 1 },
+                "tag": { "type": "string", "minLength": 1 },
+                "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+              }
+            },
+            "account": { "type": "string" },
+            "container": { "type": "string" },
+            "prefix": { "type": "string" },
+            "pollSeconds": { "type": "integer", "minimum": 1 },
+            "workloadIdentity": {
+              "type": "object",
+              "properties": {
+                "clientId": { "type": "string" },
+                "tenantId": { "type": "string" }
+              }
+            },
+            "resources": { "type": "object" }
+          },
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": {
+            "properties": {
+              "account": { "type": "string", "minLength": 1 },
+              "container": { "type": "string", "minLength": 1 },
+              "workloadIdentity": {
+                "type": "object",
+                "required": ["clientId"],
+                "properties": { "clientId": { "type": "string", "minLength": 1 } }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
