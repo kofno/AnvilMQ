@@ -85,7 +85,7 @@ The execution-depth cap only holds if callers honestly propagate and increment `
 
 These two controls guard a lineage along **two independent axes that are easy to conflate** — how *deep* it recurses versus how *large* it grows — and a workflow can trip either without the other.
 
-- **Depth** — the execution-depth circuit breaker bounds how **deep** a lineage recurses (the length of the parent → child path). A job whose server-derived `execution_depth` exceeds the maximum — fixed at `10`, always on — is rejected with `RESOURCE_EXHAUSTED` ("Circuit breaker tripped …"). A deep, narrow chain trips it.
+- **Depth** — the execution-depth circuit breaker bounds how **deep** a lineage recurses (the length of the parent → child path). A job whose server-derived `execution_depth` exceeds the maximum — configurable via `ANVILMQ_MAX_EXECUTION_DEPTH` (default `10`), always on — is rejected with `RESOURCE_EXHAUSTED` ("Circuit breaker tripped …"). A deep, narrow chain trips it.
 - **Size** — the runaway-chain quarantine bounds how **large** a lineage grows (the total number of jobs sharing one root `trace_id`, regardless of depth). Once that lineage total reaches `ANVILMQ_MAX_CHAIN_SIZE`, further enqueues are quarantined with `RESOURCE_EXHAUSTED` ("chain quarantined …"). It is off by default (`0`/unset). A shallow, massively fanned-out chain trips it.
 
 Both reject with `RESOURCE_EXHAUSTED`, but they are distinguishable in telemetry. Depth-breaker trips (together with the other ancestry-integrity rejections, `parent_not_found` and `inconsistent_depth`) roll up into `anvilmq_ancestry_rejections_total`; size quarantines roll up into `anvilmq_chain_quarantines_total`; and every kind is broken out individually in `/v1/rejections` and `anvilmq_enqueue_rejections_total{kind}` (`circuit_breaker` vs `chain_quarantine`). A **flat `anvilmq_chain_quarantines_total` alongside a climbing `anvilmq_ancestry_rejections_total`** therefore means paths are getting too deep but no lineage is oversized — often simply because the size quarantine is disabled.
@@ -101,6 +101,7 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Max jobs per lineage (`trace_id`) before further enqueues are quarantined. |
+| `ANVILMQ_MAX_EXECUTION_DEPTH` | `10` | Max lineage recursion depth before the execution-depth circuit breaker rejects an enqueue with `RESOURCE_EXHAUSTED`. Must be an integer `>= 1`; a present-but-invalid value fails startup. |
 | `ANVILMQ_MAX_CHAIN_COUNTER_TTL_MS` | `604800000` (7d) | Idle age after which a lineage counter row is pruned by the retention sweeper. `0` disables the prune. |
 
 ### Delays and retry backoff
@@ -133,14 +134,15 @@ Call `Heartbeat` with `id`, `worker_id`, and the positive `attempt` from dequeue
 
 For live jobs, heartbeat, completion, and failure require a matching, unexpired Active claim. Expiration is inclusive (`deadline <= server time`). Expired claims return FailedPrecondition even before recovery runs; a heartbeat cannot resurrect them. A stale attempt cannot acknowledge or renew a newer claim, including when the same worker ID is reused. Already committed completions can be replayed as described below. Stop processing when ownership is lost; the broker cannot cancel external side effects already in progress.
 
-The daemon runs recovery immediately on startup and every five seconds thereafter by default (configurable via `ANVILMQ_RECOVERY_INTERVAL_MS`). Each immediate transaction handles up to 100 expired claims. Jobs with attempts remaining are rescheduled using their backoff policy with ownership and lease cleared; exhausted jobs move atomically to Failed history. Recovery records `Worker lease expired`, preserves the attempt count, and logs recovered counts or errors. Failed batches roll back and retry on the next tick. Large backlogs may take multiple ticks to drain.
+The daemon runs recovery immediately on startup and every five seconds thereafter by default (configurable via `ANVILMQ_RECOVERY_INTERVAL_MS`). Each immediate transaction handles up to a bounded batch of expired claims, configurable via `ANVILMQ_RECOVERY_BATCH_SIZE` (default 100). Jobs with attempts remaining are rescheduled using their backoff policy with ownership and lease cleared; exhausted jobs move atomically to Failed history. Recovery records `Worker lease expired`, preserves the attempt count, and logs recovered counts or errors. Failed batches roll back and retry on the next tick. Large backlogs may take multiple ticks to drain.
 
 Lease duration defaults to 30 seconds (`LEASE_DURATION_MS = 30_000` in `src/leases.rs`) and is configurable at startup via `ANVILMQ_LEASE_DURATION_MS`, which must be an integer of at least `1000` (sub-second leases churn recovery). The recovery interval defaults to five seconds and is configurable via `ANVILMQ_RECOVERY_INTERVAL_MS` (positive integer milliseconds). Both are validated at startup, and a present-but-invalid value is a hard startup error. Raising the lease duration also raises the retention safety floor to `lease * 2`. Expirations persist across restarts and use the server's wall clock; keep the host clock synchronized. Forward clock jumps can expire work early, and backward jumps can delay recovery.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ANVILMQ_LEASE_DURATION_MS` | `30000` | Worker lease TTL in milliseconds, applied to fresh claims and heartbeat renewals. Must be an integer `>= 1000`; a present-but-invalid value fails startup. Also sets the retention age-prune safety floor (`lease * 2`). |
-| `ANVILMQ_RECOVERY_INTERVAL_MS` | `5000` | Cadence in milliseconds of the background sweep that recovers expired claims. Must be a positive integer; a present-but-invalid value fails startup. Does not change the per-sweep recovery batch size (fixed at 100). |
+| `ANVILMQ_RECOVERY_INTERVAL_MS` | `5000` | Cadence in milliseconds of the background sweep that recovers expired claims. Must be a positive integer; a present-but-invalid value fails startup. |
+| `ANVILMQ_RECOVERY_BATCH_SIZE` | `100` | Max expired claims recovered per sweep transaction, bounding writer contention under a large backlog. Must be an integer `>= 1`; a present-but-invalid value fails startup. |
 
 Delivery is at-least-once; see [Delivery and execution semantics](#delivery-and-execution-semantics).
 
@@ -210,7 +212,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 
 - Runtime configuration for operational knobs:
   - [x] Lease duration (`ANVILMQ_LEASE_DURATION_MS`) and recovery interval (`ANVILMQ_RECOVERY_INTERVAL_MS`) are runtime-configurable and validated at startup; durability mode is already runtime-selectable via `ANVILMQ_DURABILITY`.
-  - [ ] Expose the remaining compile-time constants — the execution-depth breaker limit and the per-sweep recovery batch size (`LIMIT 100`) — as validated runtime configuration.
+  - [x] Expose the remaining compile-time constants as validated runtime configuration: the execution-depth breaker limit (`ANVILMQ_MAX_EXECUTION_DEPTH`, default `10`) and the per-sweep recovery batch size (`ANVILMQ_RECOVERY_BATCH_SIZE`, default `100`) are now runtime-configurable and validated at startup.
 - [x] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`.
 - Backup, restore, and point-in-time recovery — scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook:
   - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).

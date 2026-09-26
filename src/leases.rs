@@ -11,6 +11,10 @@ use tonic::Status;
 /// the configured value is carried on `MyQueueService::lease_duration_ms`.
 pub const LEASE_DURATION_MS: i64 = 30_000;
 
+/// Default per-sweep recovery batch size. Overridable at startup via `ANVILMQ_RECOVERY_BATCH_SIZE`;
+/// bounds each recovery transaction so a large expired backlog cannot monopolize the writer.
+pub const DEFAULT_RECOVERY_BATCH_SIZE: usize = 100;
+
 // Read wall time after acquiring the write lock, never before waiting for it.
 pub fn now_ms(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row(
@@ -54,7 +58,7 @@ impl MyQueueService {
     }
 }
 
-pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> {
+pub async fn recover_expired(db: Arc<DatabaseManager>, batch_size: usize) -> Result<usize, Status> {
     let metrics = db.metrics.clone();
     let conn = db.get_shared_connection();
     tokio::task::spawn_blocking(move || -> rusqlite::Result<usize> {
@@ -63,8 +67,8 @@ pub async fn recover_expired(db: Arc<DatabaseManager>) -> Result<usize, Status> 
         let now = now_ms(&tx)?;
         // Bound each transaction so a large expired backlog cannot monopolize the writer.
         let jobs = {
-            let mut statement = tx.prepare("SELECT id, attempts, max_attempts, retry_backoff_ms, retry_backoff_max_ms, name, created_at FROM jobs WHERE state = 'Active' AND lease_expires_at_ms <= ?1 ORDER BY lease_expires_at_ms, id LIMIT 100")?;
-            let rows = statement.query_map([now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?)))?;
+            let mut statement = tx.prepare("SELECT id, attempts, max_attempts, retry_backoff_ms, retry_backoff_max_ms, name, created_at FROM jobs WHERE state = 'Active' AND lease_expires_at_ms <= ?1 ORDER BY lease_expires_at_ms, id LIMIT ?2")?;
+            let rows = statement.query_map(rusqlite::params![now, batch_size as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (id, attempts, max_attempts, base, cap, _name, _created_at) in &jobs {
