@@ -122,27 +122,33 @@ spec:
             # Azure Workload Identity: the webhook injects AZURE_CLIENT_ID,
             # AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and AZURE_AUTHORITY_HOST
             # from the pod label + annotated ServiceAccount. No secrets needed.
-            - name: AZCOPY_AUTO_LOGIN_TYPE
-              value: WORKLOAD
-            # Keep azcopy's HOME/log/plan under a writable emptyDir so the root
-            # filesystem can stay read-only.
-            - name: HOME
-              value: /azcopy
-            - name: AZCOPY_LOG_LOCATION
-              value: /azcopy/log
-            - name: AZCOPY_JOB_PLAN_LOCATION
-              value: /azcopy/plans
+            # Give `az` a writable config/profile dir on the scratch emptyDir so
+            # the root filesystem can stay read-only.
+            - name: AZURE_CONFIG_DIR
+              value: /azure
           command:
             - /bin/sh
             - -c
             - |
               set -eu
-              dest="https://{{ .Values.backup.upload.account }}.blob.core.windows.net/{{ .Values.backup.upload.container }}{{ with .Values.backup.upload.prefix }}/{{ . }}{{ end }}"
+              dest_prefix="{{ with .Values.backup.upload.prefix }}{{ . }}{{ end }}"
               while true; do
-                azcopy sync /data/backups "$dest" \
-                  --include-pattern 'snapshot-*.db' \
-                  --delete-destination=false \
-                  || echo "azcopy sync failed; retrying next tick"
+                if az login --service-principal \
+                    -u "$AZURE_CLIENT_ID" \
+                    -t "$AZURE_TENANT_ID" \
+                    --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" \
+                    --allow-no-subscriptions >/dev/null; then
+                  az storage blob upload-batch \
+                    --account-name {{ .Values.backup.upload.account | quote }} \
+                    --destination "{{ .Values.backup.upload.container }}${dest_prefix:+/$dest_prefix}" \
+                    --source /data/backups \
+                    --pattern 'snapshot-*.db' \
+                    --auth-mode login \
+                    --overwrite false \
+                    || echo "blob upload failed; retrying next tick"
+                else
+                  echo "az login failed; retrying next tick"
+                fi
                 sleep {{ .Values.backup.upload.pollSeconds }}
               done
           resources:
@@ -151,15 +157,15 @@ spec:
             - name: data
               mountPath: /data
               readOnly: true
-            - name: azcopy-scratch
-              mountPath: /azcopy
+            - name: cli-scratch
+              mountPath: /azure
         {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 128Mi
         {{- if .Values.backup.upload.enabled }}
-        - name: azcopy-scratch
+        - name: cli-scratch
           emptyDir:
             sizeLimit: 128Mi
         {{- end }}

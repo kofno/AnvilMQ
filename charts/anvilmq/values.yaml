@@ -37,14 +37,14 @@ backup:
   # pruned locally after each write. Remote pruning is out of band (see below).
   retain: 3
   upload:
-    # Ship /data/backups to Azure Blob Storage with an `azcopy sync` poll loop.
-    # Implies backup.enabled. Authenticates via Azure Workload Identity — no
-    # secrets or connection strings. Remote retention is an Azure Blob
-    # lifecycle-management rule, NOT the sidecar (it never deletes remote blobs).
+    # Ship /data/backups to Azure Blob Storage with a poll loop that federated-
+    # logs in and runs `az storage blob upload-batch`. Implies backup.enabled.
+    # Authenticates via Azure Workload Identity — no secrets or connection
+    # strings. Remote retention is an Azure Blob lifecycle-management rule, NOT
+    # the sidecar (it never deletes remote blobs).
     enabled: false
-    # Sidecar image. MUST contain the `azcopy` binary. The default is a sensible
-    # starting point; operators may swap it for a pinned/mirrored image that
-    # bundles azcopy.
+    # Sidecar image. MUST contain the Azure CLI (`az`). The default ships it;
+    # operators may swap it for a pinned/mirrored image that bundles `az`.
     image:
       repository: mcr.microsoft.com/azure-cli
       tag: "2.64.0"
