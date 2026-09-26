@@ -48,7 +48,7 @@ Wait for the pod to be **gone**. With the broker pod deleted you cannot `kubectl
 
 ### 2. Start a maintenance pod on the PVC
 
-Save this as `maint.yaml` and apply it in the release namespace. It mounts the existing claim `data-<release>-anvilmq-0` at `/data` as the same user the broker runs as. Use an image that has a shell plus `sqlite3` (and, if you pull from Blob, the Azure CLI). `mcr.microsoft.com/azure-cli` bundles `az`; install `sqlite3` into it at runtime, or swap in your own maintenance image.
+Save this as `maint.yaml` and apply it in the release namespace. It mounts the existing claim `data-<release>-anvilmq-0` at `/data` as the same non-root user the broker runs as (`runAsUser: 10001`), so a copied-in file lands broker-owned with no `chown` needed. `mcr.microsoft.com/azure-cli` bundles a shell plus `az`; swap in any image that has a shell. Note the pod is `runAsNonRoot`/`runAsUser: 10001`, so it **cannot `apk add`/`apt-get install`** anything at runtime — if you need an in-pod `sqlite3` or in-pod Blob auth, see the notes in [step 3](#3-remote-only-download-the-snapshot) and [step 5](#5-validate-before-starting-the-broker).
 
 ```yaml
 apiVersion: v1
@@ -85,14 +85,42 @@ If the PVC was **lost**, see [PVC lost](#pvc-lost) below before this step.
 
 ### 3. (Remote only) download the snapshot
 
-Skip if you are restoring from `/data/backups/` already on the PVC. Pulling from Blob needs an identity/role with **read** on the container (e.g. Storage Blob Data Reader). Inside the maintenance pod:
+Skip if you are restoring from `/data/backups/` already on the PVC. Reading from Blob needs an identity/role with **read** on the container (e.g. Storage Blob Data Reader; the broker's own upload identity already has Blob Data Contributor, which includes read).
+
+**Primary path (break-glass, no in-pod auth).** During an incident the simplest approach is to download the snapshot from a workstation or bastion that is already signed in to Azure, then copy it into the maintenance pod. This keeps all credentials off the pod:
+
+```bash
+# On a workstation already `az login`'d with an identity that can read the container:
+az storage blob download \
+  --account-name <account> --container-name <container> \
+  --name <prefix>/snapshot-<ts>.db --file ./snapshot-<ts>.db --auth-mode login
+
+kubectl cp ./snapshot-<ts>.db anvil-restore:/data/backups/snapshot-<ts>.db
+```
+
+**Alternative: download inside the maintenance pod.** If you must pull from Blob in-cluster, the pod needs the broker's federated identity. Add the workload-identity label and ServiceAccount to `maint.yaml` (under `metadata.labels` and `spec` respectively):
+
+```yaml
+metadata:
+  name: anvil-restore
+  labels:
+    azure.workload.identity/use: "true"
+spec:
+  serviceAccountName: <release>-anvilmq   # reuses the broker's federated identity
+```
+
+The Azure CLI does **not** auto-consume workload identity the way the SDK does, so you must run an explicit federated `az login` first (the same preamble the upload sidecar uses) before any `az storage` call:
 
 ```sh
-# newest single blob, or the whole prefix:
+az login --service-principal \
+  -u "$AZURE_CLIENT_ID" -t "$AZURE_TENANT_ID" \
+  --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" \
+  --allow-no-subscriptions
+
+# newest single blob, or mirror the whole prefix:
 az storage blob download \
   --account-name <account> --container-name <container> \
   --name <prefix>/snapshot-<ts>.db --file /data/backups/snapshot-<ts>.db --auth-mode login
-# or, to mirror the prefix locally:
 az storage blob download-batch \
   --account-name <account> --source <container> \
   --pattern '<prefix>/snapshot-*.db' --destination /data/backups --auth-mode login
@@ -116,7 +144,9 @@ chmod 600 anvil.db
 
 ### 5. Validate before starting the broker
 
-`sqlite3` may not be in the image; install it (`apk add --no-cache sqlite` / `tdnf install -y sqlite` / `apt-get install -y sqlite3`, depending on the base) or skip to letting broker startup be the validation — a clean startup is itself the ultimate check.
+**Broker startup is the ultimate validation** — a clean start (step 6) proves the file opens, migrates, and recovers. Treat that as the primary check; the optional pre-start `PRAGMA integrity_check` below just catches a bad file sooner.
+
+Running the integrity check in-pod needs a `sqlite3` binary, and the maintenance pod above is `runAsNonRoot`/`runAsUser: 10001`, so it **cannot install packages**. Two options: use a maintenance image that already bundles `sqlite3`, or, as a transient break-glass choice, start the maintenance pod as root (`runAsUser: 0`, drop `runAsNonRoot`) solely for this check. Either way:
 
 ```sh
 sqlite3 anvil.db 'PRAGMA integrity_check;'          # expect: ok
@@ -124,7 +154,7 @@ sqlite3 anvil.db 'SELECT count(*) FROM jobs;'        # live jobs restored
 sqlite3 anvil.db 'SELECT count(*) FROM job_history;' # completed-job receipts restored
 ```
 
-A clean `integrity_check` and sane counts mean the file is good. Then delete the maintenance pod so nothing else holds the volume:
+A clean `integrity_check` and sane counts mean the file is good. If you skipped it, rely on broker startup instead. Then delete the maintenance pod so nothing else holds the volume:
 
 ```sh
 exit
