@@ -67,6 +67,30 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: ANVILMQ_METRICS_QUEUES
               value: {{ join "," .Values.metricsQueues | quote }}
+            {{- if .Values.engine.maxExecutionDepth }}
+            - name: ANVILMQ_MAX_EXECUTION_DEPTH
+              value: {{ .Values.engine.maxExecutionDepth | quote }}
+            {{- end }}
+            {{- if .Values.engine.maxChainSize }}
+            - name: ANVILMQ_MAX_CHAIN_SIZE
+              value: {{ .Values.engine.maxChainSize | quote }}
+            {{- end }}
+            {{- if .Values.engine.leaseDurationMs }}
+            - name: ANVILMQ_LEASE_DURATION_MS
+              value: {{ .Values.engine.leaseDurationMs | quote }}
+            {{- end }}
+            {{- if .Values.engine.recoveryIntervalMs }}
+            - name: ANVILMQ_RECOVERY_INTERVAL_MS
+              value: {{ .Values.engine.recoveryIntervalMs | quote }}
+            {{- end }}
+            {{- if .Values.engine.recoveryBatchSize }}
+            - name: ANVILMQ_RECOVERY_BATCH_SIZE
+              value: {{ .Values.engine.recoveryBatchSize | quote }}
+            {{- end }}
+            {{- if .Values.engine.fairnessEnabled }}
+            - name: ANVILMQ_FAIRNESS_ENABLED
+              value: "true"
+            {{- end }}
             {{- if .Values.backup.enabled }}
             - name: ANVILMQ_BACKUP_ENABLED
               value: "true"

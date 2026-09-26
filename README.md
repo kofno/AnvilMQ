@@ -217,7 +217,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 - Backup, restore, and point-in-time recovery — scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook:
   - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).
   - [x] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook. The upload sidecar ships `/data/backups` to Azure Blob Storage via an `az storage blob upload-batch` poll loop authenticated with Workload Identity, wired into the Helm chart and off by default (see [Backups](#backups)); the restore runbook — single-writer safety rule, Kubernetes maintenance-pod procedure, PVC-lost path, and local flow — is documented in [docs/restore-runbook.md](docs/restore-runbook.md).
-- [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
+- [x] Production-hardened Helm values profile: the chart surfaces the operational knobs (execution-depth breaker, runaway-chain cap, lease duration, recovery interval/batch, tenant fairness, durability) as optional values, and a bundled `values-production.yaml` layers an opinionated hardened profile (NORMAL durability, local snapshots on, tenant fairness on). The execution-depth breaker is always on; its limit is configurable. Faceted dispatch and ingress velocity limits are per-facet rules provisioned at runtime through the `UpsertRateLimitRule`/`UpsertIngressLimitRule` gRPC RPCs, not chart values (see the [Production profile](#production-profile) section).
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
 
 #### Phase 5b: Consensus and replicated high availability (deferred)
@@ -446,6 +446,56 @@ backup:
 **Remote retention is out of band.** The sidecar never deletes remote blobs. Prune old remote snapshots with an **Azure Blob lifecycle-management rule** (age-based deletion scoped to the container/prefix). Local retention (`retain`) and remote retention are therefore independent.
 
 **Restore runbook.** To bring a broker back up from a local or remote snapshot — including the single-writer safety rule, the Kubernetes maintenance-pod procedure, and the PVC-lost path — see [docs/restore-runbook.md](docs/restore-runbook.md).
+
+## Production profile
+
+The chart surfaces the broker's operational knobs as an optional `engine` values block, and ships an opinionated overlay, [`charts/anvilmq/values-production.yaml`](charts/anvilmq/values-production.yaml), that operators layer with `-f`:
+
+```bash
+helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml
+```
+
+The overlay picks NORMAL durability (a deliberate throughput choice — FULL's per-commit fsync caps sustained completion throughput near 55 ops/s, below the observed ~80 ops/s peak; the recovery point is then bounded by the local snapshot cadence), tuned resource requests/limits, tenant fairness on, and the local snapshot writer on (2 min cadence, retain 3). Snapshot **upload stays disabled** in the shipped profile so it is schema-valid and never launches a misconfigured sidecar. To ship snapshots off-node, enable it (edit the overlay or pass the values on the CLI):
+
+```bash
+helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml \
+  --set backup.upload.enabled=true \
+  --set backup.upload.account=<account> \
+  --set backup.upload.container=<container> \
+  --set backup.upload.workloadIdentity.clientId=<client-id> \
+  --set backup.upload.workloadIdentity.tenantId=<tenant-id>
+```
+
+### Engine knobs
+
+Each `engine` key is optional. An empty string (or `false`) means "use the broker's built-in default", and the chart emits the matching env var **only** when a value is set — defaults and range validation stay single-sourced in the binary, which fails startup on a present-but-invalid value.
+
+| values key | env var | broker default | meaning |
+| --- | --- | --- | --- |
+| `engine.maxExecutionDepth` | `ANVILMQ_MAX_EXECUTION_DEPTH` | `10` | Execution-depth circuit-breaker limit (min 1). Always on; only the limit is tunable. |
+| `engine.maxChainSize` | `ANVILMQ_MAX_CHAIN_SIZE` | `0` (disabled) | Runaway-chain quarantine cap (non-negative). |
+| `engine.leaseDurationMs` | `ANVILMQ_LEASE_DURATION_MS` | `30000` | Worker lease TTL in ms (min 1000). |
+| `engine.recoveryIntervalMs` | `ANVILMQ_RECOVERY_INTERVAL_MS` | `5000` | Expired-lease sweep cadence in ms (> 0). |
+| `engine.recoveryBatchSize` | `ANVILMQ_RECOVERY_BATCH_SIZE` | `100` | Leases reclaimed per sweep (min 1). |
+| `engine.fairnessEnabled` | `ANVILMQ_FAIRNESS_ENABLED` | `false` | Equal round-robin fairness across facets. Emitted only when `true`. |
+
+A default `helm install` (without the overlay) sets none of these keys, so it renders exactly as before — the new values are inert until set.
+
+### Runtime-provisioned limits
+
+Faceted **dispatch** rate limits and **ingress velocity** limits are intentionally *not* part of this profile. They are per-facet/per-tenant rules — runtime RPC data, not chart config — applied while the broker is running via the `UpsertRateLimitRule` and `UpsertIngressLimitRule` gRPC RPCs (see [proto/queue.proto](proto/queue.proto)). There is no global env or values toggle for them, so the chart cannot enable them by default. Provision them per facet after deploy, e.g. with [`grpcurl`](https://github.com/fullstorydev/grpcurl):
+
+```bash
+# Dispatch-side fixed-window limit: at most 100 jobs per 60s for facet "tenant-a".
+grpcurl -plaintext -d '{"facet_pattern":"tenant-a","max_jobs":100,"window_duration_ms":60000}' \
+  anvilmq:50051 queue.v1.QueueService/UpsertRateLimitRule
+
+# Admission-side sliding-window ingress limit for the same facet.
+grpcurl -plaintext -d '{"facet_pattern":"tenant-a","max_jobs":100,"window_duration_ms":60000}' \
+  anvilmq:50051 queue.v1.QueueService/UpsertIngressLimitRule
+```
+
+See [Faceted rate limits](#faceted-rate-limits) and [Ingress velocity limits](#ingress-velocity-limits) for the semantics.
 
 ## Observability
 

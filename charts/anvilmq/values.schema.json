@@ -7,6 +7,18 @@
     "durability": { "type": "string", "enum": ["NORMAL", "FULL"] },
     "logLevel": { "type": "string", "minLength": 1 },
     "metricsQueues": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^,\\s](?:[^,]*[^,\\s])?$" } },
+    "engine": {
+      "type": "object",
+      "description": "Optional broker operational knobs. Empty string / false means use the broker's built-in default; range validation is owned by the binary.",
+      "properties": {
+        "maxExecutionDepth": { "type": "string", "pattern": "^$|^[0-9]+$" },
+        "maxChainSize": { "type": "string", "pattern": "^$|^[0-9]+$" },
+        "leaseDurationMs": { "type": "string", "pattern": "^$|^[0-9]+$" },
+        "recoveryIntervalMs": { "type": "string", "pattern": "^$|^[0-9]+$" },
+        "recoveryBatchSize": { "type": "string", "pattern": "^$|^[0-9]+$" },
+        "fairnessEnabled": { "type": "boolean" }
+      }
+    },
     "image": {
       "type": "object", "required": ["repository", "tag", "digest", "pullPolicy"],
       "properties": {
