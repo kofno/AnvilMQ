@@ -55,7 +55,7 @@ backup:
     container: ""
     # Optional key prefix within the container (no leading/trailing slash).
     prefix: ""
-    # Poll interval for the azcopy sync loop, in seconds.
+    # Poll interval for the upload loop, in seconds.
     pollSeconds: 30
     # Azure Workload Identity wiring. clientId is the user-assigned managed
     # identity's client ID; the chart annotates its ServiceAccount with it and
@@ -63,7 +63,7 @@ backup:
     workloadIdentity:
       clientId: ""
       tenantId: ""
-    # Sidecar resource requests/limits (kept small; azcopy is I/O bound).
+    # Sidecar resource requests/limits (kept small; the upload loop is I/O bound).
     resources:
       requests:
         cpu: 50m
