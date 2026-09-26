@@ -24,6 +24,53 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 podAnnotations: {}
+# Backups: the broker's local snapshot writer plus an optional upload sidecar.
+# Everything here is OFF by default, so a default install is unchanged.
+backup:
+  # Enable the broker's local snapshot writer. Emits ANVILMQ_BACKUP_* env and
+  # writes snapshots to /data/backups on the data PVC (shared with the sidecar).
+  enabled: false
+  # Snapshot cadence in milliseconds (ANVILMQ_BACKUP_INTERVAL_MS). Keep within
+  # the 1–5 min recovery-point band.
+  intervalMs: 120000
+  # Most-recent local snapshots to keep (ANVILMQ_BACKUP_RETAIN); older ones are
+  # pruned locally after each write. Remote pruning is out of band (see below).
+  retain: 3
+  upload:
+    # Ship /data/backups to Azure Blob Storage with an `azcopy sync` poll loop.
+    # Implies backup.enabled. Authenticates via Azure Workload Identity — no
+    # secrets or connection strings. Remote retention is an Azure Blob
+    # lifecycle-management rule, NOT the sidecar (it never deletes remote blobs).
+    enabled: false
+    # Sidecar image. MUST contain the `azcopy` binary. The default is a sensible
+    # starting point; operators may swap it for a pinned/mirrored image that
+    # bundles azcopy.
+    image:
+      repository: mcr.microsoft.com/azure-cli
+      tag: "2.64.0"
+      pullPolicy: IfNotPresent
+    # Target storage account name (e.g. examplesa). Required when upload.enabled.
+    account: ""
+    # Target blob container name. Required when upload.enabled.
+    container: ""
+    # Optional key prefix within the container (no leading/trailing slash).
+    prefix: ""
+    # Poll interval for the azcopy sync loop, in seconds.
+    pollSeconds: 30
+    # Azure Workload Identity wiring. clientId is the user-assigned managed
+    # identity's client ID; the chart annotates its ServiceAccount with it and
+    # labels the pod azure.workload.identity/use: "true". Required when enabled.
+    workloadIdentity:
+      clientId: ""
+      tenantId: ""
+    # Sidecar resource requests/limits (kept small; azcopy is I/O bound).
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
 networkPolicy:
   enabled: true
   # Same-namespace callers must have this label. Override peers for cross-namespace access.

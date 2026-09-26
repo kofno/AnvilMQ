@@ -214,7 +214,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
 - [x] StatefulSet and persistent storage lifecycle: a durable volume for the embedded database, a WAL checkpoint on graceful shutdown, and fast startup recovery of in-flight jobs. The durable volume and fast startup recovery ship with the existing StatefulSet; the daemon drains in-flight work and runs `PRAGMA wal_checkpoint(TRUNCATE)` on `SIGTERM`/`Ctrl-C`.
 - Backup, restore, and point-in-time recovery — scheduled atomic database snapshots to object storage (optionally continuous streaming for a tighter recovery point), with a documented restore runbook:
   - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).
-  - [ ] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook.
+  - [ ] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook. The upload sidecar has landed (an `azcopy sync` poll loop shipping `/data/backups` to Azure Blob Storage via Workload Identity, wired into the Helm chart and off by default — see [Backups](#backups)); the restore runbook remains outstanding.
 - [ ] Production-hardened Helm values profile: execution-depth breaker (always on), faceted dispatch limits, and ingress velocity limits enabled by default.
 - [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
 
@@ -396,7 +396,7 @@ A background snapshot writer produces consistent, self-contained copies of the e
 - A backup failure is logged at error and increments `anvilmq_backup_failures_total`; it never crashes the broker, which retries on the next tick. `anvilmq_last_backup_timestamp_ms` lets operators alert on stale backups.
 - Against a non-file-backed database (e.g. the in-memory unit-test databases) a run is a harmless no-op.
 
-This covers **local snapshot production only**. Shipping snapshots to object storage — via a swappable upload sidecar — and the full restore runbook are follow-up slices in this phase; no object-store dependency is compiled into the broker.
+This covers **local snapshot production**. Shipping those snapshots off the node is handled by an optional upload sidecar (below); no object-store dependency is compiled into the broker.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -404,6 +404,46 @@ This covers **local snapshot production only**. Shipping snapshots to object sto
 | `ANVILMQ_BACKUP_INTERVAL_MS` | `120000` (2 min) | Snapshot cadence in milliseconds. Must be `> 0`; a present-but-invalid value fails startup. |
 | `ANVILMQ_BACKUP_DIR` | `backups` | Directory for local snapshots, created if missing. Must be non-empty when backups are enabled. |
 | `ANVILMQ_BACKUP_RETAIN` | `3` | Number of most-recent local snapshots to keep. Must be `>= 1`; older snapshots are pruned after each write. |
+
+### Shipping snapshots to Azure Blob Storage (upload sidecar)
+
+The Helm chart can add an optional **upload sidecar** that ships local snapshots to Azure Blob Storage. Both are off by default; a default `helm install` renders exactly as before.
+
+- **Shared backups directory.** When `backup.enabled` is set, the chart points the broker at `ANVILMQ_BACKUP_DIR=/data/backups` — a directory on the same `data` PVC that holds the database. When `backup.upload.enabled` is also set, the sidecar mounts that PVC read-only and reads `/data/backups`. Both containers share the RWO volume because they are always co-scheduled in the same pod, so a snapshot taken just before a crash survives a pod reschedule.
+- **Idempotent, non-destructive sync.** The sidecar runs a poll loop that invokes `azcopy sync /data/backups "<account>.blob.core.windows.net/<container>[/<prefix>]" --include-pattern 'snapshot-*.db' --delete-destination=false` every `backup.upload.pollSeconds` (default 30). `azcopy sync` only transfers new/changed files, and `--delete-destination=false` means the broker's local retain-K reaping never propagates a delete to the remote container.
+- **Workload Identity, no secrets.** The sidecar sets `AZCOPY_AUTO_LOGIN_TYPE=WORKLOAD`. The chart labels the pod `azure.workload.identity/use: "true"` and creates a ServiceAccount annotated with `azure.workload.identity/client-id`. The workload-identity webhook then injects `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, and `AZURE_AUTHORITY_HOST` — no connection strings or account keys are stored anywhere.
+- **Strict, read-only root.** The sidecar keeps the same hardened `securityContext` as the broker (non-root, `readOnlyRootFilesystem: true`, all capabilities dropped, no privilege escalation). A small writable `azcopy-scratch` emptyDir is mounted at `/azcopy` and used for azcopy's `HOME`, log, and job-plan locations so the root filesystem can stay read-only.
+- **Swappable image.** `backup.upload.image` (default `mcr.microsoft.com/azure-cli`) is configurable; point it at any image that bundles the `azcopy` binary (e.g. a pinned, mirrored, or hardened build).
+
+Enable it via Helm values:
+
+```yaml
+backup:
+  enabled: true            # broker writes snapshots to /data/backups
+  intervalMs: 120000
+  retain: 3
+  upload:
+    enabled: true          # add the upload sidecar (implies backup.enabled)
+    account: examplesa      # target storage account name
+    container: anvil-backups
+    prefix: ""             # optional key prefix within the container
+    pollSeconds: 30
+    workloadIdentity:
+      clientId: 00000000-0000-0000-0000-000000000000  # user-assigned identity client ID
+      tenantId: 00000000-0000-0000-0000-000000000000
+```
+
+**Operator prerequisites (created out of band).** The chart wires the pod side of Workload Identity; the cloud resources are yours to provision:
+
+1. A **user-assigned managed identity** whose client ID you pass as `backup.upload.workloadIdentity.clientId`.
+2. A **federated identity credential** on that identity mapping the AKS cluster's OIDC issuer and the chart's ServiceAccount (`<release>-anvilmq`, in the release namespace) to the identity.
+3. A **Storage Blob Data Contributor** role assignment for that identity, scoped to the target blob container (or account).
+
+**Destination layout.** Snapshots land at `https://<account>.blob.core.windows.net/<container>/<prefix>/snapshot-*.db`. Use a distinct `prefix` (e.g. per region or per broker) to keep multiple instances separated in one container.
+
+**Remote retention is out of band.** The sidecar never deletes remote blobs. Prune old remote snapshots with an **Azure Blob lifecycle-management rule** (age-based deletion scoped to the container/prefix). Local retention (`retain`) and remote retention are therefore independent.
+
+**Restore runbook.** Restoring a broker from a remote snapshot is the next slice (3c) and is not yet documented here.
 
 ## Observability
 

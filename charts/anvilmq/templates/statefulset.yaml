@@ -16,12 +16,18 @@ spec:
     metadata:
       labels:
         {{- include "anvilmq.selectorLabels" . | nindent 8 }}
+        {{- if .Values.backup.upload.enabled }}
+        azure.workload.identity/use: "true"
+        {{- end }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- if .Values.backup.upload.enabled }}
+      serviceAccountName: {{ include "anvilmq.name" . }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -61,6 +67,16 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: ANVILMQ_METRICS_QUEUES
               value: {{ join "," .Values.metricsQueues | quote }}
+            {{- if .Values.backup.enabled }}
+            - name: ANVILMQ_BACKUP_ENABLED
+              value: "true"
+            - name: ANVILMQ_BACKUP_DIR
+              value: /data/backups
+            - name: ANVILMQ_BACKUP_INTERVAL_MS
+              value: {{ .Values.backup.intervalMs | quote }}
+            - name: ANVILMQ_BACKUP_RETAIN
+              value: {{ .Values.backup.retain | quote }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: 50051
@@ -93,10 +109,60 @@ spec:
               mountPath: /data
             - name: tmp
               mountPath: /tmp
+        {{- if .Values.backup.upload.enabled }}
+        - name: backup-upload
+          image: {{ printf "%s:%s" .Values.backup.upload.image.repository .Values.backup.upload.image.tag | quote }}
+          imagePullPolicy: {{ .Values.backup.upload.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Azure Workload Identity: the webhook injects AZURE_CLIENT_ID,
+            # AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and AZURE_AUTHORITY_HOST
+            # from the pod label + annotated ServiceAccount. No secrets needed.
+            - name: AZCOPY_AUTO_LOGIN_TYPE
+              value: WORKLOAD
+            # Keep azcopy's HOME/log/plan under a writable emptyDir so the root
+            # filesystem can stay read-only.
+            - name: HOME
+              value: /azcopy
+            - name: AZCOPY_LOG_LOCATION
+              value: /azcopy/log
+            - name: AZCOPY_JOB_PLAN_LOCATION
+              value: /azcopy/plans
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dest="https://{{ .Values.backup.upload.account }}.blob.core.windows.net/{{ .Values.backup.upload.container }}{{ with .Values.backup.upload.prefix }}/{{ . }}{{ end }}"
+              while true; do
+                azcopy sync /data/backups "$dest" \
+                  --include-pattern 'snapshot-*.db' \
+                  --delete-destination=false \
+                  || echo "azcopy sync failed; retrying next tick"
+                sleep {{ .Values.backup.upload.pollSeconds }}
+              done
+          resources:
+            {{- toYaml .Values.backup.upload.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: azcopy-scratch
+              mountPath: /azcopy
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 128Mi
+        {{- if .Values.backup.upload.enabled }}
+        - name: azcopy-scratch
+          emptyDir:
+            sizeLimit: 128Mi
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
