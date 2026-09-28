@@ -455,7 +455,7 @@ The chart surfaces the broker's operational knobs as an optional `engine` values
 helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml
 ```
 
-The overlay picks NORMAL durability (a deliberate throughput choice — FULL's per-commit fsync caps sustained completion throughput near 55 ops/s, below the observed ~80 ops/s peak; the recovery point is then bounded by the local snapshot cadence), tuned resource requests/limits, tenant fairness on, and the local snapshot writer on (2 min cadence, retain 3). Snapshot **upload stays disabled** in the shipped profile so it is schema-valid and never launches a misconfigured sidecar. To ship snapshots off-node, enable it (edit the overlay or pass the values on the CLI):
+The overlay picks NORMAL durability (a deliberate throughput choice — FULL's per-commit fsync caps sustained completion throughput near 55 ops/s, below the ~80 ops/s peak demand observed in production; the recovery point is then bounded by the local snapshot cadence), tuned resource requests/limits, tenant fairness on, and the local snapshot writer on (2 min cadence, retain 3). Snapshot **upload stays disabled** in the shipped profile so it is schema-valid and never launches a misconfigured sidecar. To ship snapshots off-node, enable it (edit the overlay or pass the values on the CLI):
 
 ```bash
 helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml \
