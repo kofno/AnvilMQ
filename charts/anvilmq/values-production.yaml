@@ -11,7 +11,7 @@
 
 # NORMAL over FULL is a deliberate throughput choice. FULL fsyncs on every
 # commit, which caps sustained completion throughput at roughly 55 ops/s —
-# below the observed peak of ~80 ops/s. NORMAL removes that per-commit fsync
+# below the ~80 ops/s peak demand observed in production. NORMAL removes that per-commit fsync
 # ceiling; the recovery point is then bounded by the local snapshot cadence
 # (backup.intervalMs) rather than by per-commit durability.
 durability: NORMAL
