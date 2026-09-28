@@ -12,7 +12,35 @@ const api = grpc.loadPackageDefinition(definition) as unknown as {
   queue: { v1: { QueueService: grpc.ServiceClientConstructor } };
 };
 
-export interface ConnectionOptions { address?: string; rpcTimeoutMs?: number }
+export interface ConnectionOptions {
+  address?: string;
+  rpcTimeoutMs?: number;
+  /**
+   * HTTP/2 keepalive channel tuning. Keepalive PINGs detect a half-open channel
+   * (idle load-balancer timeout, silently dead peer) at the transport layer instead
+   * of waiting for a real RPC to hit its per-call deadline.
+   */
+  keepalive?: {
+    timeMs?: number;                // default 20000: PING interval on an idle channel
+    timeoutMs?: number;             // default 10000: PING ack deadline before the channel is dropped
+    permitWithoutCalls?: boolean;   // default true: keep PINGing even with no active RPCs
+    maxReconnectBackoffMs?: number; // default 10000: cap on the transport reconnect backoff
+  };
+}
+
+/**
+ * Seam over the generated gRPC client constructor so tests can observe the channel
+ * arguments (keepalive tuning) without a proto or server change. Not part of the
+ * supported API.
+ */
+type ClientFactory = (address: string, credentials: grpc.ChannelCredentials, channelOptions: grpc.ClientOptions) => grpc.Client;
+let clientFactory: ClientFactory = (address, credentials, channelOptions) => new api.queue.v1.QueueService(address, credentials, channelOptions);
+/** Test-only: replace the client factory and return the previous one for restoration. */
+export function __setClientFactory(factory: ClientFactory): ClientFactory {
+  const previous = clientFactory;
+  clientFactory = factory;
+  return previous;
+}
 export interface JobMetadata { parentId: string; traceId: string; executionDepth: number }
 export interface AddOptions {
   priority?: number; delayMs?: number; maxAttempts?: number;
@@ -67,7 +95,16 @@ class Connection {
   constructor(options: ConnectionOptions) {
     this.timeout = options.rpcTimeoutMs ?? 5000;
     if (!Number.isFinite(this.timeout) || this.timeout <= 0) throw new Error("rpcTimeoutMs must be positive");
-    this.client = new api.queue.v1.QueueService(options.address ?? "[::1]:50051", grpc.credentials.createInsecure());
+    const k = options.keepalive ?? {};
+    for (const [label, value] of [["keepalive.timeMs", k.timeMs], ["keepalive.timeoutMs", k.timeoutMs], ["keepalive.maxReconnectBackoffMs", k.maxReconnectBackoffMs]] as const) {
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0)) throw new Error(`${label} must be a positive finite number`);
+    }
+    this.client = clientFactory(options.address ?? "[::1]:50051", grpc.credentials.createInsecure(), {
+      "grpc.keepalive_time_ms": k.timeMs ?? 20000,
+      "grpc.keepalive_timeout_ms": k.timeoutMs ?? 10000,
+      "grpc.keepalive_permit_without_calls": (k.permitWithoutCalls ?? true) ? 1 : 0,
+      "grpc.max_reconnect_backoff_ms": k.maxReconnectBackoffMs ?? 10000,
+    });
   }
   call<T>(method: string, request: object): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -97,6 +134,14 @@ export interface WorkerOptions extends ConnectionOptions {
   workerId?: string; pollIntervalMs?: number; heartbeatIntervalMs?: number;
   onError?: (error: unknown) => void;
   onCompleted?: (id: string) => void;
+  /** Upper bound on the exponential poll backoff during an outage. Default 5000; must be >= pollIntervalMs. */
+  pollBackoffMaxMs?: number;
+  /** Consecutive poll failures before the connection is declared lost. Default 3. */
+  connectionLostThreshold?: number;
+  /** Fired once when consecutive poll failures first reach connectionLostThreshold. */
+  onConnectionLost?: (info: { error: unknown; consecutiveFailures: number }) => void;
+  /** Fired once when polling succeeds again after a lost connection. */
+  onConnectionRestored?: (info: { downForMs: number; failuresWhileDown: number }) => void;
 }
 export type Processor<T> = (job: Job<T>, signal: AbortSignal) => Promise<void>;
 
@@ -108,12 +153,23 @@ export class Worker<T = unknown> {
   private running: Promise<void>;
   private pollMs: number;
   private heartbeatMs: number;
+  private pollBackoffMaxMs: number;
+  private connectionLostThreshold: number;
+  private consecutiveFailures = 0;
+  private lastPollOkAt = 0;
+  private connected = true;
+  private lostSince = 0;
+  private failuresWhileDown = 0;
   constructor(private name: string, private processor: Processor<T>, private options: WorkerOptions = {}) {
     this.workerId = options.workerId ?? crypto.randomUUID();
     this.pollMs = options.pollIntervalMs ?? 250;
     this.heartbeatMs = options.heartbeatIntervalMs ?? 10000;
+    this.pollBackoffMaxMs = options.pollBackoffMaxMs ?? 5000;
+    this.connectionLostThreshold = options.connectionLostThreshold ?? 3;
     if (!name.trim() || !this.workerId.trim()) throw new Error("queue and worker ID must not be blank");
     if (!Number.isFinite(this.pollMs) || this.pollMs <= 0 || !Number.isFinite(this.heartbeatMs) || this.heartbeatMs <= 0 || this.heartbeatMs > 10000) throw new Error("invalid poll/heartbeat interval (heartbeat maximum is 10000ms)");
+    if (!Number.isFinite(this.pollBackoffMaxMs) || this.pollBackoffMaxMs <= 0 || this.pollBackoffMaxMs < this.pollMs) throw new Error("pollBackoffMaxMs must be a positive finite number and >= pollIntervalMs");
+    if (!Number.isInteger(this.connectionLostThreshold) || this.connectionLostThreshold < 1) throw new Error("connectionLostThreshold must be an integer >= 1");
     this.connection = new Connection(options);
     this.running = this.run();
   }
@@ -123,15 +179,53 @@ export class Worker<T = unknown> {
   private async run() {
     try {
       while (!this.stopping.signal.aborted) {
+        let ok = false;
         try {
           const claim = await this.connection.call<Claim>("getNextJob", { workerId: this.workerId, queueNames: [this.name] });
+          ok = true;
+          this.onPollSuccess();
           // A claim returned during shutdown still belongs to us and must be drained.
           if (claim.found) { await this.process(claim); continue; }
-        } catch (error) { this.report(error); }
-        await sleep(this.pollMs, undefined, { signal: this.stopping.signal }).catch(() => {});
+        } catch (error) { this.onPollFailure(error); this.report(error); }
+        const delay = ok ? this.pollMs : this.nextBackoffDelay();
+        await sleep(delay, undefined, { signal: this.stopping.signal }).catch(() => {});
       }
     } finally { this.connection.close(); }
   }
+  /** A poll that returns (found OR not-found) proves the broker is reachable. */
+  private onPollSuccess() {
+    this.lastPollOkAt = Date.now();
+    if (!this.connected) {
+      const info = { downForMs: Date.now() - this.lostSince, failuresWhileDown: this.failuresWhileDown };
+      this.connected = true;
+      this.safeEmit(() => this.options.onConnectionRestored?.(info));
+    }
+    this.consecutiveFailures = 0;
+    this.failuresWhileDown = 0;
+  }
+  private onPollFailure(error: unknown) {
+    this.consecutiveFailures++;
+    if (this.connected && this.consecutiveFailures >= this.connectionLostThreshold) {
+      this.connected = false;
+      this.lostSince = Date.now();
+      this.failuresWhileDown = this.consecutiveFailures;
+      this.safeEmit(() => this.options.onConnectionLost?.({ error, consecutiveFailures: this.consecutiveFailures }));
+    } else if (!this.connected) {
+      this.failuresWhileDown++;
+    }
+  }
+  /** Exponential backoff capped by pollBackoffMaxMs, jittered to [50%,100%] to avoid a thundering herd. */
+  private nextBackoffDelay(): number {
+    const exp = Math.min(this.pollBackoffMaxMs, this.pollMs * 2 ** (this.consecutiveFailures - 1));
+    return Math.floor(exp * (0.5 + Math.random() * 0.5));
+  }
+  private safeEmit(fn: () => void) {
+    try { fn(); } catch (e) { try { (this.options.onError ?? console.error)(e); } catch { /* ignore */ } }
+  }
+  /** Current consecutive poll-failure streak (0 while reachable). Observability/testing hook. */
+  get consecutivePollFailures(): number { return this.consecutiveFailures; }
+  /** Whether the poll loop currently considers the broker reachable. Observability/testing hook. */
+  get isConnected(): boolean { return this.connected; }
   private async process(claim: Claim) {
     const handler = new AbortController();
     const heartbeatStop = new AbortController();

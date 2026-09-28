@@ -18,6 +18,18 @@ jobs:
           bun-version: 1.2.14
       - working-directory: client
         run: bun install --frozen-lockfile && bun run check && bun run test
+      # Transport-resilience soak/leak check: induced connect/drop cycles plus an idle
+      # keepalive window, asserting flat RSS/heap and no keepalive GOAWAY. Runs under Bun
+      # today; TODO(C7 publishing) adds a Node-LTS-native runner once the client ships
+      # transpiled JS (Node's strip-only .ts loader rejects TS parameter properties).
+      - name: Client transport soak/leak
+        working-directory: client
+        env:
+          SOAK_CYCLES: 24
+          SOAK_WARMUP: 6
+          SOAK_OUTAGES: 4
+          SOAK_IDLE_MS: 45000
+        run: bun test/soak.ts
       - uses: azure/setup-helm@v4.3.0
         with:
           version: v3.17.3

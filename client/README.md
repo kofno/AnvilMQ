@@ -43,7 +43,7 @@ process.once("SIGINT", () => { void worker.close(); });
 
 `Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, and `rateLimitFacet`. Generic types provide compile-time help, not runtime payload validation.
 
-Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), and `onError`. Each worker processes one job at a time; create additional workers for concurrency.
+Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, plus the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`. Each worker processes one job at a time; create additional workers for concurrency.
 
 Workers poll immediately, send heartbeats during async processing, and acknowledge with the claimed attempt number. Handler errors, including JSON decoding errors, invoke FailJob. If heartbeat fails or times out, the handler's signal aborts and the client sends no acknowledgment. Handlers must honor cancellation; the client cannot undo external side effects. Avoid blocking the event loop, which prevents heartbeats.
 
@@ -51,7 +51,47 @@ Workers poll immediately, send heartbeats during async processing, and acknowled
 
 Completion retries use the exact same job/worker/attempt token: up to three total RPC calls for `Unavailable` or `DeadlineExceeded`, with 100ms then 200ms waits. Each call has `rpcTimeoutMs`; shutdown waits for this bounded completion sequence (about 15.3 seconds at the default timeout). Other status codes are not retried. The handler is not rerun, and `onCompleted` fires once only after a successful acknowledgment. Intermediate retryable errors are suppressed; terminal/exhausted errors reach `onError`. Exhaustion still leaves the completion outcome uncertain. Heartbeats stop when the handler settles; an uncommitted completion that outlives its lease is rejected by the broker.
 
-Enqueue without a key and FailJob are not automatically retried. Keyed enqueue uses the bounded retry policy below. Polling errors retry after the poll interval. A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
+Enqueue without a key and FailJob are not automatically retried. Keyed enqueue uses the bounded retry policy below. Polling errors retry with exponential backoff (see [Transport resilience](#transport-resilience)). A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
+
+## Transport resilience
+
+The client keeps the gRPC channel healthy at the transport layer and reacts to broker outages with bounded backoff and explicit connection events. Together these remove the need for an external connection-monitor sidecar, an application-level active-PING loop, or a scheduled worker restart to recover from a half-open channel — the client detects and recovers on its own.
+
+### HTTP/2 keepalive
+
+Every connection is built with HTTP/2 keepalive so a half-open channel (an idle load-balancer timeout, a silently dead peer) is detected by a missed keepalive PING instead of only surfacing when a real RPC finally hits its per-call deadline. Tune it via `ConnectionOptions.keepalive` on any `Queue`, `Worker`, `RateLimits`, or `IngressLimits`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `timeMs` | `20000` | Interval between keepalive PINGs on an otherwise idle channel. |
+| `timeoutMs` | `10000` | How long to wait for a PING ack before dropping the channel. |
+| `permitWithoutCalls` | `true` | Keep sending PINGs even when no RPCs are in flight. |
+| `maxReconnectBackoffMs` | `10000` | Upper bound on the transport's own reconnect backoff. |
+
+Each supplied numeric is validated as a positive finite number, like `rpcTimeoutMs`.
+
+### Poll-loop backoff
+
+A `Worker` no longer re-polls on a fixed interval during an outage. A poll that **returns** (a claim found, or an empty result) proves the broker is reachable and resets the worker's failure state. A poll that **throws** is a failure: the worker waits an exponentially growing delay — `pollIntervalMs`, doubling each consecutive failure, capped at `pollBackoffMaxMs` (default 5000; must be `>= pollIntervalMs`) — jittered to a random 50–100% of that delay so a fleet does not thunder back in lockstep when the broker restarts. This replaces the previous fixed retry storm. Heartbeat and completion failures are deliberately *not* folded into this signal; the poll loop is the single source of connection liveness. `close()` interrupts an in-progress backoff sleep and returns promptly.
+
+### Connection events
+
+After `connectionLostThreshold` (default 3) consecutive poll failures, the worker fires `onConnectionLost` exactly once; when polling next succeeds it fires `onConnectionRestored` exactly once with how long it was down. A transient blip below the threshold emits nothing.
+
+```typescript
+const worker = new Worker("emails", handler, {
+  pollIntervalMs: 250,
+  pollBackoffMaxMs: 5000,       // cap the backoff during an outage
+  connectionLostThreshold: 3,   // consecutive poll failures before "lost"
+  onError: () => {},            // per-attempt errors (silenced here)
+  onConnectionLost: ({ consecutiveFailures }) =>
+    console.warn(`broker unreachable after ${consecutiveFailures} polls`),
+  onConnectionRestored: ({ downForMs, failuresWhileDown }) =>
+    console.info(`broker back after ${downForMs}ms and ${failuresWhileDown} failed polls`),
+});
+```
+
+Both callbacks are invoked defensively: a throw inside one is routed to `onError` and never breaks the poll loop.
 
 ## Long-running jobs
 
