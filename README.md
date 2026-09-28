@@ -218,7 +218,7 @@ Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](har
   - [x] Broker-side snapshot writer: consistent `VACUUM INTO` snapshots on a dedicated read connection, temp-then-atomic-rename, a configurable interval within a 1–5 min recovery-point band, and a local retain count (see [Backups](#backups), off by default).
   - [x] Ship snapshots to object storage via a swappable upload sidecar, and document the restore runbook. The upload sidecar ships `/data/backups` to Azure Blob Storage via an `az storage blob upload-batch` poll loop authenticated with Workload Identity, wired into the Helm chart and off by default (see [Backups](#backups)); the restore runbook — single-writer safety rule, Kubernetes maintenance-pod procedure, PVC-lost path, and local flow — is documented in [docs/restore-runbook.md](docs/restore-runbook.md).
 - [x] Production-hardened Helm values profile: the chart surfaces the operational knobs (execution-depth breaker, runaway-chain cap, lease duration, recovery interval/batch, tenant fairness, durability) as optional values, and a bundled `values-production.yaml` layers an opinionated hardened profile (NORMAL durability, local snapshots on, tenant fairness on). The execution-depth breaker is always on; its limit is configurable. Faceted dispatch and ingress velocity limits are per-facet rules provisioned at runtime through the `UpsertRateLimitRule`/`UpsertIngressLimitRule` gRPC RPCs, not chart values (see the [Production profile](#production-profile) section).
-- [ ] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss.
+- [x] Failure testing: broker kill under load, pod reschedule, volume detach/reattach, and restore-from-snapshot drills validating a bounded recovery-time objective with no job loss. Broker-kill-under-load is automated and CI-gated (`crash-active.ps1`/`smoke.ps1`) with measured recovery ([harness/CRASH-RECOVERY.md](harness/CRASH-RECOVERY.md)); pod-reschedule, volume detach/reattach, and restore-from-snapshot are documented procedures with stated RTO/RPO targets and acceptance criteria consolidated in [docs/failure-drills.md](docs/failure-drills.md). Replicated-failover drills remain Phase 5b.
 
 #### Phase 5b: Consensus and replicated high availability (deferred)
 
@@ -445,7 +445,7 @@ backup:
 
 **Remote retention is out of band.** The sidecar never deletes remote blobs. Prune old remote snapshots with an **Azure Blob lifecycle-management rule** (age-based deletion scoped to the container/prefix). Local retention (`retain`) and remote retention are therefore independent.
 
-**Restore runbook.** To bring a broker back up from a local or remote snapshot — including the single-writer safety rule, the Kubernetes maintenance-pod procedure, and the PVC-lost path — see [docs/restore-runbook.md](docs/restore-runbook.md).
+**Restore runbook.** To bring a broker back up from a local or remote snapshot — including the single-writer safety rule, the Kubernetes maintenance-pod procedure, and the PVC-lost path — see [docs/restore-runbook.md](docs/restore-runbook.md). For the broader catalog of failure-testing drills (broker crash, pod reschedule, volume detach/reattach, restore-from-snapshot) with their RTO/RPO targets and acceptance criteria, see [docs/failure-drills.md](docs/failure-drills.md).
 
 ## Production profile
 

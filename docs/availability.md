@@ -6,7 +6,7 @@ Current priority: defer Raft while validating acceptable recovery time on Azure 
 
 ## Intended requirement
 
-Continue queue service through the loss or recycling of one broker pod or its Kubernetes node, with a bounded failover interruption and no loss of acknowledged jobs within the stated failure model. The acceptable interruption (RTO) still needs a concrete target. Worker side effects remain at least once; broker replication cannot make arbitrary external effects exactly once.
+Continue queue service through the loss or recycling of one broker pod or its Kubernetes node, with a bounded failover interruption and no loss of acknowledged jobs within the stated failure model. The acceptable interruption (RTO) target for the single-broker + persistent-volume model — along with the RPO and per-scenario acceptance criteria — is now stated in the [failure-testing drills catalog](failure-drills.md); replicated-failover targets remain part of the Phase 5b work below. Worker side effects remain at least once; broker replication cannot make arbitrary external effects exactly once.
 
 ## Alternatives to evaluate
 
