@@ -120,7 +120,7 @@ test("shutdown: close() makes the worker stopping and not-ready", async () => {
 });
 
 test("HTTP surface: nodeHealthListener and fetchHealthHandler map live/ready to 200/503", async () => {
-  const live: WorkerHealth = { live: true, ready: true, connected: true, stale: false, stopping: false, consecutivePollFailures: 0, inFlight: 1, lastPollOkAt: 1, lastBrokerContactAt: 1, loopAliveAt: 1, uptimeMs: 5, now: 6 };
+  const live: WorkerHealth = { live: true, ready: true, connected: true, stale: false, stopping: false, consecutivePollFailures: 0, inFlight: 1, concurrency: 1, saturated: true, lastPollOkAt: 1, lastBrokerContactAt: 1, loopAliveAt: 1, uptimeMs: 5, now: 6 };
   const notReady: WorkerHealth = { ...live, ready: false, connected: false };
   const notLive: WorkerHealth = { ...live, live: false, ready: false };
 

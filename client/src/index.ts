@@ -257,6 +257,21 @@ export interface WorkerOptions extends ConnectionOptions {
    * flapping. Default: max(heartbeatMs, pollBackoffMaxMs) * 2, floored at 20000.
    */
   readinessStaleMs?: number;
+  /**
+   * Maximum number of job handlers a single worker runs in parallel. The dispatcher
+   * still polls serially (getNextJob is a single-claim RPC) but holds up to this many
+   * concurrent single-job leases, each multiplexed over the one shared connection.
+   * Default 1, which reproduces the strictly serial poll-one-process-one behaviour.
+   */
+  concurrency?: number;
+  /**
+   * Adaptive-idle ceiling. When greater than pollIntervalMs, the idle poll delay grows
+   * exponentially from pollIntervalMs toward this cap on consecutive empty polls and
+   * resets to pollIntervalMs on the next found job, trading a little latency for far
+   * fewer wasted polls on an idle queue. Default = pollIntervalMs (flat, off). Must be
+   * less than readinessStaleMs so an idle worker never flaps readiness.
+   */
+  idlePollMaxMs?: number;
 }
 export type Processor<T> = (job: Job<T>, signal: AbortSignal) => Promise<void>;
 
@@ -278,8 +293,12 @@ export interface WorkerHealth {
   stopping: boolean;
   /** Consecutive poll-failure streak (0 while reachable). */
   consecutivePollFailures: number;
-  /** Jobs currently processing (0/1 pre-C4). */
+  /** Jobs currently processing (0..concurrency). */
   inFlight: number;
+  /** Max handlers this worker runs in parallel (mirrors the concurrency option). */
+  concurrency: number;
+  /** True when inFlight >= concurrency: every slot is busy and no new job can be claimed. */
+  saturated: boolean;
   /** Epoch ms of the last successful poll, 0 if never. */
   lastPollOkAt: number;
   /** Epoch ms of the last successful broker round-trip (poll | heartbeat | completion), 0 if never. */
@@ -313,6 +332,17 @@ export class Worker<T = unknown> {
   private readonly startedAt = Date.now();
   private livenessStaleMs: number;
   private readinessStaleMs: number;
+  private concurrency: number;
+  private idlePollMaxMs: number;
+  /** Live set of dispatched process() promises; close() drains all of them. */
+  private tracked = new Set<Promise<void>>();
+  /** Re-armable slot-freed waiter: the capacity-parked branch awaits `slotFreed`, and
+   * each settling job resolves the current one and re-arms a fresh promise. */
+  private slotFreed!: Promise<void>;
+  private resolveSlotFreed!: () => void;
+  /** Resolves once when close() aborts, so a capacity-parked loop wakes on shutdown.
+   * A single shared promise avoids leaking a per-park listener on the abort signal. */
+  private abortedPromise: Promise<void>;
   constructor(private name: string, private processor: Processor<T>, private options: WorkerOptions = {}) {
     this.workerId = options.workerId ?? crypto.randomUUID();
     this.pollMs = options.pollIntervalMs ?? 250;
@@ -331,6 +361,16 @@ export class Worker<T = unknown> {
     // A readiness window at or below the heartbeat interval would flap NOT-ready during
     // every long job, since only heartbeats (not polls) refresh contact while a job runs.
     if (this.readinessStaleMs <= this.heartbeatMs) throw new Error("readinessStaleMs must be greater than heartbeatIntervalMs so long jobs do not flap readiness");
+    this.concurrency = options.concurrency ?? 1;
+    if (!Number.isInteger(this.concurrency) || this.concurrency < 1) throw new Error("concurrency must be an integer >= 1");
+    this.idlePollMaxMs = options.idlePollMaxMs ?? this.pollMs;
+    if (!Number.isFinite(this.idlePollMaxMs) || this.idlePollMaxMs < this.pollMs) throw new Error("idlePollMaxMs must be a finite number >= pollIntervalMs");
+    if (this.idlePollMaxMs >= this.readinessStaleMs) throw new Error("idlePollMaxMs must be less than readinessStaleMs so an idle worker does not flap readiness");
+    this.armSlotFreed();
+    this.abortedPromise = new Promise<void>(resolve => {
+      if (this.stopping.signal.aborted) return resolve();
+      this.stopping.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
     this.connection = new Connection(options);
     this.running = this.run();
   }
@@ -338,11 +378,19 @@ export class Worker<T = unknown> {
     try { (this.options.onError ?? console.error)(error); } catch (callbackError) { console.error(callbackError); }
   }
   private async run() {
+    const tracked = this.tracked;
+    let idleStreak = 0;
     try {
       while (!this.stopping.signal.aborted) {
         // Refresh loop liveness at the top of every iteration (including outage backoff
-        // iterations) so a broker outage never fails liveness.
+        // and capacity-park iterations) so a broker outage never fails liveness.
         this.loopAliveAt = Date.now();
+        // At capacity: park until a slot frees rather than busy-polling. Per-job
+        // heartbeats keep loopAliveAt fresh while parked, so liveness never wedges.
+        if (this.inFlight >= this.concurrency) {
+          await Promise.race([this.slotFreed, this.abortedPromise]);
+          continue;
+        }
         let ok = false;
         try {
           const claim = await this.connection.call<Claim>("getNextJob", { workerId: this.workerId, queueNames: [this.name] });
@@ -350,16 +398,46 @@ export class Worker<T = unknown> {
           this.onPollSuccess();
           // A claim returned during shutdown still belongs to us and must be drained.
           if (claim.found) {
-            // inFlight is tracked at the call site so drain-on-close accounting stays correct.
             this.inFlight++;
-            try { await this.process(claim); } finally { this.inFlight--; }
+            idleStreak = 0;
+            // Dispatch concurrently; the promise settles its own outcome (never rejects)
+            // so the tracked set can never leak an unhandled rejection.
+            let entry!: Promise<void>;
+            entry = this.process(claim)
+              .catch(error => this.report(error))
+              .finally(() => { this.inFlight--; tracked.delete(entry); this.signalSlotFreed(); });
+            tracked.add(entry);
+            // Fast path: immediately re-poll to fill any remaining slots, no sleep.
             continue;
           }
-        } catch (error) { this.onPollFailure(error); this.report(error); }
-        const delay = ok ? this.pollMs : this.nextBackoffDelay();
+          idleStreak++;
+        } catch (error) { this.onPollFailure(error); this.report(error); idleStreak = 0; }
+        const delay = ok ? this.nextIdleDelay(idleStreak) : this.nextBackoffDelay();
         await sleep(delay, undefined, { signal: this.stopping.signal }).catch(() => {});
       }
-    } finally { this.connection.close(); }
+    } finally {
+      // Drain: close() resolves only after the loop has broken AND every dispatched
+      // handler (including one already in flight when abort fired) has settled.
+      await Promise.allSettled([...tracked]);
+      this.connection.close();
+    }
+  }
+  /** (Re)arm the single-shot slot-freed waiter. */
+  private armSlotFreed() {
+    this.slotFreed = new Promise<void>(resolve => { this.resolveSlotFreed = resolve; });
+  }
+  /** Wake a capacity-parked loop and re-arm a fresh waiter for the next fill. */
+  private signalSlotFreed() {
+    const resolve = this.resolveSlotFreed;
+    this.armSlotFreed();
+    resolve();
+  }
+  /** Adaptive idle backoff (distinct from the C1 failure-path nextBackoffDelay): grows
+   * from pollMs toward idlePollMaxMs on consecutive empty polls, [50%,100%] jittered.
+   * Collapses to ~pollMs when idlePollMaxMs === pollMs (flat, off). */
+  private nextIdleDelay(streak: number): number {
+    const exp = Math.min(this.idlePollMaxMs, this.pollMs * 2 ** (streak - 1));
+    return Math.floor(exp * (0.5 + Math.random() * 0.5));
   }
   /** Refresh both staleness clocks off a SUCCESSFUL broker round-trip (poll, heartbeat,
    * or completion). Never emits connection events and never changes `connected`. */
@@ -414,6 +492,7 @@ export class Worker<T = unknown> {
     return {
       live, ready, connected: this.connected, stale, stopping,
       consecutivePollFailures: this.consecutiveFailures, inFlight: this.inFlight,
+      concurrency: this.concurrency, saturated: this.inFlight >= this.concurrency,
       lastPollOkAt: this.lastPollOkAt, lastBrokerContactAt: this.lastBrokerContactAt,
       loopAliveAt: this.loopAliveAt, uptimeMs: now - this.startedAt, now,
     };
