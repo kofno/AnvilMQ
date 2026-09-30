@@ -181,9 +181,129 @@ Together with [Transport resilience](#transport-resilience), this retires the ex
 
 **Security:** the health port is unauthenticated plaintext (transport auth and TLS are future work). Expose it on a cluster-internal address or listener only — never on a public interface — and rely on the probe's own network path rather than exposing it externally.
 
+## Observability & lifecycle
+
+Three surfaces build on the health snapshot: broker-authoritative job-lifecycle hooks, a zero-dependency Prometheus metrics endpoint, an injectable logger, and a `gracefulShutdown` helper for clean pod termination.
+
+### Job-lifecycle hooks
+
+Beyond `onCompleted`, a `Worker` fires three lifecycle hooks. The failure hooks are **broker-authoritative**: the worker reads the broker's `FailJob` response and fires `onFailed` versus `onRetry` based on `moved_to_failed_state`, so your telemetry matches what the broker actually decided — never a client-side guess.
+
+| Hook | Fires | Payload |
+| --- | --- | --- |
+| `onActive` | Immediately **before** the handler runs. | `{ id, name, attempt, metadata }` |
+| `onCompleted` | After `CompleteJob` is acknowledged. | `id` |
+| `onRetry` | After a failure the broker will **redeliver** (`moved_to_failed_state === false`: attempts remain). | `{ id, name, attempt, error }` |
+| `onFailed` | After a failure the broker moved to its **terminal** failed state (`moved_to_failed_state === true`: attempts exhausted). | `{ id, name, attempt, error }` |
+
+Exactly one of `onRetry`/`onFailed` fires per failed delivery. A job with `maxAttempts: 3` that always throws fires `onActive`+`onRetry` twice, then `onActive`+`onFailed` once. Every hook is dispatched through the same `safeEmit` guard as the connection events, so a throwing hook is routed to `onError`/the logger and never breaks the job or the poll loop.
+
+```typescript
+const worker = new Worker<EmailJob>("emails", sendEmail, {
+  onActive:    ({ id, attempt }) => log.info({ id, attempt }, "job started"),
+  onCompleted: id => log.info({ id }, "job done"),
+  onRetry:     ({ id, attempt, error }) => log.warn({ id, attempt, error }, "job will be retried"),
+  onFailed:    ({ id, attempt, error }) => log.error({ id, attempt, error }, "job permanently failed"),
+});
+```
+
+### Metrics
+
+`worker.metrics()` returns a synchronous, I/O-free `WorkerMetrics` snapshot. Counters are monotonic since construction; gauges read live. All series are prefixed `anvilmq_client_`.
+
+| Series | Type | `WorkerMetrics` field | Meaning |
+| --- | --- | --- | --- |
+| `jobs_processed_total` | counter | `jobsProcessedTotal` | Jobs completed successfully. |
+| `jobs_failed_total` | counter | `jobsFailedTotal` | Jobs moved to the terminal failed state (`onFailed`). |
+| `jobs_retried_total` | counter | `jobsRetriedTotal` | Jobs that failed and will be redelivered (`onRetry`). |
+| `poll_failures_total` | counter | `pollFailuresTotal` | Dispatcher poll failures. |
+| `reconnects_total` | counter | `reconnectsTotal` | Connection recoveries after being declared lost. |
+| `jobs_active` | gauge | `jobsActive` | Jobs currently processing (mirrors `inFlight`). |
+| `connection_up` | gauge | `connectionUp` | `1` when the broker is considered reachable, else `0`. |
+
+`renderPrometheus(metrics, { labels? })` is a **pure, zero-dependency** function that turns a snapshot into Prometheus text exposition (version 0.0.4) — `# HELP`, `# TYPE`, and one sample line per series, with an optional `labels` bag applied to every sample:
+
+```typescript
+import { renderPrometheus } from "./src/index";
+
+renderPrometheus(worker.metrics(), { labels: { worker: worker.workerId } });
+// # HELP anvilmq_client_jobs_processed_total Jobs completed successfully.
+// # TYPE anvilmq_client_jobs_processed_total counter
+// anvilmq_client_jobs_processed_total{worker="…"} 42
+// …
+```
+
+Wire it onto the health listener with `metricsPath`. The metrics route is opt-in: when `metricsPath` is unset there is no metrics route (`/metrics` stays a 404), preserving back-compat. `GET {metricsPath}` returns `200` with content-type `text/plain; version=0.0.4`; the live/ready JSON routes are unchanged.
+
+```typescript
+import { createServer } from "node:http";
+import { Worker, nodeHealthListener } from "./src/index";
+
+const worker = new Worker("emails", handler);
+createServer(nodeHealthListener(worker, { metricsPath: "/metrics" })).listen(8080);
+```
+
+```yaml
+# Prometheus scrape annotations
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+```
+
+### Injectable logger
+
+Every internal diagnostic (a poll failure with no `onError`, a throwing hook) goes through a `Logger`. Supply your own to keep the library off `console.*` entirely and route diagnostics into your structured logging pipeline; the default is a console-backed `defaultLogger`.
+
+```typescript
+export interface Logger {
+  error(...args: unknown[]): void;
+  warn?(...args: unknown[]): void;
+  info?(...args: unknown[]): void;
+  debug?(...args: unknown[]): void;
+}
+
+const worker = new Worker("emails", handler, { logger: pino() }); // pino/winston/bunyan-shaped objects work as-is
+```
+
+Only `error` is required, so a `console`, `pino`, `winston`, or `bunyan`-shaped object works unchanged. A supplied `onError` still takes precedence for job/poll errors; the logger is the fallback sink.
+
+### Graceful shutdown
+
+`gracefulShutdown(closables, opts?)` registers `SIGTERM`/`SIGINT` handlers that close your resources cleanly on the first signal, then exit. It closes every closable concurrently and races the drain against `timeoutMs` (default `25000`): a clean drain exits `0`, a timeout logs a warning and exits `1`. Further signals during the drain are ignored. It reaches Node's `process` via `globalThis` only (no `node:process` import), so importing off Node never throws — it logs once and returns a no-op. The return value is an unregister function that detaches the handlers.
+
+```typescript
+import { Worker, OutboxForwarder, gracefulShutdown, nodeHealthListener } from "./src/index";
+import { createServer } from "node:http";
+
+const worker = new Worker("emails", handler);
+const server = createServer(nodeHealthListener(worker, { metricsPath: "/metrics" }));
+server.listen(8080);
+
+// On SIGTERM (k8s pod termination), drain in-flight jobs and stop the health server,
+// giving Kubernetes' terminationGracePeriodSeconds room before the drain deadline.
+gracefulShutdown([
+  worker,                                        // Worker.close() drains in-flight handlers
+  { close: () => new Promise<void>(r => server.close(() => r())) },
+], { timeoutMs: 20000 });
+```
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30 # > gracefulShutdown timeoutMs, so the clean drain wins
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `signals` | `["SIGTERM", "SIGINT"]` | OS signals that trigger the drain. |
+| `timeoutMs` | `25000` | Drain deadline; on timeout, warn and (if `exit`) exit 1. |
+| `exit` | `true` | Call `process.exit` after draining (0 clean, 1 on timeout). |
+| `logger` | `defaultLogger` | Where drain diagnostics go. |
+
 ## Concurrency & throughput
 
-A single `Worker` can run more than one handler at a time. Two options tune it:
+A single `Worker` can run more than one handler at a time. Two options tune it: 
 
 | Option | Default | Meaning |
 | --- | --- | --- |
