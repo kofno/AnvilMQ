@@ -68,14 +68,19 @@ services:
     environment:
       ANVILMQ_ADDR: broker:50051
       ANVILMQ_HTTP_URL: http://broker:9090
-      # Concurrent single-job workers per job name.
+      # Per-name handler parallelism: the client's `concurrency` option on one Worker per job
+      # name (8 workers total), each running up to this many handlers in parallel.
       SIM_WORKER_CONCURRENCY: ${SIM_WORKER_CONCURRENCY-2}
+      # Aggregated worker-fleet health/metrics surface (/livez, /readyz, /metrics).
+      SIM_HEALTH_PORT: ${SIM_HEALTH_PORT-9095}
       # Simulated handler latency (ms) standing in for downstream service calls.
       SIM_WORK_MS: ${SIM_WORK_MS-15}
       # Fan-out multipliers for the task chain (kept small to stay under depth 10).
       SIM_TASKS_PER_EVENT: ${SIM_TASKS_PER_EVENT-2}
       SIM_SUBTASKS_PER_TASK: ${SIM_SUBTASKS_PER_TASK-3}
       RUST_LOG: info
+    ports:
+      - "127.0.0.1:9095:9095"
     depends_on:
       broker:
         condition: service_healthy

@@ -6,8 +6,8 @@
 //
 // Isolated: enqueues only to the local sim broker. No demo/prod endpoints.
 import { setTimeout as sleep } from "node:timers/promises";
-import { RateLimits, IngressLimits, type AddOptions } from "../../../client/src/index";
-import { ADDRESS, HTTP, JobName, num, enqueue, closeAllQueues, LimitFacet, GRPC_RESOURCE_EXHAUSTED, type JobData, type JobName as JobNameT } from "./queues";
+import { RateLimits, IngressLimits, gracefulShutdown, type AddOptions, type Logger } from "../../../client/src/index";
+import { ADDRESS, HTTP, JobName, num, enqueue, queueFor, closeAllQueues, LimitFacet, GRPC_RESOURCE_EXHAUSTED, type JobData, type JobName as JobNameT } from "./queues";
 
 const profile = (process.env.SIM_PROFILE ?? "prod").toLowerCase();
 const rate = num("SIM_RATE", profile === "soak" ? 1000 : 13, 0, 200000); // aggregate jobs/s; 0 = unlimited
@@ -144,18 +144,34 @@ if (limitDemo && rateLimits && ingressLimits) {
     intervalMs: limitTickMs, ingressBurst, dispatchBurst }));
 }
 
-// Every limitTickMs: burst each limited facet. Ingress sheds surplus as RESOURCE_EXHAUSTED (the
-// admitted remainder drains normally); dispatch admits all at enqueue but workers claim them only
-// at the fixed-window rate, so they pool in Waiting. Jobs use ProcessTask without fan-out.
+// Every limitTickMs: burst each limited facet through the client's bounded fan-out (addBulk),
+// reading the positional AddResult[] to keep the counters. Ingress sheds surplus as
+// RESOURCE_EXHAUSTED (a {ok:false} with that code); the admitted remainder drains normally.
+// Dispatch admits all at enqueue but workers claim them only at the fixed-window rate, so they
+// pool in Waiting. Jobs use ProcessTask without fan-out. Auto-key stays on for duplicate-free retries.
 async function limitDemoTick(): Promise<void> {
-  await Promise.all(Array.from({ length: ingressBurst }, async () => {
-    try { await enqueue(JobName.ProcessTask, { recordId: `ingress-${rid()}`, payloadBytes: 256, subtaskCount: 0 }, { rateLimitFacet: LimitFacet.IngressBurst }); ingressAdmitted++; }
-    catch (e) { if ((e as { code?: number }).code === GRPC_RESOURCE_EXHAUSTED) ingressRejected++; else if (errors <= 5) console.error(JSON.stringify({ event: "ingress-demo-error", error: String(e) })); }
+  const q = queueFor(JobName.ProcessTask);
+
+  const ingressItems = Array.from({ length: ingressBurst }, () => ({
+    data: { recordId: `ingress-${rid()}`, payloadBytes: 256, subtaskCount: 0 },
+    options: { rateLimitFacet: LimitFacet.IngressBurst } as AddOptions,
   }));
-  await Promise.all(Array.from({ length: dispatchBurst }, async () => {
-    try { await enqueue(JobName.ProcessTask, { recordId: `throttle-${rid()}`, payloadBytes: 256, subtaskCount: 0 }, { rateLimitFacet: LimitFacet.DispatchThrottle }); dispatchQueued++; }
-    catch (e) { if (errors <= 5) console.error(JSON.stringify({ event: "dispatch-demo-error", error: String(e) })); }
+  const ingressResults = await q.addBulk(ingressItems, { concurrency: ingressBurst, stopOnError: false });
+  for (const r of ingressResults) {
+    if (r.ok) ingressAdmitted++;
+    else if ((r.error as { code?: number }).code === GRPC_RESOURCE_EXHAUSTED) ingressRejected++;
+    else if (errors <= 5) console.error(JSON.stringify({ event: "ingress-demo-error", error: String(r.error) }));
+  }
+
+  const dispatchItems = Array.from({ length: dispatchBurst }, () => ({
+    data: { recordId: `throttle-${rid()}`, payloadBytes: 256, subtaskCount: 0 },
+    options: { rateLimitFacet: LimitFacet.DispatchThrottle } as AddOptions,
   }));
+  const dispatchResults = await q.addBulk(dispatchItems, { concurrency: dispatchBurst, stopOnError: false });
+  for (const r of dispatchResults) {
+    if (r.ok) dispatchQueued++;
+    else if (errors <= 5) console.error(JSON.stringify({ event: "dispatch-demo-error", error: String(r.error) }));
+  }
 }
 const limitTimer = limitDemo ? setInterval(() => { void limitDemoTick(); }, limitTickMs) : null;
 
@@ -165,21 +181,32 @@ const report = setInterval(async () => {
 }, 5000);
 
 let stopping = false;
-async function shutdown() {
-  if (stopping) return; stopping = true;
+const logger: Logger = {
+  error: (...args: unknown[]) => console.error(...args),
+  warn: (...args: unknown[]) => console.warn(...args),
+  info: (...args: unknown[]) => console.log(...args),
+};
+
+// Idempotent teardown shared by the normal finish and the signal path: stop the limit-demo
+// timer, delete its two rules, close the limit clients, log the summary, and close the queues.
+async function finalize(): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  clearInterval(report);
   if (limitTimer) clearInterval(limitTimer);
+  if (limitDemo && rateLimits && ingressLimits) {
+    try { await rateLimits.delete(LimitFacet.DispatchThrottle); await ingressLimits.delete(LimitFacet.IngressBurst); }
+    catch (e) { console.error(JSON.stringify({ event: "limit-demo-cleanup-error", error: String(e) })); }
+    rateLimits.close(); ingressLimits.close();
+  }
+  const elapsed = (performance.now() - start) / 1000;
+  console.log(JSON.stringify({ event: "producer-finished", profile, elapsedSeconds: Number(elapsed.toFixed(1)), submitted, acknowledged, errors, enqueuePerSecond: Number((acknowledged / elapsed).toFixed(1)), ingressAdmitted, ingressRejected, dispatchQueued }));
+  closeAllQueues();
 }
-for (const s of ["SIGINT", "SIGTERM"] as const) process.once(s, shutdown);
+
+// SIGTERM/SIGINT run the same teardown as a normal finish, then exit.
+gracefulShutdown([{ close: finalize }], { logger });
 
 await Promise.all(Array.from({ length: lanes }, lane));
-clearInterval(report);
-if (limitTimer) clearInterval(limitTimer);
-if (limitDemo && rateLimits && ingressLimits) {
-  try { await rateLimits.delete(LimitFacet.DispatchThrottle); await ingressLimits.delete(LimitFacet.IngressBurst); }
-  catch (e) { console.error(JSON.stringify({ event: "limit-demo-cleanup-error", error: String(e) })); }
-  rateLimits.close(); ingressLimits.close();
-}
-const elapsed = (performance.now() - start) / 1000;
-console.log(JSON.stringify({ event: "producer-finished", profile, elapsedSeconds: Number(elapsed.toFixed(1)), submitted, acknowledged, errors, enqueuePerSecond: Number((acknowledged / elapsed).toFixed(1)), ingressAdmitted, ingressRejected, dispatchQueued }));
-closeAllQueues();
+await finalize();
 process.exit(errors ? 1 : 0);
