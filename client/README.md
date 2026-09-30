@@ -41,7 +41,7 @@ const worker = new Worker<{ recipient: string }>("email", async (job, signal) =>
 process.once("SIGINT", () => { void worker.close(); });
 ```
 
-`Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, and `rateLimitFacet`. Generic types provide compile-time help, not runtime payload validation.
+`Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, `rateLimitFacet`, and the durability knobs `idempotencyKey`, `enqueueRetryMaxMs`, `enqueueRetryBaseMs`, and `noIdempotencyKey` (see [Producer durability](#producer-durability)). `Queue.addBulk(items, bulkOpts?)` fans out to one `add` per item with bounded concurrency. Generic types provide compile-time help, not runtime payload validation.
 
 Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`, plus the health options `livenessStaleMs` and `readinessStaleMs` (see [Kubernetes health](#kubernetes-health)). Each worker processes one job at a time; create additional workers for concurrency.
 
@@ -51,7 +51,7 @@ Workers poll immediately, send heartbeats during async processing, and acknowled
 
 Completion retries use the exact same job/worker/attempt token: up to three total RPC calls for `Unavailable` or `DeadlineExceeded`, with 100ms then 200ms waits. Each call has `rpcTimeoutMs`; shutdown waits for this bounded completion sequence (about 15.3 seconds at the default timeout). Other status codes are not retried. The handler is not rerun, and `onCompleted` fires once only after a successful acknowledgment. Intermediate retryable errors are suppressed; terminal/exhausted errors reach `onError`. Exhaustion still leaves the completion outcome uncertain. Heartbeats stop when the handler settles; an uncommitted completion that outlives its lease is rejected by the broker.
 
-Enqueue without a key and FailJob are not automatically retried. Keyed enqueue uses the bounded retry policy below. Polling errors retry with exponential backoff (see [Transport resilience](#transport-resilience)). A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
+Every enqueue (`add`, `addBulk` items, and `enqueueChild`) uses the bounded, auto-keyed retry policy in [Producer durability](#producer-durability); FailJob is not automatically retried. Polling errors retry with exponential backoff (see [Transport resilience](#transport-resilience)). A completion RPC error is never converted into a failure acknowledgment. Deploy the broker's idempotent completion support before this client: an older broker may reject an otherwise successful replay.
 
 ## Transport resilience
 
@@ -281,13 +281,97 @@ const result = await queue.add(
 console.log(result.id, result.replayed);
 ```
 
-Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. Omit the option to retain ordinary enqueue behavior. The reply is an enqueue receipt, not a status query: a matching replay returns the job's ORIGINAL enqueue state (`Waiting`, or `Delayed` if a delay was set) even after the job has run. Treat `result.replayed === true` as "nothing new was created" and use `result.id` to look up live progress separately. See [Idempotent enqueue](../README.md#idempotent-enqueue) for the full model.
+Keys are scoped to the queue name. Matching requests return one job ID; conflicting payload/options return `AlreadyExists` without retry. The client accepts nonblank keys up to 256 UTF-8 bytes. The reply is an enqueue receipt, not a status query: a matching replay returns the job's ORIGINAL enqueue state (`Waiting`, or `Delayed` if a delay was set) even after the job has run. Treat `result.replayed === true` as "nothing new was created" and use `result.id` to look up live progress separately. See [Idempotent enqueue](../README.md#idempotent-enqueue) for the full model.
 
-Only keyed enqueue automatically retries `Unavailable` and `DeadlineExceeded`: three calls maximum, 100ms then 200ms waits, each with `rpcTimeoutMs`. Request data is serialized and options copied once before retrying. After exhaustion, the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work. This is not a durable producer buffer: use an outbox if submissions must survive producer-process loss before acknowledgment.
+Every `add` (and every `enqueueChild`, and every item of `addBulk`) now retries `Unavailable` and `DeadlineExceeded` under one unified, bounded policy — see [Producer durability](#producer-durability) for how the retry stays duplicate-free even without an explicit key. Request data is serialized and options copied once before retrying, so a retry never picks up a mutated caller object. After the window elapses the outcome is still uncertain; retain the same key and original request for a later retry. Changing the key could create duplicate work.
 
 Receipts have no standalone TTL and are reclaimed only once the job is gone from both the live and history tables, so the dedup window tracks job retention. The producer should reuse a stable business-operation ID or persist a generated UUID before its first request. Preserve payload serialization and options across restarts; JSON property ordering is significant. New intended work needs a new key. This prevents duplicate insertion, not repeated handler side effects.
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
+
+## Producer durability
+
+A producer survives a **broker hiccup** (a short outage: a rolling restart, a brief network partition, a load-balancer failover) without losing an enqueue and without creating a duplicate, and it has a clearly-scoped stop-gap for a **producer crash** (the producer process itself dying before the broker acknowledges). The distinction is the whole design:
+
+| Failure | What the client does | Guarantee |
+| --- | --- | --- |
+| Broker hiccup (broker down, producer alive) | Bounded, jittered enqueue retry across a wall-clock window; the same effective key rides every retry so the broker dedupes | At-least-once, no client-made duplicates |
+| Producer crash (producer dies before ack) | The in-memory outbox buffers the pending add, but that buffer is process-local | Best-effort; anything still pending is **lost on crash** unless you back the outbox with durable storage |
+
+### Auto-key: safe retries with or without your own key
+
+`add` derives an **effective idempotency key** once per call and reuses it across every retry of that call:
+
+1. `options.idempotencyKey` if you supply one (your stable business-operation ID — always preferred), else
+2. a UUID minted once at the top of the call and held for the whole retry loop.
+
+Because the same key is sent on every attempt, the broker collapses the client's own retries into a single job: at-least-once delivery with **zero duplicates from the retry loop**, even for a caller that never passed a key. Tuning lives on `AddOptions`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enqueueRetryMaxMs` | `15000` | Total wall-clock window for bounded enqueue retries. |
+| `enqueueRetryBaseMs` | `200` | First backoff step; doubles each attempt, capped at `enqueueRetryMaxMs`, jittered to 50–100%. |
+| `noIdempotencyKey` | `false` | Opt out: send no key, attempt once, accept duplicate risk. |
+
+Retry is attempted only for `Unavailable`/`DeadlineExceeded`; any other status (e.g. `AlreadyExists`, `InvalidArgument`, `ResourceExhausted`) throws immediately. Set `noIdempotencyKey: true` only for a fire-and-forget add where a duplicate is acceptable and you explicitly do not want a minted key.
+
+### `addBulk`: bounded client-side fan-out
+
+There is no batch RPC; `addBulk` fans out to one independent `add` per item through a bounded worker pool (default concurrency 8) so a large batch never spawns unbounded promises. Results are **positional** — one `AddResult` per input, in order:
+
+```typescript
+const results = await queue.addBulk(
+  [
+    { data: { orderId: "a" }, options: { idempotencyKey: "order:a" } },
+    { data: { orderId: "b" }, options: { idempotencyKey: "order:b" } },
+  ],
+  { concurrency: 8, stopOnError: false },
+);
+for (const r of results) {
+  if (r.ok) console.log(r.id, r.replayed);
+  else console.error(r.error);
+}
+```
+
+With `stopOnError: false` (the default) a mid-batch failure is captured as `{ ok: false, error }` and does not abort the rest. With `stopOnError: true` the call rejects on the first failure, with the partial positional results attached as `error.results`.
+
+### Enqueue-before-complete: exactly-once fan-out at the broker
+
+To fan a job out to children crash-safely, **enqueue every child idempotently, then complete the parent**. If the parent crashes after enqueuing but before completing, the broker redelivers it; the re-run re-enqueues the identical keys, the broker dedupes them, and the net effect is exactly-once fan-out *at the broker*. `enqueueChildBulk` assigns each child a positional index and a deterministic default key `${parentId}:${childName}:${index}`, which is what makes the replay dedupe:
+
+```typescript
+const worker = new Worker<{ orderId: string }>("orders", async job => {
+  // 1. Enqueue all children first. Deterministic keys => a redelivered parent replays,
+  //    it does not duplicate.
+  await job.enqueueChildBulk([
+    { name: "shipments", data: { orderId: job.data.orderId } },
+    { name: "receipts", data: { orderId: job.data.orderId } },
+  ]);
+  // 2. Only now return, which completes the parent. A crash before this point is safe.
+});
+```
+
+A single `job.enqueueChild(name, data)` still works; with no explicit key it mints a per-call UUID (no stable index), so prefer `enqueueChildBulk` — or pass your own `idempotencyKey` — when you need replay-safe fan-out. The broker makes *insertion* exactly-once; child **handler side effects remain at-least-once** and must tolerate duplicates.
+
+### In-memory outbox stop-gap (and plugging in your own store)
+
+`OutboxForwarder` is a store-and-forward buffer: `enqueue()` records a pending add and returns immediately, and a background tick loop (or a manual `drainOnce()`) forwards pending records to the broker, always re-using each record's held key so a re-forward is deduped. Transient broker errors leave a record pending for the next tick; a permanent error (e.g. `InvalidArgument`) poisons the record via `markFailed` and is surfaced through `onForwarded` — never silently dropped.
+
+```typescript
+import { Queue, OutboxForwarder, MemoryOutboxStore } from "./src/index";
+
+const queue = new Queue("emails");
+const forwarder = new OutboxForwarder(queue, new MemoryOutboxStore(), {
+  onForwarded: (key, result) => { if (!result.ok) console.error("poisoned", key, result.error); },
+  onDrained: () => console.info("outbox empty"),
+});
+forwarder.start();
+await forwarder.enqueue({ to: "user@example.com" }, { idempotencyKey: "welcome:user-1" });
+// ... on shutdown:
+await forwarder.stop();
+```
+
+`MemoryOutboxStore` is the **only** store shipped and it is in-memory by design: it absorbs a short broker outage without the producer blocking, but a producer-process crash loses anything still pending — this is a stop-gap, not durable persistence, and it adds no database or storage dependency. The `OutboxStore` interface (`put` / `claimPending` / `markSent` / `markFailed`) is the user-space seam for real durability: implement it against your own durable medium and the `OutboxForwarder` works unchanged, giving you producer-crash survival.
 
 ## Interactive demo
 

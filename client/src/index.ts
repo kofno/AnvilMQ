@@ -41,13 +41,52 @@ export function __setClientFactory(factory: ClientFactory): ClientFactory {
   clientFactory = factory;
   return previous;
 }
+/**
+ * Runtime-agnostic UUID mint. Prefers the WHATWG crypto available on Node 18+, Bun,
+ * and Deno; falls back to a Math.random v4 shape only when it is entirely absent, so
+ * the library never imports `node:*` on the enqueue hot path.
+ */
+function mintKey(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, ch => {
+    const r = (Math.random() * 16) | 0;
+    return (ch === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+/** Backoff with [50%,100%] jitter, mirroring the C1 poll-loop backoff so a producer
+ * fleet does not thunder back in lockstep when the broker restarts. */
+function jitteredBackoff(base: number, attempt: number, cap: number): number {
+  const exp = Math.min(cap, base * 2 ** attempt);
+  return Math.floor(exp * (0.5 + Math.random() * 0.5));
+}
+
+/** Run `task` for indices 0..count-1 with at most `concurrency` in flight. `task` must
+ * settle its own outcome (never reject) so the pool cannot leak an unhandled rejection. */
+async function boundedPool(count: number, concurrency: number, task: (index: number) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => { for (let i = next++; i < count; i = next++) await task(i); };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, count)) }, worker));
+}
+
 export interface JobMetadata { parentId: string; traceId: string; executionDepth: number }
 export interface AddOptions {
   priority?: number; delayMs?: number; maxAttempts?: number;
   retryBackoffMs?: number; retryBackoffMaxMs?: number;
   metadata?: Partial<JobMetadata>; rateLimitFacet?: string;
   idempotencyKey?: string;
+  /** Total wall-clock window for bounded enqueue retries on transient errors. Default 15000. */
+  enqueueRetryMaxMs?: number;
+  /** First backoff step; doubles each attempt, capped at enqueueRetryMaxMs. Default 200. */
+  enqueueRetryBaseMs?: number;
+  /** Opt out of the auto-minted idempotency key: send no key, attempt once, accept duplicate risk. Default false. */
+  noIdempotencyKey?: boolean;
 }
+/** One positional outcome from {@link Queue.addBulk}: a receipt on success, or the raw error. */
+export type AddResult =
+  | { ok: true; id: string; state: string; replayed: boolean }
+  | { ok: false; error: unknown };
 /** Options for {@link Job.enqueueChild}: everything except the lineage fields, which
  * the server owns (parent is forced to the current job; depth/trace are derived). */
 export type ChildAddOptions = Omit<AddOptions, "metadata">;
@@ -61,6 +100,15 @@ export interface Job<T> {
    * fields cannot be set by the caller.
    */
   enqueueChild<C = unknown>(name: string, data: C, options?: ChildAddOptions): Promise<{ id: string; state: string; replayed: boolean }>;
+  /**
+   * Enqueue a fan-out of children of this job with bounded concurrency. Each child is
+   * assigned a positional index (0..n-1) and, unless the caller supplies its own
+   * `idempotencyKey`, a deterministic default key `${parentId}:${childName}:${index}`.
+   * That determinism is what makes the enqueue-before-complete pattern exactly-once at
+   * the broker: if the parent is redelivered after a crash, the identical keys replay
+   * and the broker dedupes them. Rejects on the first child that fails permanently.
+   */
+  enqueueChildBulk(children: { name: string; data: unknown; options?: ChildAddOptions }[]): Promise<{ id: string; state: string; replayed: boolean }[]>;
 }
 interface Claim { found: boolean; id: string; name: string; payload: Buffer; attempts: number; metadata: JobMetadata; leaseExpiresAtMs: number }
 
@@ -73,18 +121,35 @@ async function sendAdd<T>(connection: Connection, name: string, data: T, options
     const value = options[key];
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`${key} must be a nonnegative safe integer`);
   }
+  for (const key of ["enqueueRetryMaxMs", "enqueueRetryBaseMs"] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`${key} must be a nonnegative finite number`);
+  }
   if (options.maxAttempts !== undefined && options.maxAttempts > 0xffffffff) throw new Error("maxAttempts exceeds uint32");
   if (options.priority !== undefined && (!Number.isInteger(options.priority) || options.priority < -2147483648 || options.priority > 2147483647)) throw new Error("priority exceeds int32");
   const json = JSON.stringify(data);
   if (json === undefined) throw new Error("payload must be JSON serializable");
-  // Freeze the request once; a retry must not pick up mutated caller options/data.
-  const request = { ...options, metadata: options.metadata ? { ...options.metadata } : undefined, name, payload: Buffer.from(json) };
+  // Derive the effective idempotency key ONCE per call and reuse it across every retry,
+  // so the broker dedupes our own retries: at-least-once delivery, zero client-made
+  // duplicates. An explicit key wins; otherwise mint a UUID — UNLESS the caller opted
+  // out, in which case we send no key and make a single attempt (duplicate risk theirs).
+  const effectiveKey = options.noIdempotencyKey ? undefined : (options.idempotencyKey ?? mintKey());
+  const maxMs = options.enqueueRetryMaxMs ?? 15000;
+  const baseMs = options.enqueueRetryBaseMs ?? 200;
+  // Freeze the request once; a retry must not pick up mutated caller options/data, and
+  // client-only knobs (retry window, opt-out flag) never travel to the broker.
+  const { enqueueRetryMaxMs: _rm, enqueueRetryBaseMs: _rb, noIdempotencyKey: _ni, idempotencyKey: _ik, metadata, ...rest } = options;
+  const request = { ...rest, metadata: metadata ? { ...metadata } : undefined, name, payload: Buffer.from(json), ...(effectiveKey ? { idempotencyKey: effectiveKey } : {}) };
+  const started = Date.now();
   for (let attempt = 0; ; attempt++) {
     try { return await connection.call("addJob", request); }
     catch (error) {
       const code = (error as grpc.ServiceError).code;
-      if (!request.idempotencyKey || attempt >= 2 || (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED)) throw error;
-      await sleep(100 * 2 ** attempt);
+      const retryable = code === grpc.status.UNAVAILABLE || code === grpc.status.DEADLINE_EXCEEDED;
+      // No key ⇒ a retry could duplicate, so never retry. Non-transient ⇒ retry is futile.
+      // Window elapsed ⇒ stop and surface the last error to the caller.
+      if (!effectiveKey || !retryable || Date.now() - started >= maxMs) throw error;
+      await sleep(jitteredBackoff(baseMs, attempt, maxMs));
     }
   }
 }
@@ -126,6 +191,43 @@ export class Queue<T = unknown> {
   }
   async add(data: T, options: AddOptions = {}): Promise<{ id: string; state: string; replayed: boolean }> {
     return sendAdd(this.connection, this.name, data, options);
+  }
+  /**
+   * Client-side fan-out: one independent {@link sendAdd} per item (each with its own
+   * effective key and bounded retry), run through a bounded worker pool (default
+   * concurrency 8) so a large batch never spawns unbounded promises. Results are
+   * positional, one per input. With `stopOnError:false` (the default) a mid-batch
+   * failure is captured as `{ ok:false }` and does not abort the rest. With
+   * `stopOnError:true` the returned promise rejects on the first failure, with the
+   * partial positional results attached as `error.results`.
+   */
+  async addBulk(
+    items: { data: T; options?: AddOptions }[],
+    bulkOpts: { concurrency?: number; stopOnError?: boolean } = {},
+  ): Promise<AddResult[]> {
+    const concurrency = bulkOpts.concurrency ?? 8;
+    if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("concurrency must be a positive integer");
+    const stopOnError = bulkOpts.stopOnError ?? false;
+    const results = new Array<AddResult>(items.length);
+    let firstError: unknown;
+    let stopped = false;
+    await boundedPool(items.length, concurrency, async i => {
+      if (stopped) return;
+      const item = items[i];
+      try {
+        const r = await sendAdd(this.connection, this.name, item.data, item.options);
+        results[i] = { ok: true, id: r.id, state: r.state, replayed: r.replayed };
+      } catch (error) {
+        results[i] = { ok: false, error };
+        if (stopOnError && !stopped) { stopped = true; firstError = error; }
+      }
+    });
+    if (stopOnError && stopped) {
+      const err = firstError instanceof Error ? firstError : new Error(String(firstError));
+      (err as { results?: AddResult[] }).results = results;
+      throw err;
+    }
+    return results;
   }
   close() { this.connection.close(); }
 }
@@ -344,7 +446,25 @@ export class Worker<T = unknown> {
       // parent and leaves depth/trace for the server to derive.
       const enqueueChild = <C = unknown>(name: string, childData: C, options?: ChildAddOptions) =>
         sendAdd(this.connection, name, childData, { ...options, metadata: { parentId: claim.id } });
-      await this.processor({ id: claim.id, name: claim.name, data, attempts: claim.attempts, metadata: claim.metadata, leaseExpiresAtMs: claim.leaseExpiresAtMs, enqueueChild }, handler.signal);
+      // Deterministic fan-out: default child key is `${parentId}:${childName}:${index}`
+      // unless the caller overrides idempotencyKey. Redelivery of the parent replays the
+      // identical keys, so the broker dedupes ⇒ exactly-once fan-out at the broker.
+      const enqueueChildBulk = async (children: { name: string; data: unknown; options?: ChildAddOptions }[]) => {
+        const results = new Array<{ id: string; state: string; replayed: boolean }>(children.length);
+        let firstError: unknown;
+        let stopped = false;
+        await boundedPool(children.length, 8, async i => {
+          if (stopped) return;
+          const child = children[i];
+          const key = child.options?.idempotencyKey ?? `${claim.id}:${child.name}:${i}`;
+          try {
+            results[i] = await sendAdd(this.connection, child.name, child.data, { ...child.options, idempotencyKey: key, metadata: { parentId: claim.id } });
+          } catch (error) { if (!stopped) { stopped = true; firstError = error; } }
+        });
+        if (stopped) throw firstError;
+        return results;
+      };
+      await this.processor({ id: claim.id, name: claim.name, data, attempts: claim.attempts, metadata: claim.metadata, leaseExpiresAtMs: claim.leaseExpiresAtMs, enqueueChild, enqueueChildBulk }, handler.signal);
     } catch (error) { failed = true; failure = error; }
     heartbeatStop.abort();
     await beats;
@@ -479,4 +599,170 @@ export function fetchHealthHandler(
     const ok = path === livePath ? health.live : health.ready;
     return new Response(JSON.stringify(health), { status: ok ? 200 : 503, headers });
   };
+}
+
+/**
+ * A store-and-forward record. `payload` is the caller's data (not yet JSON-encoded);
+ * `key` is the effective idempotency key, minted once and held for the record's whole
+ * lifetime so re-forwards are deduped by the broker.
+ */
+export interface OutboxRecord {
+  key: string;
+  queue: string;
+  payload: unknown;
+  options?: AddOptions;
+  state: "pending" | "sent" | "failed";
+  attempts: number;
+  createdAt: number;
+  lastError?: unknown;
+}
+
+/**
+ * The pluggable durability seam. {@link MemoryOutboxStore} is the ONLY implementation
+ * shipped and it is in-memory (a producer crash loses un-forwarded records — by design).
+ * To make submissions survive producer-process loss, implement this interface against
+ * your own durable medium; the {@link OutboxForwarder} works unchanged against any store.
+ */
+export interface OutboxStore {
+  /** Insert or replace a record keyed by `record.key`. */
+  put(record: OutboxRecord): Promise<void>;
+  /** Return up to `limit` records still in the `pending` state. */
+  claimPending(limit: number): Promise<OutboxRecord[]>;
+  /** Mark the record forwarded (broker accepted it). */
+  markSent(key: string): Promise<void>;
+  /** Mark the record poisoned (a permanent, non-retryable enqueue error). */
+  markFailed(key: string, error: unknown): Promise<void>;
+}
+
+/**
+ * In-memory {@link OutboxStore} backed by a `Map`. Suitable as a best-effort stop-gap
+ * that absorbs a short broker outage without the producer blocking or losing the add.
+ * It does NOT persist: anything still `pending` when the process dies is lost. Swap in
+ * a durable {@link OutboxStore} when the buffer must outlive the producer process.
+ */
+export class MemoryOutboxStore implements OutboxStore {
+  private records = new Map<string, OutboxRecord>();
+  async put(record: OutboxRecord): Promise<void> {
+    // First writer for a key wins its createdAt/attempts; a re-put of the same key
+    // (idempotent enqueue) does not reset an in-flight record's bookkeeping.
+    if (!this.records.has(record.key)) this.records.set(record.key, { ...record });
+  }
+  async claimPending(limit: number): Promise<OutboxRecord[]> {
+    const out: OutboxRecord[] = [];
+    for (const r of this.records.values()) {
+      if (r.state === "pending") { out.push({ ...r }); if (out.length >= limit) break; }
+    }
+    return out;
+  }
+  async markSent(key: string): Promise<void> {
+    const r = this.records.get(key);
+    if (r) { r.state = "sent"; r.attempts++; }
+  }
+  async markFailed(key: string, error: unknown): Promise<void> {
+    const r = this.records.get(key);
+    if (r) { r.state = "failed"; r.attempts++; r.lastError = error; }
+  }
+  /** Introspection: a snapshot copy of a single record, or undefined. */
+  get(key: string): OutboxRecord | undefined { const r = this.records.get(key); return r ? { ...r } : undefined; }
+  /** Introspection: snapshot copies of every record. */
+  all(): OutboxRecord[] { return [...this.records.values()].map(r => ({ ...r })); }
+  /** Introspection: number of records in a given state (all states if omitted). */
+  count(state?: OutboxRecord["state"]): number {
+    if (!state) return this.records.size;
+    let n = 0; for (const r of this.records.values()) if (r.state === state) n++; return n;
+  }
+}
+
+export interface OutboxForwarderOptions {
+  /** Drain tick interval. Default 250. */
+  intervalMs?: number;
+  /** Maximum records claimed per drain. Default 32. */
+  batchSize?: number;
+  /** Concurrent forwards within a drain. Default 8. */
+  concurrency?: number;
+  /** Fired per record once it reaches a terminal outcome (sent, or poisoned). */
+  onForwarded?: (key: string, result: AddResult) => void;
+  /** Fired once each time a non-empty backlog is drained to zero pending records. */
+  onDrained?: () => void;
+}
+
+/**
+ * Drains an {@link OutboxStore} to a {@link Queue}. `enqueue()` records a pending add and
+ * returns immediately (best-effort store-and-forward); a background tick loop (start/stop)
+ * or a manual {@link drainOnce} forwards pending records. Every forward uses the record's
+ * held key, so a re-forward is deduped by the broker (at-least-once, no duplicate jobs).
+ * Transient broker errors (`UNAVAILABLE`/`DEADLINE_EXCEEDED`) leave the record pending for
+ * the next tick; a permanent error (e.g. `INVALID_ARGUMENT`) poisons the record via
+ * `markFailed` and is surfaced through `onForwarded` — never silently dropped.
+ */
+export class OutboxForwarder<T = unknown> {
+  private readonly intervalMs: number;
+  private readonly batchSize: number;
+  private readonly concurrency: number;
+  private running?: Promise<void>;
+  private wake = new AbortController();
+  private stopping = false;
+  constructor(private queue: Queue<T>, private store: OutboxStore, private opts: OutboxForwarderOptions = {}) {
+    this.intervalMs = opts.intervalMs ?? 250;
+    this.batchSize = opts.batchSize ?? 32;
+    this.concurrency = opts.concurrency ?? 8;
+    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) throw new Error("intervalMs must be a positive finite number");
+    if (!Number.isInteger(this.batchSize) || this.batchSize < 1) throw new Error("batchSize must be a positive integer");
+    if (!Number.isInteger(this.concurrency) || this.concurrency < 1) throw new Error("concurrency must be a positive integer");
+  }
+  /** Mint the effective key (business idempotencyKey else UUID) and store a pending record. */
+  async enqueue(data: T, options?: AddOptions): Promise<{ key: string }> {
+    const key = options?.idempotencyKey ?? mintKey();
+    await this.store.put({ key, queue: this.queue.name, payload: data, options, state: "pending", attempts: 0, createdAt: Date.now() });
+    return { key };
+  }
+  /** Forward one batch of pending records. Returns how many reached a terminal outcome
+   * (sent or poisoned) this pass; transient failures stay pending and are not counted. */
+  async drainOnce(): Promise<number> {
+    const batch = await this.store.claimPending(this.batchSize);
+    if (batch.length === 0) return 0;
+    let forwarded = 0;
+    await boundedPool(batch.length, this.concurrency, async i => {
+      const record = batch[i];
+      try {
+        // Always force the held key and a single attempt: the tick loop, not add()'s own
+        // window, owns retry cadence so a down broker does not block a drain for 15s.
+        const r = await this.queue.add(record.payload as T, { ...record.options, idempotencyKey: record.key, noIdempotencyKey: false, enqueueRetryMaxMs: 0 });
+        await this.store.markSent(record.key);
+        forwarded++;
+        this.opts.onForwarded?.(record.key, { ok: true, id: r.id, state: r.state, replayed: r.replayed });
+      } catch (error) {
+        const code = (error as grpc.ServiceError).code;
+        if (code === grpc.status.UNAVAILABLE || code === grpc.status.DEADLINE_EXCEEDED) return; // transient: retry next tick
+        await this.store.markFailed(record.key, error);
+        forwarded++;
+        this.opts.onForwarded?.(record.key, { ok: false, error });
+      }
+    });
+    return forwarded;
+  }
+  /** Start the background drain loop. Idempotent; a second call while running is a no-op. */
+  start(): void {
+    if (this.running) return;
+    this.stopping = false;
+    this.wake = new AbortController();
+    this.running = (async () => {
+      while (!this.stopping) {
+        try {
+          const forwarded = await this.drainOnce();
+          if (forwarded > 0 && !this.stopping) {
+            const remaining = await this.store.claimPending(1);
+            if (remaining.length === 0) { try { this.opts.onDrained?.(); } catch { /* ignore */ } }
+          }
+        } catch { /* a store error should not kill the loop */ }
+        await sleep(this.intervalMs, undefined, { signal: this.wake.signal }).catch(() => {});
+      }
+    })();
+  }
+  /** Stop the background drain loop and await its exit. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.wake.abort();
+    if (this.running) { await this.running; this.running = undefined; }
+  }
 }
