@@ -142,8 +142,53 @@ export interface WorkerOptions extends ConnectionOptions {
   onConnectionLost?: (info: { error: unknown; consecutiveFailures: number }) => void;
   /** Fired once when polling succeeds again after a lost connection. */
   onConnectionRestored?: (info: { downForMs: number; failuresWhileDown: number }) => void;
+  /**
+   * Liveness staleness budget. Liveness fails only when the poll loop stops turning
+   * (a blocked event loop or a dead poll task) for longer than this. A broker outage
+   * must NOT fail liveness. Default: max(heartbeatMs, pollBackoffMaxMs) * 3, floored at 30000.
+   */
+  livenessStaleMs?: number;
+  /**
+   * Readiness staleness budget. Readiness fails when no successful broker round-trip
+   * (poll, heartbeat, or completion) has happened within this window. Must exceed
+   * heartbeatIntervalMs so a long job's heartbeats keep readiness fresh instead of
+   * flapping. Default: max(heartbeatMs, pollBackoffMaxMs) * 2, floored at 20000.
+   */
+  readinessStaleMs?: number;
 }
 export type Processor<T> = (job: Job<T>, signal: AbortSignal) => Promise<void>;
+
+/**
+ * A synchronous, I/O-free snapshot of a worker's k8s health surface. The distinction
+ * that drives everything: `live` ("my loop is turning") must survive a broker outage,
+ * while `ready` ("I can reach the broker and do work") must fail during one.
+ */
+export interface WorkerHealth {
+  /** Liveness: the poll loop is turning (map to livenessProbe -> /livez). */
+  live: boolean;
+  /** Readiness: live && connected && !stale && !stopping && polled at least once (map to readinessProbe -> /readyz). */
+  ready: boolean;
+  /** C1 poll-loop connection state. */
+  connected: boolean;
+  /** Broker-contact staleness exceeded readinessStaleMs. */
+  stale: boolean;
+  /** close() has begun. */
+  stopping: boolean;
+  /** Consecutive poll-failure streak (0 while reachable). */
+  consecutivePollFailures: number;
+  /** Jobs currently processing (0/1 pre-C4). */
+  inFlight: number;
+  /** Epoch ms of the last successful poll, 0 if never. */
+  lastPollOkAt: number;
+  /** Epoch ms of the last successful broker round-trip (poll | heartbeat | completion), 0 if never. */
+  lastBrokerContactAt: number;
+  /** Epoch ms of the last poll-loop or heartbeat tick. */
+  loopAliveAt: number;
+  /** Milliseconds since worker construction. */
+  uptimeMs: number;
+  /** Date.now() at snapshot, so a reader is self-contained. */
+  now: number;
+}
 
 /** Starts polling immediately. close() drains the current handler while retaining heartbeats. */
 export class Worker<T = unknown> {
@@ -160,6 +205,12 @@ export class Worker<T = unknown> {
   private connected = true;
   private lostSince = 0;
   private failuresWhileDown = 0;
+  private inFlight = 0;
+  private lastBrokerContactAt = 0;
+  private loopAliveAt = Date.now();
+  private readonly startedAt = Date.now();
+  private livenessStaleMs: number;
+  private readinessStaleMs: number;
   constructor(private name: string, private processor: Processor<T>, private options: WorkerOptions = {}) {
     this.workerId = options.workerId ?? crypto.randomUUID();
     this.pollMs = options.pollIntervalMs ?? 250;
@@ -170,6 +221,14 @@ export class Worker<T = unknown> {
     if (!Number.isFinite(this.pollMs) || this.pollMs <= 0 || !Number.isFinite(this.heartbeatMs) || this.heartbeatMs <= 0 || this.heartbeatMs > 10000) throw new Error("invalid poll/heartbeat interval (heartbeat maximum is 10000ms)");
     if (!Number.isFinite(this.pollBackoffMaxMs) || this.pollBackoffMaxMs <= 0 || this.pollBackoffMaxMs < this.pollMs) throw new Error("pollBackoffMaxMs must be a positive finite number and >= pollIntervalMs");
     if (!Number.isInteger(this.connectionLostThreshold) || this.connectionLostThreshold < 1) throw new Error("connectionLostThreshold must be an integer >= 1");
+    if (options.livenessStaleMs !== undefined && (!Number.isFinite(options.livenessStaleMs) || options.livenessStaleMs <= 0)) throw new Error("livenessStaleMs must be a positive finite number");
+    if (options.readinessStaleMs !== undefined && (!Number.isFinite(options.readinessStaleMs) || options.readinessStaleMs <= 0)) throw new Error("readinessStaleMs must be a positive finite number");
+    const staleBase = Math.max(this.heartbeatMs, this.pollBackoffMaxMs);
+    this.livenessStaleMs = options.livenessStaleMs ?? Math.max(30000, staleBase * 3);
+    this.readinessStaleMs = options.readinessStaleMs ?? Math.max(20000, staleBase * 2);
+    // A readiness window at or below the heartbeat interval would flap NOT-ready during
+    // every long job, since only heartbeats (not polls) refresh contact while a job runs.
+    if (this.readinessStaleMs <= this.heartbeatMs) throw new Error("readinessStaleMs must be greater than heartbeatIntervalMs so long jobs do not flap readiness");
     this.connection = new Connection(options);
     this.running = this.run();
   }
@@ -179,22 +238,34 @@ export class Worker<T = unknown> {
   private async run() {
     try {
       while (!this.stopping.signal.aborted) {
+        // Refresh loop liveness at the top of every iteration (including outage backoff
+        // iterations) so a broker outage never fails liveness.
+        this.loopAliveAt = Date.now();
         let ok = false;
         try {
           const claim = await this.connection.call<Claim>("getNextJob", { workerId: this.workerId, queueNames: [this.name] });
           ok = true;
           this.onPollSuccess();
           // A claim returned during shutdown still belongs to us and must be drained.
-          if (claim.found) { await this.process(claim); continue; }
+          if (claim.found) {
+            // inFlight is tracked at the call site so drain-on-close accounting stays correct.
+            this.inFlight++;
+            try { await this.process(claim); } finally { this.inFlight--; }
+            continue;
+          }
         } catch (error) { this.onPollFailure(error); this.report(error); }
         const delay = ok ? this.pollMs : this.nextBackoffDelay();
         await sleep(delay, undefined, { signal: this.stopping.signal }).catch(() => {});
       }
     } finally { this.connection.close(); }
   }
+  /** Refresh both staleness clocks off a SUCCESSFUL broker round-trip (poll, heartbeat,
+   * or completion). Never emits connection events and never changes `connected`. */
+  private markContact() { this.lastBrokerContactAt = this.loopAliveAt = Date.now(); }
   /** A poll that returns (found OR not-found) proves the broker is reachable. */
   private onPollSuccess() {
     this.lastPollOkAt = Date.now();
+    this.markContact();
     if (!this.connected) {
       const info = { downForMs: Date.now() - this.lostSince, failuresWhileDown: this.failuresWhileDown };
       this.connected = true;
@@ -226,6 +297,27 @@ export class Worker<T = unknown> {
   get consecutivePollFailures(): number { return this.consecutiveFailures; }
   /** Whether the poll loop currently considers the broker reachable. Observability/testing hook. */
   get isConnected(): boolean { return this.connected; }
+  /**
+   * Synchronous, I/O-free health snapshot for k8s probes. Reads only in-memory fields
+   * plus one Date.now(); issues no RPC and never awaits.
+   */
+  health(): WorkerHealth {
+    const now = Date.now();
+    const stale = this.lastBrokerContactAt > 0 && (now - this.lastBrokerContactAt) > this.readinessStaleMs;
+    const live = (now - this.loopAliveAt) <= this.livenessStaleMs;
+    const stopping = this.stopping.signal.aborted;
+    // Startup gate: a fresh pod is not ready until it reaches the broker once, even
+    // though C1 seeds connected = true optimistically.
+    const ready = live && this.connected && !stale && !stopping && this.lastPollOkAt > 0;
+    return {
+      live, ready, connected: this.connected, stale, stopping,
+      consecutivePollFailures: this.consecutiveFailures, inFlight: this.inFlight,
+      lastPollOkAt: this.lastPollOkAt, lastBrokerContactAt: this.lastBrokerContactAt,
+      loopAliveAt: this.loopAliveAt, uptimeMs: now - this.startedAt, now,
+    };
+  }
+  /** Test-only: backdate the loop-liveness clock to simulate a wedged event loop. Not part of the supported API. */
+  __setLoopAliveAt(value: number): void { this.loopAliveAt = value; }
   private async process(claim: Claim) {
     const handler = new AbortController();
     const heartbeatStop = new AbortController();
@@ -234,7 +326,10 @@ export class Worker<T = unknown> {
       while (!heartbeatStop.signal.aborted) {
         await sleep(this.heartbeatMs, undefined, { signal: heartbeatStop.signal }).catch(() => {});
         if (heartbeatStop.signal.aborted) break;
-        try { await this.connection.call("heartbeat", identity); }
+        // Refresh loop liveness on every heartbeat tick so a long async job keeps
+        // liveness fresh; a blocked event loop stops this callback and liveness fails.
+        this.loopAliveAt = Date.now();
+        try { await this.connection.call("heartbeat", identity); this.markContact(); }
         catch (error) {
           // Even a timeout leaves ownership uncertain. Never acknowledge after this.
           handler.abort(error); this.report(error); break;
@@ -269,6 +364,7 @@ export class Worker<T = unknown> {
           await sleep(100 * 2 ** attempt);
         }
       }
+      this.markContact();
       this.options.onCompleted?.(claim.id);
     }
   }
@@ -322,4 +418,65 @@ export class IngressLimits {
   }
   status(facetKey: string): Promise<IngressLimitStatus> { return this.connection.call("getIngressLimitStatus", { facetKey }); }
   close() { this.connection.close(); }
+}
+
+export interface HealthHttpOptions {
+  /** Liveness path (default /livez). */
+  livePath?: string;
+  /** Readiness path (default /readyz). */
+  readyPath?: string;
+}
+
+/** Extract the pathname from a request URL that may be absolute or a bare path, and
+ * may carry a query string or fragment. Compares pathname only. */
+function healthPathname(url: string | undefined): string {
+  const raw = url ?? "/";
+  try { return new URL(raw).pathname; } catch { return raw.split("?")[0].split("#")[0]; }
+}
+
+/**
+ * A `node:http`-shaped request listener for k8s probes. `GET {livePath}` returns 200 iff
+ * `worker.health().live`, `GET {readyPath}` returns 200 iff `worker.health().ready`, else
+ * 503; the body is the full {@link WorkerHealth} JSON in both cases. Unknown path -> 404,
+ * non-GET -> 405. Does zero I/O and opens no socket: pass it to `http.createServer(...)`.
+ * The library never imports `node:http`, keeping it runtime-agnostic.
+ */
+export function nodeHealthListener(
+  worker: { health(): WorkerHealth },
+  opts: HealthHttpOptions = {},
+): (req: { url?: string; method?: string }, res: { statusCode: number; setHeader(k: string, v: string): void; end(b?: string): void }) => void {
+  const livePath = opts.livePath ?? "/livez";
+  const readyPath = opts.readyPath ?? "/readyz";
+  return (req, res) => {
+    const path = healthPathname(req.url);
+    res.setHeader("content-type", "application/json");
+    if (path !== livePath && path !== readyPath) { res.statusCode = 404; res.end(JSON.stringify({ error: "not found" })); return; }
+    if ((req.method ?? "GET") !== "GET") { res.setHeader("allow", "GET"); res.statusCode = 405; res.end(JSON.stringify({ error: "method not allowed" })); return; }
+    const health = worker.health();
+    res.statusCode = (path === livePath ? health.live : health.ready) ? 200 : 503;
+    res.end(JSON.stringify(health));
+  };
+}
+
+/**
+ * A WHATWG-`fetch`-shaped handler for k8s probes, for runtimes whose server takes a
+ * `(Request) => Response` function. Same semantics as {@link nodeHealthListener}:
+ * `GET {livePath}` -> 200/503 on `live`, `GET {readyPath}` -> 200/503 on `ready`, full
+ * {@link WorkerHealth} JSON body, unknown path -> 404, non-GET -> 405. Does zero I/O.
+ */
+export function fetchHealthHandler(
+  worker: { health(): WorkerHealth },
+  opts: HealthHttpOptions = {},
+): (request: { url: string; method?: string }) => Response {
+  const livePath = opts.livePath ?? "/livez";
+  const readyPath = opts.readyPath ?? "/readyz";
+  const headers = { "content-type": "application/json" };
+  return (request) => {
+    const path = healthPathname(request.url);
+    if (path !== livePath && path !== readyPath) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers });
+    if ((request.method ?? "GET") !== "GET") return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: { ...headers, allow: "GET" } });
+    const health = worker.health();
+    const ok = path === livePath ? health.live : health.ready;
+    return new Response(JSON.stringify(health), { status: ok ? 200 : 503, headers });
+  };
 }
