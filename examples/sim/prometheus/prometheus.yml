@@ -8,3 +8,8 @@ scrape_configs:
       - targets: ["broker:9090"]
         labels:
           cluster: sim
+  - job_name: anvilmq-client
+    static_configs:
+      - targets: ["workers:9095"]
+        labels:
+          cluster: sim

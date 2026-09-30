@@ -20,6 +20,7 @@ Allow a minute for rate-based charts to fill.
 | Prometheus | http://127.0.0.1:9490 | Metrics queries; scrapes the broker every 5 seconds |
 | Broker gRPC | `127.0.0.1:50071` | Queue client and worker API |
 | Broker HTTP | http://127.0.0.1:9092 | `/readyz`, `/metrics`, and read-only history APIs |
+| Worker health | http://127.0.0.1:9095 | Aggregated worker-fleet `/livez`, `/readyz`, and `/metrics` |
 | Loki | http://127.0.0.1:3100 | Log ingestion and queries |
 
 **Grafana credentials are `admin` / `admin`, with anonymous viewing enabled. Demo-only:**
@@ -40,6 +41,7 @@ benchmark ports (`50061` / `9091`); this example does not include another benchm
 | **AnvilMQ queue health** | Throughput, terminal failures, retries, p95 latency, backlog, per-job overview, and retained history/receipt pruning |
 | **AnvilMQ safety controls (ancestry & dispatch throttle)** | Ancestry-depth rejection, dispatch-side throttling, and structured enqueue-rejection logs |
 | **AnvilMQ ingress velocity limits** | Admission-side rejections and task completion rate during bursts |
+| **AnvilMQ client (worker fleet)** | Client-side view from the workers' aggregated `anvilmq_client_*` series: jobs completed, active, failed, and retried, connection up, and poll-failure/reconnect turbulence |
 | **AnvilMQ recent failures** | Terminal failures with error messages, attempts, depth, trace IDs, and job IDs from the broker HTTP API |
 
 The default producer exercises safety controls periodically. The standalone demos below cover
@@ -100,6 +102,13 @@ The default event chain is **1 event -> 2 tasks -> 6 subtasks -> 6 writes**, at 
 through 4. Payloads use synthetic tenant IDs, record IDs, and byte counts, not real data.
 The shared `ProcessTask` handler keeps direct tasks lightweight without changing this chain.
 
+Each job name is served by a single `Worker` running up to `SIM_WORKER_CONCURRENCY` handlers
+in parallel (the client's `concurrency` option), so the fleet is eight workers, not eight per
+name. The workers drain in-flight handlers through the client's `gracefulShutdown` on
+`SIGTERM`/`SIGINT` and expose one aggregated `/livez`, `/readyz`, and `/metrics` surface on
+`SIM_HEALTH_PORT` (default `9095`), scraped by Prometheus and charted on the **AnvilMQ client
+(worker fleet)** dashboard.
+
 The `prod` profile is a synthetic mixed demo, not a production trace: its relative weights
 are 50 events, 35 direct tasks, 8 delays, 4 CPU jobs, 3 failures, and 1 recursive probe.
 It targets 13 top-level submissions/s; fan-out adds internal jobs. The `soak` profile submits
@@ -118,7 +127,8 @@ Set environment variables before `docker compose up -d` to override Compose defa
 |---|---|---|
 | `SIM_PROFILE` | `prod` | Mixed demo or `soak` |
 | `SIM_RATE` | `13` | Aggregate top-level jobs/s; `0` is unlimited |
-| `SIM_WORKER_CONCURRENCY` | `2` | Workers per job name |
+| `SIM_WORKER_CONCURRENCY` | `2` | Per-name handler concurrency (one worker per name) |
+| `SIM_HEALTH_PORT` | `9095` | Aggregated worker-fleet health/metrics port |
 | `SIM_WORK_MS` | `15` | Jittered simulated downstream latency |
 | `SIM_TASKS_PER_EVENT` | `2` | First fan-out multiplier |
 | `SIM_SUBTASKS_PER_TASK` | `3` | Second fan-out multiplier |

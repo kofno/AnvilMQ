@@ -1,6 +1,6 @@
 # AnvilMQ TypeScript client (Bun)
 
-This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a minimal starting point, not a compatible replacement for any existing client or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are not implemented.
+This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a minimal starting point, not a compatible replacement for any existing client or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are intentionally not implemented, so it is intended for in-cluster (trusted-network) use.
 
 ## Setup and validation
 
@@ -21,7 +21,7 @@ It also runs a test-only gRPC proxy that forwards completion to the real broker,
 ## API
 
 ```typescript
-import { Queue, Worker } from "./src/index";
+import { Queue, Worker, gracefulShutdown } from "./src/index";
 
 const queue = new Queue<{ recipient: string }>("email");
 await queue.add({ recipient: "user@example.com" }, {
@@ -38,12 +38,12 @@ const worker = new Worker<{ recipient: string }>("email", async (job, signal) =>
   console.log(job.data.recipient, job.id, job.attempts);
 }, { onError: error => console.error(error) });
 
-process.once("SIGINT", () => { void worker.close(); });
+gracefulShutdown([worker]);
 ```
 
 `Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, `rateLimitFacet`, and the durability knobs `idempotencyKey`, `enqueueRetryMaxMs`, `enqueueRetryBaseMs`, and `noIdempotencyKey` (see [Producer durability](#producer-durability)). `Queue.addBulk(items, bulkOpts?)` fans out to one `add` per item with bounded concurrency. Generic types provide compile-time help, not runtime payload validation.
 
-Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`, plus the health options `livenessStaleMs` and `readinessStaleMs` (see [Kubernetes health](#kubernetes-health)). Each worker processes one job at a time; create additional workers for concurrency.
+Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`, plus the health options `livenessStaleMs` and `readinessStaleMs` (see [Kubernetes health](#kubernetes-health)). A single `Worker` runs up to `concurrency` handlers in parallel (default `1`, i.e. strictly one job at a time); raise it to process more jobs over one connection instead of creating extra workers (see [Concurrency & throughput](#concurrency--throughput)).
 
 Workers poll immediately, send heartbeats during async processing, and acknowledge with the claimed attempt number. Handler errors, including JSON decoding errors, invoke FailJob. If heartbeat fails or times out, the handler's signal aborts and the client sends no acknowledgment. Handlers must honor cancellation; the client cannot undo external side effects. Avoid blocking the event loop, which prevents heartbeats.
 
@@ -181,6 +181,124 @@ Together with [Transport resilience](#transport-resilience), this retires the ex
 
 **Security:** the health port is unauthenticated plaintext (transport auth and TLS are future work). Expose it on a cluster-internal address or listener only — never on a public interface — and rely on the probe's own network path rather than exposing it externally.
 
+## Concurrency & throughput
+
+A single `Worker` can run more than one handler at a time. Two options tune it: 
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `1` | Max handlers a single worker runs in parallel. `1` is the strictly serial, back-compatible behaviour. |
+| `idlePollMaxMs` | `pollIntervalMs` | Adaptive-idle ceiling. When greater than `pollIntervalMs`, the empty-poll delay grows exponentially from `pollIntervalMs` toward this cap and resets on the next found job. Equal to `pollIntervalMs` means flat (off). |
+
+```typescript
+const worker = new Worker("emails", handler, { concurrency: 8, idlePollMaxMs: 2000 });
+```
+
+### The capacity-gate model
+
+The worker still **polls serially** — `getNextJob` is a single-claim RPC that hands back at most one job, and there is no batch-claim RPC. Throughput comes from *processing* concurrently, not from claiming in bulk:
+
+- The dispatcher loop polls one job at a time. On a found job it dispatches the handler **without awaiting it** and immediately re-polls (fast path) to fill any remaining slots.
+- Each in-flight handler is tracked in a live set. When `inFlight` reaches `concurrency` the loop **parks** on a slot-freed signal instead of busy-polling; each handler that settles frees exactly one slot and wakes the loop.
+- All N claims, N per-job heartbeats, and N completions **multiplex over the one shared `Connection`** under a single `workerId`. Broker lease atomicity guarantees each `getNextJob` returns a distinct job, so N concurrent single-job leases never overlap.
+- `close()` stops claiming **new** work but drains cleanly: a claim already returned is still processed, and `close()`'s promise resolves only after **every** in-flight handler has settled.
+
+`concurrency: 1` reproduces the original serial behaviour exactly (poll, one job, immediate re-poll on a found job, `pollIntervalMs` sleep when empty). Higher values are a strict superset.
+
+### `saturated` and `inFlight`
+
+`health().inFlight` now ranges `0..concurrency`, and `health().saturated` is `true` while every slot is busy. Both are useful for autoscaling signals and dashboards: a worker that is persistently `saturated` is a candidate for more replicas or higher `concurrency`.
+
+### Adaptive idle polling
+
+On an idle queue, a fixed `pollIntervalMs` wastes round-trips. Set `idlePollMaxMs` above `pollIntervalMs` to let the empty-poll delay back off exponentially (with `[50%,100%]` jitter) toward the cap, then snap back to `pollIntervalMs` the moment a job appears. This is independent of the C1 outage backoff, which still governs the *failure* path. `idlePollMaxMs` must be **less than** `readinessStaleMs` (construction throws otherwise) so an idle worker never backs off long enough to flap readiness — its per-poll success keeps contact fresh.
+
+> **Note:** this is client-side throughput parity only. `getNextJob` remains a single-claim RPC; a server-side long-poll (holding the claim open until a job is available) is a separate broker change and is not part of this client.
+
+## Producer durability
+
+A producer survives a **broker hiccup** (a short outage: a rolling restart, a brief network partition, a load-balancer failover) without losing an enqueue and without creating a duplicate, and it has a clearly-scoped stop-gap for a **producer crash** (the producer process itself dying before the broker acknowledges). The distinction is the whole design:
+
+| Failure | What the client does | Guarantee |
+| --- | --- | --- |
+| Broker hiccup (broker down, producer alive) | Bounded, jittered enqueue retry across a wall-clock window; the same effective key rides every retry so the broker dedupes | At-least-once, no client-made duplicates |
+| Producer crash (producer dies before ack) | The in-memory outbox buffers the pending add, but that buffer is process-local | Best-effort; anything still pending is **lost on crash** unless you back the outbox with durable storage |
+
+### Auto-key: safe retries with or without your own key
+
+`add` derives an **effective idempotency key** once per call and reuses it across every retry of that call:
+
+1. `options.idempotencyKey` if you supply one (your stable business-operation ID — always preferred), else
+2. a UUID minted once at the top of the call and held for the whole retry loop.
+
+Because the same key is sent on every attempt, the broker collapses the client's own retries into a single job: at-least-once delivery with **zero duplicates from the retry loop**, even for a caller that never passed a key. Tuning lives on `AddOptions`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enqueueRetryMaxMs` | `15000` | Total wall-clock window for bounded enqueue retries. |
+| `enqueueRetryBaseMs` | `200` | First backoff step; doubles each attempt, capped at `enqueueRetryMaxMs`, jittered to 50–100%. |
+| `noIdempotencyKey` | `false` | Opt out: send no key, attempt once, accept duplicate risk. |
+
+Retry is attempted only for `Unavailable`/`DeadlineExceeded`; any other status (e.g. `AlreadyExists`, `InvalidArgument`, `ResourceExhausted`) throws immediately. Set `noIdempotencyKey: true` only for a fire-and-forget add where a duplicate is acceptable and you explicitly do not want a minted key.
+
+### `addBulk`: bounded client-side fan-out
+
+There is no batch RPC; `addBulk` fans out to one independent `add` per item through a bounded worker pool (default concurrency 8) so a large batch never spawns unbounded promises. Results are **positional** — one `AddResult` per input, in order:
+
+```typescript
+const results = await queue.addBulk(
+  [
+    { data: { orderId: "a" }, options: { idempotencyKey: "order:a" } },
+    { data: { orderId: "b" }, options: { idempotencyKey: "order:b" } },
+  ],
+  { concurrency: 8, stopOnError: false },
+);
+for (const r of results) {
+  if (r.ok) console.log(r.id, r.replayed);
+  else console.error(r.error);
+}
+```
+
+With `stopOnError: false` (the default) a mid-batch failure is captured as `{ ok: false, error }` and does not abort the rest. With `stopOnError: true` the call rejects on the first failure, with the partial positional results attached as `error.results`.
+
+### Enqueue-before-complete: exactly-once fan-out at the broker
+
+To fan a job out to children crash-safely, **enqueue every child idempotently, then complete the parent**. If the parent crashes after enqueuing but before completing, the broker redelivers it; the re-run re-enqueues the identical keys, the broker dedupes them, and the net effect is exactly-once fan-out *at the broker*. `enqueueChildBulk` assigns each child a positional index and a deterministic default key `${parentId}:${childName}:${index}`, which is what makes the replay dedupe:
+
+```typescript
+const worker = new Worker<{ orderId: string }>("orders", async job => {
+  // 1. Enqueue all children first. Deterministic keys => a redelivered parent replays,
+  //    it does not duplicate.
+  await job.enqueueChildBulk([
+    { name: "shipments", data: { orderId: job.data.orderId } },
+    { name: "receipts", data: { orderId: job.data.orderId } },
+  ]);
+  // 2. Only now return, which completes the parent. A crash before this point is safe.
+});
+```
+
+A single `job.enqueueChild(name, data)` still works; with no explicit key it mints a per-call UUID (no stable index), so prefer `enqueueChildBulk` — or pass your own `idempotencyKey` — when you need replay-safe fan-out. The broker makes *insertion* exactly-once; child **handler side effects remain at-least-once** and must tolerate duplicates.
+
+### In-memory outbox stop-gap (and plugging in your own store)
+
+`OutboxForwarder` is a store-and-forward buffer: `enqueue()` records a pending add and returns immediately, and a background tick loop (or a manual `drainOnce()`) forwards pending records to the broker, always re-using each record's held key so a re-forward is deduped. Transient broker errors leave a record pending for the next tick; a permanent error (e.g. `InvalidArgument`) poisons the record via `markFailed` and is surfaced through `onForwarded` — never silently dropped.
+
+```typescript
+import { Queue, OutboxForwarder, MemoryOutboxStore } from "./src/index";
+
+const queue = new Queue("emails");
+const forwarder = new OutboxForwarder(queue, new MemoryOutboxStore(), {
+  onForwarded: (key, result) => { if (!result.ok) console.error("poisoned", key, result.error); },
+  onDrained: () => console.info("outbox empty"),
+});
+forwarder.start();
+await forwarder.enqueue({ to: "user@example.com" }, { idempotencyKey: "welcome:user-1" });
+// ... on shutdown:
+await forwarder.stop();
+```
+
+`MemoryOutboxStore` is the **only** store shipped and it is in-memory by design: it absorbs a short broker outage without the producer blocking, but a producer-process crash loses anything still pending — this is a stop-gap, not durable persistence, and it adds no database or storage dependency. The `OutboxStore` interface (`put` / `claimPending` / `markSent` / `markFailed`) is the user-space seam for real durability: implement it against your own durable medium and the `OutboxForwarder` works unchanged, giving you producer-crash survival.
+
 ## Observability & lifecycle
 
 Three surfaces build on the health snapshot: broker-authoritative job-lifecycle hooks, a zero-dependency Prometheus metrics endpoint, an injectable logger, and a `gracefulShutdown` helper for clean pod termination.
@@ -243,8 +361,9 @@ const worker = new Worker("emails", handler);
 createServer(nodeHealthListener(worker, { metricsPath: "/metrics" })).listen(8080);
 ```
 
+### Prometheus scrape annotations
+
 ```yaml
-# Prometheus scrape annotations
 metadata:
   annotations:
     prometheus.io/scrape: "true"
@@ -300,40 +419,6 @@ spec:
 | `timeoutMs` | `25000` | Drain deadline; on timeout, warn and (if `exit`) exit 1. |
 | `exit` | `true` | Call `process.exit` after draining (0 clean, 1 on timeout). |
 | `logger` | `defaultLogger` | Where drain diagnostics go. |
-
-## Concurrency & throughput
-
-A single `Worker` can run more than one handler at a time. Two options tune it: 
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `concurrency` | `1` | Max handlers a single worker runs in parallel. `1` is the strictly serial, back-compatible behaviour. |
-| `idlePollMaxMs` | `pollIntervalMs` | Adaptive-idle ceiling. When greater than `pollIntervalMs`, the empty-poll delay grows exponentially from `pollIntervalMs` toward this cap and resets on the next found job. Equal to `pollIntervalMs` means flat (off). |
-
-```typescript
-const worker = new Worker("emails", handler, { concurrency: 8, idlePollMaxMs: 2000 });
-```
-
-### The capacity-gate model
-
-The worker still **polls serially** — `getNextJob` is a single-claim RPC that hands back at most one job, and there is no batch-claim RPC. Throughput comes from *processing* concurrently, not from claiming in bulk:
-
-- The dispatcher loop polls one job at a time. On a found job it dispatches the handler **without awaiting it** and immediately re-polls (fast path) to fill any remaining slots.
-- Each in-flight handler is tracked in a live set. When `inFlight` reaches `concurrency` the loop **parks** on a slot-freed signal instead of busy-polling; each handler that settles frees exactly one slot and wakes the loop.
-- All N claims, N per-job heartbeats, and N completions **multiplex over the one shared `Connection`** under a single `workerId`. Broker lease atomicity guarantees each `getNextJob` returns a distinct job, so N concurrent single-job leases never overlap.
-- `close()` stops claiming **new** work but drains cleanly: a claim already returned is still processed, and `close()`'s promise resolves only after **every** in-flight handler has settled.
-
-`concurrency: 1` reproduces the original serial behaviour exactly (poll, one job, immediate re-poll on a found job, `pollIntervalMs` sleep when empty). Higher values are a strict superset.
-
-### `saturated` and `inFlight`
-
-`health().inFlight` now ranges `0..concurrency`, and `health().saturated` is `true` while every slot is busy. Both are useful for autoscaling signals and dashboards: a worker that is persistently `saturated` is a candidate for more replicas or higher `concurrency`.
-
-### Adaptive idle polling
-
-On an idle queue, a fixed `pollIntervalMs` wastes round-trips. Set `idlePollMaxMs` above `pollIntervalMs` to let the empty-poll delay back off exponentially (with `[50%,100%]` jitter) toward the cap, then snap back to `pollIntervalMs` the moment a job appears. This is independent of the C1 outage backoff, which still governs the *failure* path. `idlePollMaxMs` must be **less than** `readinessStaleMs` (construction throws otherwise) so an idle worker never backs off long enough to flap readiness — its per-poll success keeps contact fresh.
-
-> **Note:** this is client-side throughput parity only. `getNextJob` remains a single-claim RPC; a server-side long-poll (holding the claim open until a job is available) is a separate broker change and is not part of this client.
 
 ## Long-running jobs
 
@@ -445,89 +530,21 @@ Receipts have no standalone TTL and are reclaimed only once the job is gone from
 
 Delivery is at least once within the server's attempt and durability limits. Side effects must tolerate duplicates. The `leaseExpiresAtMs` on the job is the initial claim deadline; the worker renews it internally.
 
-## Producer durability
-
-A producer survives a **broker hiccup** (a short outage: a rolling restart, a brief network partition, a load-balancer failover) without losing an enqueue and without creating a duplicate, and it has a clearly-scoped stop-gap for a **producer crash** (the producer process itself dying before the broker acknowledges). The distinction is the whole design:
-
-| Failure | What the client does | Guarantee |
-| --- | --- | --- |
-| Broker hiccup (broker down, producer alive) | Bounded, jittered enqueue retry across a wall-clock window; the same effective key rides every retry so the broker dedupes | At-least-once, no client-made duplicates |
-| Producer crash (producer dies before ack) | The in-memory outbox buffers the pending add, but that buffer is process-local | Best-effort; anything still pending is **lost on crash** unless you back the outbox with durable storage |
-
-### Auto-key: safe retries with or without your own key
-
-`add` derives an **effective idempotency key** once per call and reuses it across every retry of that call:
-
-1. `options.idempotencyKey` if you supply one (your stable business-operation ID — always preferred), else
-2. a UUID minted once at the top of the call and held for the whole retry loop.
-
-Because the same key is sent on every attempt, the broker collapses the client's own retries into a single job: at-least-once delivery with **zero duplicates from the retry loop**, even for a caller that never passed a key. Tuning lives on `AddOptions`:
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `enqueueRetryMaxMs` | `15000` | Total wall-clock window for bounded enqueue retries. |
-| `enqueueRetryBaseMs` | `200` | First backoff step; doubles each attempt, capped at `enqueueRetryMaxMs`, jittered to 50–100%. |
-| `noIdempotencyKey` | `false` | Opt out: send no key, attempt once, accept duplicate risk. |
-
-Retry is attempted only for `Unavailable`/`DeadlineExceeded`; any other status (e.g. `AlreadyExists`, `InvalidArgument`, `ResourceExhausted`) throws immediately. Set `noIdempotencyKey: true` only for a fire-and-forget add where a duplicate is acceptable and you explicitly do not want a minted key.
-
-### `addBulk`: bounded client-side fan-out
-
-There is no batch RPC; `addBulk` fans out to one independent `add` per item through a bounded worker pool (default concurrency 8) so a large batch never spawns unbounded promises. Results are **positional** — one `AddResult` per input, in order:
+## Exact-facet rate limits
 
 ```typescript
-const results = await queue.addBulk(
-  [
-    { data: { orderId: "a" }, options: { idempotencyKey: "order:a" } },
-    { data: { orderId: "b" }, options: { idempotencyKey: "order:b" } },
-  ],
-  { concurrency: 8, stopOnError: false },
-);
-for (const r of results) {
-  if (r.ok) console.log(r.id, r.replayed);
-  else console.error(r.error);
-}
+import { RateLimits } from "./src/index";
+const limits = new RateLimits();
+await limits.upsert("practice:123", 10, 60000); // ten claims per fixed window
+console.log(await limits.status("practice:123"));
+await queue.add(data, { rateLimitFacet: "practice:123" });
+await limits.delete("practice:123");
+limits.close();
 ```
 
-With `stopOnError: false` (the default) a mid-batch failure is captured as `{ ok: false, error }` and does not abort the rest. With `stopOnError: true` the call rejects on the first failure, with the partial positional results attached as `error.results`.
+Each upsert resets the facet's usage window; zero quota pauses dispatch. Limits are shared across queue names and count retries as new claims. Wildcards are not supported. Management RPCs assume trusted-network access. Workers continue polling when all eligible work is throttled.
 
-### Enqueue-before-complete: exactly-once fan-out at the broker
-
-To fan a job out to children crash-safely, **enqueue every child idempotently, then complete the parent**. If the parent crashes after enqueuing but before completing, the broker redelivers it; the re-run re-enqueues the identical keys, the broker dedupes them, and the net effect is exactly-once fan-out *at the broker*. `enqueueChildBulk` assigns each child a positional index and a deterministic default key `${parentId}:${childName}:${index}`, which is what makes the replay dedupe:
-
-```typescript
-const worker = new Worker<{ orderId: string }>("orders", async job => {
-  // 1. Enqueue all children first. Deterministic keys => a redelivered parent replays,
-  //    it does not duplicate.
-  await job.enqueueChildBulk([
-    { name: "shipments", data: { orderId: job.data.orderId } },
-    { name: "receipts", data: { orderId: job.data.orderId } },
-  ]);
-  // 2. Only now return, which completes the parent. A crash before this point is safe.
-});
-```
-
-A single `job.enqueueChild(name, data)` still works; with no explicit key it mints a per-call UUID (no stable index), so prefer `enqueueChildBulk` — or pass your own `idempotencyKey` — when you need replay-safe fan-out. The broker makes *insertion* exactly-once; child **handler side effects remain at-least-once** and must tolerate duplicates.
-
-### In-memory outbox stop-gap (and plugging in your own store)
-
-`OutboxForwarder` is a store-and-forward buffer: `enqueue()` records a pending add and returns immediately, and a background tick loop (or a manual `drainOnce()`) forwards pending records to the broker, always re-using each record's held key so a re-forward is deduped. Transient broker errors leave a record pending for the next tick; a permanent error (e.g. `InvalidArgument`) poisons the record via `markFailed` and is surfaced through `onForwarded` — never silently dropped.
-
-```typescript
-import { Queue, OutboxForwarder, MemoryOutboxStore } from "./src/index";
-
-const queue = new Queue("emails");
-const forwarder = new OutboxForwarder(queue, new MemoryOutboxStore(), {
-  onForwarded: (key, result) => { if (!result.ok) console.error("poisoned", key, result.error); },
-  onDrained: () => console.info("outbox empty"),
-});
-forwarder.start();
-await forwarder.enqueue({ to: "user@example.com" }, { idempotencyKey: "welcome:user-1" });
-// ... on shutdown:
-await forwarder.stop();
-```
-
-`MemoryOutboxStore` is the **only** store shipped and it is in-memory by design: it absorbs a short broker outage without the producer blocking, but a producer-process crash loses anything still pending — this is a stop-gap, not durable persistence, and it adds no database or storage dependency. The `OutboxStore` interface (`put` / `claimPending` / `markSent` / `markFailed`) is the user-space seam for real durability: implement it against your own durable medium and the `OutboxForwarder` works unchanged, giving you producer-crash survival.
+`WorkerOptions.onCompleted(id)` is called only after a successful completion acknowledgment. The load harness uses it to measure end-to-end latency; handler return alone is not counted as completion. Keep this callback synchronous and lightweight.
 
 ## Interactive demo
 
@@ -553,19 +570,3 @@ The seed adds success, retry (fails twice), delayed, and long-running jobs. Watc
 `HANDLER DONE` means the handler returned; it is printed before the completion RPC and is not a durable acknowledgment. RPC failures are logged separately.
 
 For a separate daemon, set `ANVILMQ_ADDR` in both terminals and optionally `ANVILMQ_DB_PATH` in the server terminal. Defaults remain unchanged.
-
-## Exact-facet rate limits
-
-```typescript
-import { RateLimits } from "./src/index";
-const limits = new RateLimits();
-await limits.upsert("practice:123", 10, 60000); // ten claims per fixed window
-console.log(await limits.status("practice:123"));
-await queue.add(data, { rateLimitFacet: "practice:123" });
-await limits.delete("practice:123");
-limits.close();
-```
-
-Each upsert resets the facet's usage window; zero quota pauses dispatch. Limits are shared across queue names and count retries as new claims. Wildcards are not supported. Management RPCs assume trusted-network access. Workers continue polling when all eligible work is throttled.
-
-`WorkerOptions.onCompleted(id)` is called only after a successful completion acknowledgment. The load harness uses it to measure end-to-end latency; handler return alone is not counted as completion. Keep this callback synchronous and lightweight.
