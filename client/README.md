@@ -121,7 +121,9 @@ Only **successful** round-trips refresh these clocks. Heartbeat and completion *
 | `stale` | Broker-contact staleness exceeded `readinessStaleMs`. |
 | `stopping` | `close()` has begun. |
 | `consecutivePollFailures` | Consecutive poll-failure streak (0 while reachable). |
-| `inFlight` | Jobs currently processing (0 or 1 today; concurrency is future work). |
+| `inFlight` | Jobs currently processing (`0..concurrency`). |
+| `concurrency` | Max handlers this worker runs in parallel (mirrors the option). |
+| `saturated` | `inFlight >= concurrency`: every slot is busy, no new job can be claimed. |
 | `lastPollOkAt` | Epoch ms of the last successful poll, `0` if never. |
 | `lastBrokerContactAt` | Epoch ms of the last poll, heartbeat, or completion round-trip, `0` if never. |
 | `loopAliveAt` | Epoch ms of the last poll-loop or heartbeat tick. |
@@ -178,6 +180,40 @@ readinessProbe:
 Together with [Transport resilience](#transport-resilience), this retires the external connection-monitor sidecar and the scheduled-restart CronJob: the pod restarts itself only when truly wedged and is routed around automatically when it cannot reach the broker.
 
 **Security:** the health port is unauthenticated plaintext (transport auth and TLS are future work). Expose it on a cluster-internal address or listener only — never on a public interface — and rely on the probe's own network path rather than exposing it externally.
+
+## Concurrency & throughput
+
+A single `Worker` can run more than one handler at a time. Two options tune it:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `1` | Max handlers a single worker runs in parallel. `1` is the strictly serial, back-compatible behaviour. |
+| `idlePollMaxMs` | `pollIntervalMs` | Adaptive-idle ceiling. When greater than `pollIntervalMs`, the empty-poll delay grows exponentially from `pollIntervalMs` toward this cap and resets on the next found job. Equal to `pollIntervalMs` means flat (off). |
+
+```typescript
+const worker = new Worker("emails", handler, { concurrency: 8, idlePollMaxMs: 2000 });
+```
+
+### The capacity-gate model
+
+The worker still **polls serially** — `getNextJob` is a single-claim RPC that hands back at most one job, and there is no batch-claim RPC. Throughput comes from *processing* concurrently, not from claiming in bulk:
+
+- The dispatcher loop polls one job at a time. On a found job it dispatches the handler **without awaiting it** and immediately re-polls (fast path) to fill any remaining slots.
+- Each in-flight handler is tracked in a live set. When `inFlight` reaches `concurrency` the loop **parks** on a slot-freed signal instead of busy-polling; each handler that settles frees exactly one slot and wakes the loop.
+- All N claims, N per-job heartbeats, and N completions **multiplex over the one shared `Connection`** under a single `workerId`. Broker lease atomicity guarantees each `getNextJob` returns a distinct job, so N concurrent single-job leases never overlap.
+- `close()` stops claiming **new** work but drains cleanly: a claim already returned is still processed, and `close()`'s promise resolves only after **every** in-flight handler has settled.
+
+`concurrency: 1` reproduces the original serial behaviour exactly (poll, one job, immediate re-poll on a found job, `pollIntervalMs` sleep when empty). Higher values are a strict superset.
+
+### `saturated` and `inFlight`
+
+`health().inFlight` now ranges `0..concurrency`, and `health().saturated` is `true` while every slot is busy. Both are useful for autoscaling signals and dashboards: a worker that is persistently `saturated` is a candidate for more replicas or higher `concurrency`.
+
+### Adaptive idle polling
+
+On an idle queue, a fixed `pollIntervalMs` wastes round-trips. Set `idlePollMaxMs` above `pollIntervalMs` to let the empty-poll delay back off exponentially (with `[50%,100%]` jitter) toward the cap, then snap back to `pollIntervalMs` the moment a job appears. This is independent of the C1 outage backoff, which still governs the *failure* path. `idlePollMaxMs` must be **less than** `readinessStaleMs` (construction throws otherwise) so an idle worker never backs off long enough to flap readiness — its per-poll success keeps contact fresh.
+
+> **Note:** this is client-side throughput parity only. `getNextJob` remains a single-claim RPC; a server-side long-poll (holding the claim open until a job is available) is a separate broker change and is not part of this client.
 
 ## Long-running jobs
 
