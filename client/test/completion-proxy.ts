@@ -61,17 +61,29 @@ export async function verifyCompletionAmbiguity(address: string, httpAddress: st
       upstream = new api.queue.v1.QueueService(address, grpc.credentials.createInsecure(), { "grpc.use_local_subchannel_pool": 1 });
       enqueueFault = scenario; addRequests = []; committedIds = [];
       const queue = new Queue(`enqueue-${crypto.randomUUID()}`, { address: proxyAddress, rpcTimeoutMs: 500 });
-      const options = scenario === "unkeyed" ? {} : { idempotencyKey: "business-operation-123" };
+      // C3: every add now carries an effective idempotency key (explicit, or minted once
+      // and reused across retries), so even an "unkeyed" caller retries safely and the
+      // broker dedupes. Bound the retry window so the scenarios stay fast and, for the
+      // permanently-lost "exhausted" case, terminate in DEADLINE_EXCEEDED.
+      const options: Record<string, unknown> = scenario === "unkeyed"
+        ? { enqueueRetryMaxMs: 5000, enqueueRetryBaseMs: 100 }
+        : scenario === "exhausted"
+        ? { idempotencyKey: "business-operation-123", enqueueRetryMaxMs: 700, enqueueRetryBaseMs: 150 }
+          : { idempotencyKey: "business-operation-123", enqueueRetryMaxMs: 5000, enqueueRetryBaseMs: 100 };
       try {
-        if (scenario === "exhausted" || scenario === "unkeyed") {
+        if (scenario === "exhausted") {
+          // Response discarded on every attempt: the bounded window elapses and rethrows.
           await expect(queue.add({ invoiceId: 123 }, options)).rejects.toMatchObject({ code: grpc.status.DEADLINE_EXCEEDED });
+          expect(addRequests.length).toBeGreaterThanOrEqual(2); // retried within the window
         } else {
+          // First response lost, the retry replays the committed job on the SAME key.
           const result = await queue.add({ invoiceId: 123 }, options);
           expect(result.replayed).toBe(true);
           expect(result.id).toBe(committedIds[0]);
+          expect(addRequests.length).toBe(2);
         }
-        expect(addRequests.length).toBe(scenario === "exhausted" ? 3 : scenario === "unkeyed" ? 1 : 2);
         expect(new Set(committedIds).size).toBe(1);
+        // Every attempt (including the unkeyed minted-key case) carried the identical key.
         for (const request of addRequests) expect(request).toEqual(addRequests[0]);
         if (scenario !== "unkeyed") {
           // Exercise actual broker status handling directly; the fault proxy is
@@ -86,7 +98,12 @@ export async function verifyCompletionAmbiguity(address: string, httpAddress: st
         const poll = () => new Promise<any>((resolve, reject) => upstream.getNextJob({ workerId: "probe", queueNames: [queue.name] }, { deadline: Date.now() + 2000 }, (e: Error | null, r: any) => e ? reject(e) : resolve(r)));
         expect((await poll()).id).toBe(committedIds[0]);
         expect((await poll()).found).toBe(false);
-      } finally { queue.close(); }
+      } finally {
+        // Let any deliberately abandoned in-flight call settle before tearing the channel
+        // down; closing a subchannel with a pending native call can crash grpc-js on Windows.
+        await sleep(150);
+        queue.close();
+      }
     }
     enqueueFault = undefined;
     for (const scenario of ["unavailable", "deadline", "exhausted", "rejected"] as const) {

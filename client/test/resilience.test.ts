@@ -114,8 +114,81 @@ test("events: a single sub-threshold transient does not emit", async () => {
   } finally { __setClientFactory(previous); if (worker) await worker.close(); }
 });
 
-test("close during backoff returns promptly", async () => {
-  const previous = __setClientFactory(() => scriptedClient(() => ({ error: new Error("always down") })));
+test("enqueue retry: an unkeyed add mints one key and reuses it across retries", async () => {
+  const requests: Array<{ idempotencyKey?: string }> = [];
+  let calls = 0;
+  const previous = __setClientFactory(() => {
+    const addJob = (req: { idempotencyKey?: string }, _opts: unknown, cb: (e: unknown, r: unknown) => void) => {
+      requests.push(req);
+      calls++;
+      // Fail the first three transiently, then accept.
+      queueMicrotask(() => calls <= 3
+        ? cb({ code: grpc.status.UNAVAILABLE }, undefined)
+        : cb(null, { id: "job-1", state: "Waiting", replayed: false }));
+    };
+    return { addJob, close: () => {} } as unknown as grpc.Client;
+  });
+  try {
+    const queue = new Queue<{ n: number }>("retry-key", { address: "127.0.0.1:1" });
+    // No idempotencyKey supplied: sendAdd must mint one and keep it stable.
+    const result = await queue.add({ n: 7 }, { enqueueRetryBaseMs: 5, enqueueRetryMaxMs: 5000 });
+    queue.close();
+    expect(result.id).toBe("job-1");
+    expect(requests.length).toBe(4);
+    const keys = new Set(requests.map(r => r.idempotencyKey));
+    expect(keys.size).toBe(1);
+    expect([...keys][0]).toBeTruthy();
+  } finally { __setClientFactory(previous); }
+});
+
+test("enqueue retry: noIdempotencyKey sends no key and does not retry", async () => {
+  const requests: Array<{ idempotencyKey?: string }> = [];
+  const previous = __setClientFactory(() => {
+    const addJob = (req: { idempotencyKey?: string }, _opts: unknown, cb: (e: unknown, r: unknown) => void) => {
+      requests.push(req);
+      queueMicrotask(() => cb({ code: grpc.status.UNAVAILABLE }, undefined));
+    };
+    return { addJob, close: () => {} } as unknown as grpc.Client;
+  });
+  try {
+    const queue = new Queue<{ n: number }>("no-key", { address: "127.0.0.1:1" });
+    await expect(queue.add({ n: 1 }, { noIdempotencyKey: true })).rejects.toBeDefined();
+    queue.close();
+    expect(requests.length).toBe(1);
+    expect(requests[0].idempotencyKey).toBeUndefined();
+  } finally { __setClientFactory(previous); }
+});
+
+test("enqueue retry: permanently-down broker retries across the window with [50%,100%] jitter", async () => {
+  const times: number[] = [];
+  const previous = __setClientFactory(() => {
+    const addJob = (_req: unknown, _opts: unknown, cb: (e: unknown, r: unknown) => void) => {
+      times.push(Date.now());
+      queueMicrotask(() => cb({ code: grpc.status.UNAVAILABLE }, undefined));
+    };
+    return { addJob, close: () => {} } as unknown as grpc.Client;
+  });
+  try {
+    const queue = new Queue<{ n: number }>("retry-window", { address: "127.0.0.1:1" });
+    const base = 40;
+    const windowMs = 600;
+    const start = Date.now();
+    await expect(queue.add({ n: 1 }, { enqueueRetryBaseMs: base, enqueueRetryMaxMs: windowMs })).rejects.toBeDefined();
+    const span = Date.now() - start;
+    queue.close();
+    // Retried across a span at least as long as the configured window.
+    expect(span).toBeGreaterThanOrEqual(windowMs);
+    // Each observed gap is a jittered [50%,100%] slice of min(base*2^attempt, cap).
+    for (let i = 1; i < times.length; i++) {
+      const gap = times[i] - times[i - 1];
+      const expected = Math.min(windowMs, base * 2 ** (i - 1));
+      expect(gap).toBeGreaterThanOrEqual(Math.floor(expected * 0.5) - 20);
+      expect(gap).toBeLessThanOrEqual(expected + 250);
+    }
+  } finally { __setClientFactory(previous); }
+});
+
+test("close during backoff returns promptly", async () => {  const previous = __setClientFactory(() => scriptedClient(() => ({ error: new Error("always down") })));
   let worker: Worker | undefined;
   try {
     worker = new Worker("backoff-close", async () => {}, {
