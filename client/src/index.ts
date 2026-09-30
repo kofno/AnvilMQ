@@ -70,6 +70,30 @@ async function boundedPool(count: number, concurrency: number, task: (index: num
   await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, count)) }, worker));
 }
 
+/**
+ * A minimal structured-logging seam. Only `error` is required; `warn`/`info`/`debug`
+ * are optional so a caller can supply a console, pino, winston, or bunyan-shaped object
+ * unchanged. Injecting a logger is how you keep the library off `console.*` entirely.
+ */
+export interface Logger {
+  error(...args: unknown[]): void;
+  warn?(...args: unknown[]): void;
+  info?(...args: unknown[]): void;
+  debug?(...args: unknown[]): void;
+}
+
+/**
+ * The single console-backed {@link Logger} used when no logger is injected. This object
+ * is the ONLY place the library touches `console.*` on any runtime path; every other
+ * diagnostic goes through an injected or defaulted `Logger`.
+ */
+export const defaultLogger: Logger = {
+  error: (...args: unknown[]) => console.error(...args),
+  warn: (...args: unknown[]) => console.warn(...args),
+  info: (...args: unknown[]) => console.info(...args),
+  debug: (...args: unknown[]) => console.debug(...args),
+};
+
 export interface JobMetadata { parentId: string; traceId: string; executionDepth: number }
 export interface AddOptions {
   priority?: number; delayMs?: number; maxAttempts?: number;
@@ -236,6 +260,14 @@ export interface WorkerOptions extends ConnectionOptions {
   workerId?: string; pollIntervalMs?: number; heartbeatIntervalMs?: number;
   onError?: (error: unknown) => void;
   onCompleted?: (id: string) => void;
+  /** Fired via safeEmit immediately before a job's handler runs. */
+  onActive?: (info: { id: string; name: string; attempt: number; metadata: JobMetadata }) => void;
+  /** Fired via safeEmit when the broker moves a job to its terminal failed state (attempts exhausted). */
+  onFailed?: (info: { id: string; name: string; attempt: number; error: unknown }) => void;
+  /** Fired via safeEmit when the broker will redeliver a failed job (attempts remain). */
+  onRetry?: (info: { id: string; name: string; attempt: number; error: unknown }) => void;
+  /** Injectable structured logger. Defaults to a console-backed {@link defaultLogger}. */
+  logger?: Logger;
   /** Upper bound on the exponential poll backoff during an outage. Default 5000; must be >= pollIntervalMs. */
   pollBackoffMaxMs?: number;
   /** Consecutive poll failures before the connection is declared lost. Default 3. */
@@ -311,6 +343,28 @@ export interface WorkerHealth {
   now: number;
 }
 
+  /**
+   * A synchronous, I/O-free counter/gauge snapshot for a worker. Counters are monotonic
+   * since construction; gauges read live. Feed it to {@link renderPrometheus} for a
+   * `/metrics` endpoint, or scrape the numbers directly.
+   */
+  export interface WorkerMetrics {
+    /** Jobs that completed successfully (completeJob acknowledged). */
+    jobsProcessedTotal: number;
+    /** Jobs the broker moved to its terminal failed state. */
+    jobsFailedTotal: number;
+    /** Jobs that failed but will be redelivered by the broker. */
+    jobsRetriedTotal: number;
+    /** Jobs currently processing (live gauge, mirrors inFlight). */
+    jobsActive: number;
+    /** Poll failures observed by the dispatcher loop. */
+    pollFailuresTotal: number;
+    /** Number of times the connection recovered after being declared lost. */
+    reconnectsTotal: number;
+    /** 1 when the poll loop currently considers the broker reachable, else 0 (live gauge). */
+    connectionUp: number;
+  }
+
 /** Starts polling immediately. close() drains the current handler while retaining heartbeats. */
 export class Worker<T = unknown> {
   readonly workerId: string;
@@ -334,6 +388,13 @@ export class Worker<T = unknown> {
   private readinessStaleMs: number;
   private concurrency: number;
   private idlePollMaxMs: number;
+  private readonly logger: Logger;
+  /** Monotonic lifecycle counters (plain numbers; JS is single-threaded so no atomics). */
+  private jobsProcessedTotal = 0;
+  private jobsFailedTotal = 0;
+  private jobsRetriedTotal = 0;
+  private pollFailuresTotal = 0;
+  private reconnectsTotal = 0;
   /** Live set of dispatched process() promises; close() drains all of them. */
   private tracked = new Set<Promise<void>>();
   /** Re-armable slot-freed waiter: the capacity-parked branch awaits `slotFreed`, and
@@ -345,6 +406,7 @@ export class Worker<T = unknown> {
   private abortedPromise: Promise<void>;
   constructor(private name: string, private processor: Processor<T>, private options: WorkerOptions = {}) {
     this.workerId = options.workerId ?? crypto.randomUUID();
+    this.logger = options.logger ?? defaultLogger;
     this.pollMs = options.pollIntervalMs ?? 250;
     this.heartbeatMs = options.heartbeatIntervalMs ?? 10000;
     this.pollBackoffMaxMs = options.pollBackoffMaxMs ?? 5000;
@@ -375,7 +437,7 @@ export class Worker<T = unknown> {
     this.running = this.run();
   }
   private report(error: unknown) {
-    try { (this.options.onError ?? console.error)(error); } catch (callbackError) { console.error(callbackError); }
+    try { (this.options.onError ?? ((e: unknown) => this.logger.error(e)))(error); } catch (callbackError) { this.logger.error(callbackError); }
   }
   private async run() {
     const tracked = this.tracked;
@@ -449,6 +511,7 @@ export class Worker<T = unknown> {
     if (!this.connected) {
       const info = { downForMs: Date.now() - this.lostSince, failuresWhileDown: this.failuresWhileDown };
       this.connected = true;
+      this.reconnectsTotal++;
       this.safeEmit(() => this.options.onConnectionRestored?.(info));
     }
     this.consecutiveFailures = 0;
@@ -456,6 +519,7 @@ export class Worker<T = unknown> {
   }
   private onPollFailure(error: unknown) {
     this.consecutiveFailures++;
+    this.pollFailuresTotal++;
     if (this.connected && this.consecutiveFailures >= this.connectionLostThreshold) {
       this.connected = false;
       this.lostSince = Date.now();
@@ -471,7 +535,7 @@ export class Worker<T = unknown> {
     return Math.floor(exp * (0.5 + Math.random() * 0.5));
   }
   private safeEmit(fn: () => void) {
-    try { fn(); } catch (e) { try { (this.options.onError ?? console.error)(e); } catch { /* ignore */ } }
+    try { fn(); } catch (e) { try { (this.options.onError ?? ((err: unknown) => this.logger.error(err)))(e); } catch { /* ignore */ } }
   }
   /** Current consecutive poll-failure streak (0 while reachable). Observability/testing hook. */
   get consecutivePollFailures(): number { return this.consecutiveFailures; }
@@ -495,6 +559,21 @@ export class Worker<T = unknown> {
       concurrency: this.concurrency, saturated: this.inFlight >= this.concurrency,
       lastPollOkAt: this.lastPollOkAt, lastBrokerContactAt: this.lastBrokerContactAt,
       loopAliveAt: this.loopAliveAt, uptimeMs: now - this.startedAt, now,
+    };
+  }
+  /**
+   * Synchronous, I/O-free counter/gauge snapshot. Counters are monotonic since
+   * construction; `jobsActive`/`connectionUp` read live. Issues no RPC and never awaits.
+   */
+  metrics(): WorkerMetrics {
+    return {
+      jobsProcessedTotal: this.jobsProcessedTotal,
+      jobsFailedTotal: this.jobsFailedTotal,
+      jobsRetriedTotal: this.jobsRetriedTotal,
+      jobsActive: this.inFlight,
+      pollFailuresTotal: this.pollFailuresTotal,
+      reconnectsTotal: this.reconnectsTotal,
+      connectionUp: this.connected ? 1 : 0,
     };
   }
   /** Test-only: backdate the loop-liveness clock to simulate a wedged event loop. Not part of the supported API. */
@@ -543,6 +622,9 @@ export class Worker<T = unknown> {
         if (stopped) throw firstError;
         return results;
       };
+      // Fired via safeEmit immediately before the handler runs; the broker-authoritative
+      // lifecycle events (onFailed/onRetry) come from the failJob response below.
+      this.safeEmit(() => this.options.onActive?.({ id: claim.id, name: claim.name, attempt: claim.attempts, metadata: claim.metadata }));
       await this.processor({ id: claim.id, name: claim.name, data, attempts: claim.attempts, metadata: claim.metadata, leaseExpiresAtMs: claim.leaseExpiresAtMs, enqueueChild, enqueueChildBulk }, handler.signal);
     } catch (error) { failed = true; failure = error; }
     heartbeatStop.abort();
@@ -551,7 +633,16 @@ export class Worker<T = unknown> {
     // Do not turn an ambiguous completion RPC failure into a FailJob request.
     if (failed) {
       this.report(failure);
-      await this.connection.call("failJob", { ...identity, errorMessage: failure instanceof Error ? failure.message : String(failure) });
+      const resp = await this.connection.call<{ success: boolean; movedToFailedState: boolean }>("failJob", { ...identity, errorMessage: failure instanceof Error ? failure.message : String(failure) });
+      // The broker owns the retry decision: movedToFailedState distinguishes a terminal
+      // failure (attempts exhausted) from a transient one it will redeliver.
+      if (resp.movedToFailedState === true) {
+        this.jobsFailedTotal++;
+        this.safeEmit(() => this.options.onFailed?.({ id: claim.id, name: claim.name, attempt: claim.attempts, error: failure }));
+      } else {
+        this.jobsRetriedTotal++;
+        this.safeEmit(() => this.options.onRetry?.({ id: claim.id, name: claim.name, attempt: claim.attempts, error: failure }));
+      }
     } else {
       // Completion is idempotent. Keep the same claim token on every retry;
       // never rerun the handler or turn an ambiguous result into FailJob.
@@ -563,6 +654,7 @@ export class Worker<T = unknown> {
           await sleep(100 * 2 ** attempt);
         }
       }
+      this.jobsProcessedTotal++;
       this.markContact();
       this.options.onCompleted?.(claim.id);
     }
@@ -624,6 +716,39 @@ export interface HealthHttpOptions {
   livePath?: string;
   /** Readiness path (default /readyz). */
   readyPath?: string;
+  /** Prometheus metrics path. When unset there is NO metrics route (`/metrics` -> 404). */
+  metricsPath?: string;
+}
+
+/**
+ * Render a {@link WorkerMetrics} snapshot as Prometheus text exposition (version 0.0.4).
+ * Pure and zero-dependency: no clock, no I/O. Every series is prefixed `anvilmq_client_`.
+ * An optional `labels` bag is applied to every sample; omit it (or pass `{}`) to emit
+ * bare sample lines with no `{...}` braces.
+ */
+export function renderPrometheus(m: WorkerMetrics, opts?: { labels?: Record<string, string> }): string {
+  const labels = opts?.labels ?? {};
+  const entries = Object.entries(labels);
+  const labelStr = entries.length === 0
+    ? ""
+    : `{${entries.map(([k, v]) => `${k}="${String(v).replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\n")}"`).join(",")}}`;
+  const series: { name: string; type: "counter" | "gauge"; help: string; value: number }[] = [
+    { name: "jobs_processed_total", type: "counter", help: "Jobs completed successfully.", value: m.jobsProcessedTotal },
+    { name: "jobs_failed_total", type: "counter", help: "Jobs moved to the terminal failed state.", value: m.jobsFailedTotal },
+    { name: "jobs_retried_total", type: "counter", help: "Jobs that failed and will be redelivered.", value: m.jobsRetriedTotal },
+    { name: "poll_failures_total", type: "counter", help: "Dispatcher poll failures.", value: m.pollFailuresTotal },
+    { name: "reconnects_total", type: "counter", help: "Connection recoveries after being declared lost.", value: m.reconnectsTotal },
+    { name: "jobs_active", type: "gauge", help: "Jobs currently processing.", value: m.jobsActive },
+    { name: "connection_up", type: "gauge", help: "1 when the broker is considered reachable, else 0.", value: m.connectionUp },
+  ];
+  let out = "";
+  for (const s of series) {
+    const full = `anvilmq_client_${s.name}`;
+    out += `# HELP ${full} ${s.help}\n`;
+    out += `# TYPE ${full} ${s.type}\n`;
+    out += `${full}${labelStr} ${s.value}\n`;
+  }
+  return out;
 }
 
 /** Extract the pathname from a request URL that may be absolute or a bare path, and
@@ -636,21 +761,31 @@ function healthPathname(url: string | undefined): string {
 /**
  * A `node:http`-shaped request listener for k8s probes. `GET {livePath}` returns 200 iff
  * `worker.health().live`, `GET {readyPath}` returns 200 iff `worker.health().ready`, else
- * 503; the body is the full {@link WorkerHealth} JSON in both cases. Unknown path -> 404,
+ * 503; the body is the full {@link WorkerHealth} JSON in both cases. When `opts.metricsPath`
+ * is set, `GET {metricsPath}` returns 200 `text/plain` Prometheus text from
+ * `worker.metrics()`; when unset there is no metrics route. Unknown path -> 404,
  * non-GET -> 405. Does zero I/O and opens no socket: pass it to `http.createServer(...)`.
  * The library never imports `node:http`, keeping it runtime-agnostic.
  */
 export function nodeHealthListener(
-  worker: { health(): WorkerHealth },
+  worker: { health(): WorkerHealth; metrics?(): WorkerMetrics },
   opts: HealthHttpOptions = {},
 ): (req: { url?: string; method?: string }, res: { statusCode: number; setHeader(k: string, v: string): void; end(b?: string): void }) => void {
   const livePath = opts.livePath ?? "/livez";
   const readyPath = opts.readyPath ?? "/readyz";
+  const metricsPath = opts.metricsPath;
   return (req, res) => {
     const path = healthPathname(req.url);
+    const isMetrics = metricsPath !== undefined && path === metricsPath;
+    if (path !== livePath && path !== readyPath && !isMetrics) { res.setHeader("content-type", "application/json"); res.statusCode = 404; res.end(JSON.stringify({ error: "not found" })); return; }
+    if ((req.method ?? "GET") !== "GET") { res.setHeader("content-type", "application/json"); res.setHeader("allow", "GET"); res.statusCode = 405; res.end(JSON.stringify({ error: "method not allowed" })); return; }
+    if (isMetrics) {
+      res.setHeader("content-type", "text/plain; version=0.0.4");
+      res.statusCode = 200;
+      res.end(renderPrometheus(worker.metrics!()));
+      return;
+    }
     res.setHeader("content-type", "application/json");
-    if (path !== livePath && path !== readyPath) { res.statusCode = 404; res.end(JSON.stringify({ error: "not found" })); return; }
-    if ((req.method ?? "GET") !== "GET") { res.setHeader("allow", "GET"); res.statusCode = 405; res.end(JSON.stringify({ error: "method not allowed" })); return; }
     const health = worker.health();
     res.statusCode = (path === livePath ? health.live : health.ready) ? 200 : 503;
     res.end(JSON.stringify(health));
@@ -661,23 +796,74 @@ export function nodeHealthListener(
  * A WHATWG-`fetch`-shaped handler for k8s probes, for runtimes whose server takes a
  * `(Request) => Response` function. Same semantics as {@link nodeHealthListener}:
  * `GET {livePath}` -> 200/503 on `live`, `GET {readyPath}` -> 200/503 on `ready`, full
- * {@link WorkerHealth} JSON body, unknown path -> 404, non-GET -> 405. Does zero I/O.
+ * {@link WorkerHealth} JSON body, `GET {metricsPath}` -> 200 Prometheus text when set,
+ * unknown path -> 404, non-GET -> 405. Does zero I/O.
  */
 export function fetchHealthHandler(
-  worker: { health(): WorkerHealth },
+  worker: { health(): WorkerHealth; metrics?(): WorkerMetrics },
   opts: HealthHttpOptions = {},
 ): (request: { url: string; method?: string }) => Response {
   const livePath = opts.livePath ?? "/livez";
   const readyPath = opts.readyPath ?? "/readyz";
+  const metricsPath = opts.metricsPath;
   const headers = { "content-type": "application/json" };
   return (request) => {
     const path = healthPathname(request.url);
-    if (path !== livePath && path !== readyPath) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers });
+    const isMetrics = metricsPath !== undefined && path === metricsPath;
+    if (path !== livePath && path !== readyPath && !isMetrics) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers });
     if ((request.method ?? "GET") !== "GET") return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: { ...headers, allow: "GET" } });
+    if (isMetrics) return new Response(renderPrometheus(worker.metrics!()), { status: 200, headers: { "content-type": "text/plain; version=0.0.4" } });
     const health = worker.health();
     const ok = path === livePath ? health.live : health.ready;
     return new Response(JSON.stringify(health), { status: ok ? 200 : 503, headers });
   };
+}
+
+/**
+ * Register OS-signal handlers that gracefully close a set of resources (workers,
+ * forwarders, health servers) on the first `SIGTERM`/`SIGINT`, then optionally exit.
+ * Returns an unregister function that detaches every handler.
+ *
+ * On the first signal it calls `close()` on every closable concurrently and races the
+ * combined drain against `timeoutMs`. A clean drain exits 0 (when `exit`); a timeout
+ * logs a warning and exits 1 (when `exit`). Further signals during the drain are ignored
+ * (idempotent). Off Node (no `globalThis.process.on`) it logs once and returns a no-op,
+ * so importing in a browser/edge runtime never throws. Reaches `process` via
+ * `globalThis` only — it never imports `node:process`.
+ */
+export function gracefulShutdown(
+  closables: { close(): Promise<void> | void }[],
+  opts: { signals?: string[]; timeoutMs?: number; logger?: Logger; exit?: boolean } = {},
+): () => void {
+  const signals = opts.signals ?? ["SIGTERM", "SIGINT"];
+  const timeoutMs = opts.timeoutMs ?? 25000;
+  const logger = opts.logger ?? defaultLogger;
+  const exit = opts.exit ?? true;
+  const proc = (globalThis as { process?: { on?: Function; removeListener?: Function; exit?: (code?: number) => void } }).process;
+  if (!proc || typeof proc.on !== "function") {
+    logger.warn?.("gracefulShutdown: no process.on available; signal handling is disabled");
+    return () => {};
+  }
+  let draining = false;
+  const handler = (signal: string) => {
+    if (draining) return;
+    draining = true;
+    logger.info?.(`gracefulShutdown: received ${signal}, draining ${closables.length} resource(s)`);
+    void (async () => {
+      const closes = closables.map(c => Promise.resolve().then(() => c.close()));
+      let timedOut = false;
+      const timeout = new Promise<void>(resolve => setTimeout(() => { timedOut = true; resolve(); }, timeoutMs));
+      await Promise.race([Promise.allSettled(closes), timeout]);
+      if (timedOut) {
+        (logger.warn ?? logger.error)(`gracefulShutdown: drain exceeded ${timeoutMs}ms; forcing exit`);
+        if (exit) proc.exit?.(1);
+        return;
+      }
+      if (exit) proc.exit?.(0);
+    })();
+  };
+  const bound = signals.map(sig => { const h = () => handler(sig); proc.on!(sig, h); return { sig, h }; });
+  return () => { for (const { sig, h } of bound) proc.removeListener?.(sig, h); };
 }
 
 /**
