@@ -43,7 +43,7 @@ process.once("SIGINT", () => { void worker.close(); });
 
 `Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, and `rateLimitFacet`. Generic types provide compile-time help, not runtime payload validation.
 
-Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, plus the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`. Each worker processes one job at a time; create additional workers for concurrency.
+Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`, plus the health options `livenessStaleMs` and `readinessStaleMs` (see [Kubernetes health](#kubernetes-health)). Each worker processes one job at a time; create additional workers for concurrency.
 
 Workers poll immediately, send heartbeats during async processing, and acknowledge with the claimed attempt number. Handler errors, including JSON decoding errors, invoke FailJob. If heartbeat fails or times out, the handler's signal aborts and the client sends no acknowledgment. Handlers must honor cancellation; the client cannot undo external side effects. Avoid blocking the event loop, which prevents heartbeats.
 
@@ -92,6 +92,92 @@ const worker = new Worker("emails", handler, {
 ```
 
 Both callbacks are invoked defensively: a throw inside one is routed to `onError` and never breaks the poll loop.
+
+## Kubernetes health
+
+A `Worker` exposes a synchronous, I/O-free health snapshot designed for Kubernetes probes. It draws a hard line between two questions:
+
+- **Liveness — "my loop is turning."** `worker.health().live` fails only when the worker is genuinely wedged (a blocked event loop, or a dead poll task). A broker outage must **not** fail liveness: restarting a pod cannot fix a down broker, and an outage-driven restart loop is exactly the failure this surface removes. Wire it to `livenessProbe -> /livez`.
+- **Readiness — "I can reach the broker and do work."** `worker.health().ready` fails during a broker outage, before the first successful poll (a fresh pod is gated until it reaches the broker once), and during graceful shutdown. Wire it to `readinessProbe -> /readyz` so traffic and work are routed around a worker that cannot reach the broker.
+
+`worker.health()` reads in-memory fields plus one `Date.now()`; it issues no RPC and never awaits, so a probe does zero I/O.
+
+### The staleness subtlety
+
+`lastPollOkAt` advances on every reachable poll, but the poll loop is suspended inside your handler for the whole duration of a long job, so it stops advancing while a job runs. A naive "no poll in N seconds => unhealthy" would therefore flap NOT-ready during every long job. The surface uses two separate clocks instead:
+
+- **`lastBrokerContactAt`** — refreshed on any successful broker round-trip: a poll, a heartbeat, or a completion. During a long job the automatic heartbeats keep contact fresh, so readiness holds. Readiness staleness reads this clock.
+- **`loopAliveAt`** — refreshed at the top of every poll-loop iteration and on every heartbeat tick. A long async job keeps it fresh via heartbeat ticks; a blocked event loop stops both poll iterations and timer callbacks, so it goes stale and liveness correctly fails.
+
+Only **successful** round-trips refresh these clocks. Heartbeat and completion **failures** are never folded into connection health (that remains the poll loop's job, exactly as in [Transport resilience](#transport-resilience)); this surface never emits connection events and never changes `connected`.
+
+### `WorkerHealth` fields
+
+| Field | Meaning |
+| --- | --- |
+| `live` | Liveness: the poll loop is turning. |
+| `ready` | `live && connected && !stale && !stopping && lastPollOkAt > 0`. |
+| `connected` | Poll-loop connection state (from Transport resilience). |
+| `stale` | Broker-contact staleness exceeded `readinessStaleMs`. |
+| `stopping` | `close()` has begun. |
+| `consecutivePollFailures` | Consecutive poll-failure streak (0 while reachable). |
+| `inFlight` | Jobs currently processing (0 or 1 today; concurrency is future work). |
+| `lastPollOkAt` | Epoch ms of the last successful poll, `0` if never. |
+| `lastBrokerContactAt` | Epoch ms of the last poll, heartbeat, or completion round-trip, `0` if never. |
+| `loopAliveAt` | Epoch ms of the last poll-loop or heartbeat tick. |
+| `uptimeMs` | Milliseconds since construction. |
+| `now` | `Date.now()` at snapshot, so a reader is self-contained. |
+
+### Options and defaults
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `livenessStaleMs` | `max(heartbeatIntervalMs, pollBackoffMaxMs) * 3`, floored at `30000` | How long the loop may stop turning before liveness fails. |
+| `readinessStaleMs` | `max(heartbeatIntervalMs, pollBackoffMaxMs) * 2`, floored at `20000` | How long without a broker round-trip before readiness fails. |
+
+Each is validated as a positive finite number if supplied. `readinessStaleMs` must be **greater than** `heartbeatIntervalMs`, otherwise a long job's heartbeats could not keep readiness fresh and it would flap; construction throws if this is violated.
+
+### Serving the probes
+
+The library never opens a socket or imports `node:http`, so it stays runtime-agnostic and side-effect-free on import. It exports two framework-agnostic handlers instead; each maps `GET {livePath}` to 200/503 on `live`, `GET {readyPath}` to 200/503 on `ready`, returns the full `WorkerHealth` as a JSON body in both cases (so a 503 is debuggable), and answers an unknown path with 404 and a non-GET with 405. Paths default to `/livez` and `/readyz`.
+
+On Node's `http` server:
+
+```typescript
+import { createServer } from "node:http";
+import { Worker, nodeHealthListener } from "./src/index";
+
+const worker = new Worker("emails", handler);
+createServer(nodeHealthListener(worker)).listen(8080);
+```
+
+On a `fetch`-style server:
+
+```typescript
+import { Worker, fetchHealthHandler } from "./src/index";
+
+const worker = new Worker("emails", handler);
+Bun.serve({ port: 8080, fetch: fetchHealthHandler(worker) });
+```
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+Together with [Transport resilience](#transport-resilience), this retires the external connection-monitor sidecar and the scheduled-restart CronJob: the pod restarts itself only when truly wedged and is routed around automatically when it cannot reach the broker.
+
+**Security:** the health port is unauthenticated plaintext (transport auth and TLS are future work). Expose it on a cluster-internal address or listener only — never on a public interface — and rely on the probe's own network path rather than exposing it externally.
 
 ## Long-running jobs
 
