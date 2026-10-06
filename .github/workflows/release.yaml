@@ -26,8 +26,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.2.14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - working-directory: client
         run: bun install --frozen-lockfile && bun run check && bun run test
+      - name: Installed client package (Node and Bun)
+        working-directory: client
+        run: npm run test:package
       - uses: azure/setup-helm@v4.3.0
         with:
           version: v3.17.3

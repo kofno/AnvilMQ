@@ -25,3 +25,7 @@ Desktop.ini
 # Container harness reports and seed manifests.
 /harness/artifacts/
 /dist/
+
+/client/dist/
+/client/proto/
+/client/*.tgz

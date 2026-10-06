@@ -1,6 +1,14 @@
-# AnvilMQ TypeScript client (Bun)
+# AnvilMQ TypeScript client (Node.js and Bun)
 
-This is a repo-local, private client using the canonical `../proto/queue.proto` at runtime. It is a minimal starting point, not a compatible replacement for any existing client or a published package. Bun is required for the demo/test scripts. Transport is plaintext gRPC for local development; authentication and TLS configuration are intentionally not implemented, so it is intended for in-cluster (trusted-network) use.
+ESM client for AnvilMQ with compiled JavaScript, TypeScript declarations, and a bundled protobuf. Requires Node.js 22 or newer, or Bun 1.2.14 or newer. Transport uses plaintext gRPC on trusted private networks; authentication and TLS are not implemented. This is not a drop-in BullMQ replacement.
+
+## Package preparation
+
+From `client/`, run `npm run build` and `npm pack`. Install the generated tarball in your application, then import `{ Queue, Worker } from '@anvilmq/client'`. Registry publication is a separate step; this change does not publish to npm.
+
+Run `cargo build --locked` from the repository root, then `npm run test:package` from `client/` to verify a clean tarball installation, declarations, and real broker enqueue/completion under Node and Bun. Both runtimes and npm must be on PATH. The test uses an isolated temporary database and removes its temporary consumer afterward.
+
+The package is ESM-only. Its public entry point is `@anvilmq/client`; source-file imports are unsupported. The prerelease version is reserved for packaging work after rc.4; no rc.5 broker release is implied. The client package, including its bundled protobuf and documentation, is MIT licensed; see [LICENSE](LICENSE). This license applies to the client distribution, not the broker.
 
 ## Setup and validation
 
@@ -21,7 +29,7 @@ It also runs a test-only gRPC proxy that forwards completion to the real broker,
 ## API
 
 ```typescript
-import { Queue, Worker, gracefulShutdown } from "./src/index";
+import { Queue, Worker, gracefulShutdown } from "@anvilmq/client";
 
 const queue = new Queue<{ recipient: string }>("email");
 await queue.add({ recipient: "user@example.com" }, {
@@ -147,7 +155,7 @@ On Node's `http` server:
 
 ```typescript
 import { createServer } from "node:http";
-import { Worker, nodeHealthListener } from "./src/index";
+import { Worker, nodeHealthListener } from "@anvilmq/client";
 
 const worker = new Worker("emails", handler);
 createServer(nodeHealthListener(worker)).listen(8080);
@@ -156,7 +164,7 @@ createServer(nodeHealthListener(worker)).listen(8080);
 On a `fetch`-style server:
 
 ```typescript
-import { Worker, fetchHealthHandler } from "./src/index";
+import { Worker, fetchHealthHandler } from "@anvilmq/client";
 
 const worker = new Worker("emails", handler);
 Bun.serve({ port: 8080, fetch: fetchHealthHandler(worker) });
@@ -284,7 +292,7 @@ A single `job.enqueueChild(name, data)` still works; with no explicit key it min
 `OutboxForwarder` is a store-and-forward buffer: `enqueue()` records a pending add and returns immediately, and a background tick loop (or a manual `drainOnce()`) forwards pending records to the broker, always re-using each record's held key so a re-forward is deduped. Transient broker errors leave a record pending for the next tick; a permanent error (e.g. `InvalidArgument`) poisons the record via `markFailed` and is surfaced through `onForwarded` — never silently dropped.
 
 ```typescript
-import { Queue, OutboxForwarder, MemoryOutboxStore } from "./src/index";
+import { Queue, OutboxForwarder, MemoryOutboxStore } from "@anvilmq/client";
 
 const queue = new Queue("emails");
 const forwarder = new OutboxForwarder(queue, new MemoryOutboxStore(), {
@@ -342,7 +350,7 @@ const worker = new Worker<EmailJob>("emails", sendEmail, {
 `renderPrometheus(metrics, { labels? })` is a **pure, zero-dependency** function that turns a snapshot into Prometheus text exposition (version 0.0.4) — `# HELP`, `# TYPE`, and one sample line per series, with an optional `labels` bag applied to every sample:
 
 ```typescript
-import { renderPrometheus } from "./src/index";
+import { renderPrometheus } from "@anvilmq/client";
 
 renderPrometheus(worker.metrics(), { labels: { worker: worker.workerId } });
 // # HELP anvilmq_client_jobs_processed_total Jobs completed successfully.
@@ -355,7 +363,7 @@ Wire it onto the health listener with `metricsPath`. The metrics route is opt-in
 
 ```typescript
 import { createServer } from "node:http";
-import { Worker, nodeHealthListener } from "./src/index";
+import { Worker, nodeHealthListener } from "@anvilmq/client";
 
 const worker = new Worker("emails", handler);
 createServer(nodeHealthListener(worker, { metricsPath: "/metrics" })).listen(8080);
@@ -393,7 +401,7 @@ Only `error` is required, so a `console`, `pino`, `winston`, or `bunyan`-shaped 
 `gracefulShutdown(closables, opts?)` registers `SIGTERM`/`SIGINT` handlers that close your resources cleanly on the first signal, then exit. It closes every closable concurrently and races the drain against `timeoutMs` (default `25000`): a clean drain exits `0`, a timeout logs a warning and exits `1`. Further signals during the drain are ignored. It reaches Node's `process` via `globalThis` only (no `node:process` import), so importing off Node never throws — it logs once and returns a no-op. The return value is an unregister function that detaches the handlers.
 
 ```typescript
-import { Worker, OutboxForwarder, gracefulShutdown, nodeHealthListener } from "./src/index";
+import { Worker, OutboxForwarder, gracefulShutdown, nodeHealthListener } from "@anvilmq/client";
 import { createServer } from "node:http";
 
 const worker = new Worker("emails", handler);
@@ -431,7 +439,7 @@ A job keeps its lease for as long as it needs — minutes, if necessary — as l
 The helpers below (`fetchReportRows`, `renderReportOffThread`, `sendEmailIdempotent`) are illustrative placeholders for your own code.
 
 ```ts
-import { Worker } from "./src/index";
+import { Worker } from "@anvilmq/client";
 
 // Email report generation: gather data in pages, render, then send. May take minutes.
 const worker = new Worker<{ reportId: string; recipient: string }>(
@@ -533,7 +541,7 @@ Delivery is at least once within the server's attempt and durability limits. Sid
 ## Exact-facet rate limits
 
 ```typescript
-import { RateLimits } from "./src/index";
+import { RateLimits } from "@anvilmq/client";
 const limits = new RateLimits();
 await limits.upsert("practice:123", 10, 60000); // ten claims per fixed window
 console.log(await limits.status("practice:123"));
