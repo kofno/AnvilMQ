@@ -25,7 +25,10 @@ try {
     $staging = Join-Path $output 'client-staging'
     $package = Join-Path $staging 'package'
     New-Item -ItemType Directory -Path (Join-Path $package 'proto') -Force | Out-Null
-    Copy-Item client/src $package -Recurse
+    & node client/scripts/build.mjs
+    if ($LASTEXITCODE -ne 0) { throw 'Client build failed' }
+    Copy-Item client/dist $package -Recurse
+    if (Test-Path client/LICENSE) { Copy-Item client/LICENSE $package }
     Copy-Item proto/queue.proto (Join-Path $package 'proto/queue.proto')
     Copy-Item client/README.md $package
     $manifest = Get-Content client/package.json -Raw | ConvertFrom-Json

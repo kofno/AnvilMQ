@@ -30,7 +30,7 @@ git push origin v0.1.0-rc.2
 
 Requires Docker, Helm, PowerShell 7, Git, and tar. Builds `anvilmq:0.1.0-rc.2` locally and writes packages/checksums to `dist/0.1.0-rc.2/`; it does not push images or tags. The manifest records the commit and whether the working tree was dirty. Existing output directories are rejected to avoid accidentally replacing release artifacts. `-ImageRepository` changes the image name; `-SkipImageBuild` only packages files and marks that fact in `release.json`.
 
-The client archive is npm-compatible and includes the canonical protobuf. It exports TypeScript and is intended for Bun applications; a compiled Node.js distribution is not included. No npm registry publication is required.
+The client archive is npm-compatible and includes the canonical protobuf. It exports compiled ESM JavaScript and TypeScript declarations for Node.js 22+ and Bun, with the protobuf bundled. Build dependencies must be installed in client/ before packaging. No npm registry publication is performed.
 
 ## Deploy the published release
 
