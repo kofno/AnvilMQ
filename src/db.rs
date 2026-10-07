@@ -172,6 +172,23 @@ mod tests {
         conn.prepare("SELECT id, rejected_at, kind, name, trace_id, parent_id, execution_depth, rate_limit_facet, detail FROM enqueue_rejections")
             .unwrap();
     }
+
+    #[test]
+    fn job_history_trace_lookup_is_index_backed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        DatabaseManager::run_migrations(&mut conn).unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM job_history WHERE trace_id = ?1 ORDER BY finished_at DESC",
+                ["any-trace"],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_history_trace"),
+            "expected trace index, got: {plan}"
+        );
+    }
 }
 
 impl DatabaseManager {
@@ -466,6 +483,12 @@ impl DatabaseManager {
         )?;
         tx.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_name_state_finished ON job_history(name, state, finished_at DESC)",
+            [],
+        )?;
+        // Exact trace-id lookups (console Trace ID filter + lineage drill-down) seek by trace_id and
+        // return finished_at DESC; the composite serves both so they never full-scan job_history.
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_trace ON job_history(trace_id, finished_at DESC)",
             [],
         )?;
         tx.commit()?;

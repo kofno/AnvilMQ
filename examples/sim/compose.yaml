@@ -38,11 +38,13 @@ services:
       # which the search demo (src/search-demo.ts) exercises. Off by default in the broker.
       ANVILMQ_FTS_ENABLED: ${ANVILMQ_FTS_ENABLED-1}
       # Retention sweeper. Production defaults are 24h/1000 completed + 7d failed, which never
-      # fire in a short sim; these overridable values keep a rolling ~2-5 min window so the
-      # history-bounding effect is visible on the Grafana "Retention" row within minutes.
-      ANVILMQ_RETENTION_COMPLETED_AGE_MS: ${ANVILMQ_RETENTION_COMPLETED_AGE_MS-120000}
+      # fire in a short sim; these overridable values keep an intentionally longer window (well
+      # beyond a few minutes) so a job or trace spotted in Grafana stays searchable in the console
+      # during a live demo, while history is still bounded and the sweeper still visibly runs on
+      # the Grafana "Retention" row.
+      ANVILMQ_RETENTION_COMPLETED_AGE_MS: ${ANVILMQ_RETENTION_COMPLETED_AGE_MS-1800000}
       ANVILMQ_RETENTION_COMPLETED_COUNT: ${ANVILMQ_RETENTION_COMPLETED_COUNT-0}
-      ANVILMQ_RETENTION_FAILED_AGE_MS: ${ANVILMQ_RETENTION_FAILED_AGE_MS-300000}
+      ANVILMQ_RETENTION_FAILED_AGE_MS: ${ANVILMQ_RETENTION_FAILED_AGE_MS-3600000}
       ANVILMQ_RETENTION_FAILED_COUNT: ${ANVILMQ_RETENTION_FAILED_COUNT-0}
       ANVILMQ_RETENTION_INTERVAL_MS: ${ANVILMQ_RETENTION_INTERVAL_MS-15000}
       # Max rows deleted per statement per tick. Prune capacity = BATCH / (INTERVAL_MS/1000).
