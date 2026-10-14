@@ -88,20 +88,33 @@ These are BullMQ *client* concerns; the broker does not need to change.
 
 | Feature | Rationale for deferral |
 |---------|------------------------|
-| **High availability / Raft (Phase 5)** | The application runs a **single** Valkey today, so single-broker AnvilMQ is at parity on availability. AnvilMQ is **ahead on durability** (FULL + WAL backup) and the client **outbox** catches jobs up during a broker outage. HA is therefore not required to make the comparison fair — see the caveat below. |
+| **High availability / Raft (Phase 5)** | The application's current Valkey runs Sentinel, but the Sentinels are **co-located on a single node**, so a node outage still drops messages — the deployment is **not truly HA today**. Single-broker AnvilMQ therefore only has to match that real-world resilience bar, not textbook HA. AnvilMQ runs at **NORMAL** durability (FULL is off the table for throughput — see below) and relies on the client **outbox** to catch producers up across a broker restart, plus periodic **WAL backup** for disaster recovery. HA is not required to make the comparison fair — see the caveat below. |
 | **Admin-UI mutations** (retry / promote / remove / create) | `/console` is read-only; useful for ops parity but not needed to run a throughput/correctness test. Revisit post-evaluation. |
 | **`job.log` / `step.sleep`** | Nice-to-have. Per-job logs are cosmetic for the test; `step.sleep` is expressible as a delayed follow-up job. |
 | **Chain/depth configurability** | Default depth 10 and the (off-by-default) chain-size cap are fine for the expected shallow trees; make configurable only if a ported flow needs it. |
 
 #### HA caveat (must be tested, not assumed)
 
-The parity argument for deferring HA rests on two claims that the evaluation must
-**validate as explicit test cases**, not take on faith:
+**The resilience bar is the *actual* current deployment, not textbook HA.** Today's
+Valkey runs Sentinel with all Sentinels co-located on one node, so a node outage
+already drops in-flight messages. AnvilMQ only has to match that, and the client
+outbox plausibly exceeds it. The asserted "HA is the biggest blocker" framing
+overstates a requirement the current system does not itself meet.
+
+**Durability choice: run at NORMAL.** FULL is incompatible with the throughput the
+workload needs (the baseline shows FULL capped well below observed peak), so the
+evaluation runs AnvilMQ at NORMAL. NORMAL can lose recently acknowledged writes
+after an OS/power failure, so the durability story rests on two compensating
+mechanisms rather than synchronous commit.
+
+The parity argument for deferring HA therefore rests on two claims the evaluation
+must **validate as explicit test cases**, not take on faith:
 1. the client **outbox** actually lets producers catch up after a broker restart
    with no lost enqueues (test C4);
 2. **WAL-backup restore** recovers broker state within an acceptable window.
 
-If either fails under test, HA re-enters the conversation.
+If either fails under test, HA (or a stronger durability posture) re-enters the
+conversation.
 
 ## Proposed sequencing
 
@@ -129,8 +142,10 @@ the largest and most invasive change.
 - **C3.** Comparable dashboards: reuse the bull-der-dash panels for BullMQ and the
   AnvilMQ sim/Prometheus dashboards for AnvilMQ — throughput (ops/s), latency
   (p50/p95/p99), backlog/age, and durability settings in view.
-- **C4.** Failure injection: broker crash + outbox catch-up validation, and a
-  WAL-backup restore drill (see HA caveat).
+- **C4.** Failure injection: **node-outage parity** — reproduce the real failure
+  mode (lose the node hosting the broker, mirroring the co-located-Sentinel Valkey
+  risk) and verify the client **outbox** catches producers up with no lost
+  enqueues on restart; plus a **WAL-backup restore** drill (see HA caveat).
 
 ## Relationship to the existing README roadmap
 
@@ -143,11 +158,17 @@ the largest and most invasive change.
 | **Phase 5 — Regional HA (Raft)** | **Stays deferred.** Not a blocker for the evaluation; mitigated by durability + client outbox, which the test validates |
 | Phase 6 — Observability | Largely complete; reused for Track C dashboards |
 
+## Decisions
+
+- **Durability: NORMAL.** FULL is incompatible with the workload's throughput
+  needs and is not a candidate. The durability story is NORMAL + client outbox +
+  periodic WAL backup, validated by test C4.
+- **Resilience bar: match the current deployment, not textbook HA.** Today's
+  co-located-Sentinel Valkey is not truly HA, so HA/Raft (Phase 5) stays deferred.
+
 ## Open questions
 
 - Milestone cut for the *first* evaluation: do we need full flow semantics (A6)
   in the first head-to-head, or can an initial round cover cron + bulk + dedup
   (A1–A5) with flows following in a second round?
 - B3 scope: a thin BullMQ-compatible shim vs. a fuller client rewrite.
-- Durability setting for the comparison: run AnvilMQ at FULL (fairest vs. a
-  single Valkey) or show both NORMAL and FULL?
