@@ -173,6 +173,8 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 ## Roadmap
 
+For a near-term, test-driven slice aimed at a head-to-head evaluation against the current BullMQ/Valkey deployment, see the [BullMQ workload parity roadmap](docs/bullmq-parity-roadmap.md) (draft).
+
 ### Phase 1: Core plumbing
 
 - [x] Rust project and core protobuf contract.
