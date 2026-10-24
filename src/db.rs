@@ -454,6 +454,7 @@ impl DatabaseManager {
             ("available_at", "INTEGER"),
             ("retry_backoff_ms", "INTEGER NOT NULL DEFAULT 0"),
             ("retry_backoff_max_ms", "INTEGER NOT NULL DEFAULT 60000"),
+            ("retry_jitter", "REAL NOT NULL DEFAULT 0"),
         ] {
             let exists = {
                 let mut statement = tx.prepare("PRAGMA table_info(jobs)")?;

@@ -873,6 +873,7 @@ dependencies = [
  "axum",
  "prost",
  "prost-types",
+ "rand",
  "rusqlite",
  "serde",
  "serde_json",
