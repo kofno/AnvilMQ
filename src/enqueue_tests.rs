@@ -133,9 +133,11 @@ async fn retry_jitter_out_of_range_is_rejected_and_zero_is_default() {
     let conn = service.db_manager.get_shared_connection();
     let (min, max): (f64, f64) = tokio::task::spawn_blocking(move || {
         conn.blocking_lock()
-            .query_row("SELECT MIN(retry_jitter), MAX(retry_jitter) FROM jobs", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT MIN(retry_jitter), MAX(retry_jitter) FROM jobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap()
     })
     .await

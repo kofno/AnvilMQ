@@ -292,7 +292,13 @@ impl QueueService for MyQueueService {
         let _timer = self.db_manager.metrics.timer("FailJob");
         let req = request.into_inner();
         let moved_to_failed_state = self
-            .finish_job(req.id, req.worker_id, req.attempt, Some(req.error_message), req.non_retryable)
+            .finish_job(
+                req.id,
+                req.worker_id,
+                req.attempt,
+                Some(req.error_message),
+                req.non_retryable,
+            )
             .await?;
         Ok(Response::new(FailJobResponse {
             success: true,
