@@ -30,8 +30,8 @@ pub mod queue {
 
 use queue::v1::{
     queue_service_server::{QueueService, QueueServiceServer},
-    AddJobRequest, AddJobResponse, CompleteJobRequest, CompleteJobResponse, FailJobRequest,
-    FailJobResponse, GetNextJobRequest, GetNextJobResponse,
+    AddJobBulkRequest, AddJobBulkResponse, AddJobRequest, AddJobResponse, CompleteJobRequest,
+    CompleteJobResponse, FailJobRequest, FailJobResponse, GetNextJobRequest, GetNextJobResponse,
 };
 
 pub struct MyQueueService {
@@ -50,6 +50,16 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<AddJobResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("AddJob");
         enqueue::enqueue(self, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn add_job_bulk(
+        &self,
+        request: Request<AddJobBulkRequest>,
+    ) -> Result<Response<AddJobBulkResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("AddJobBulk");
+        enqueue::enqueue_bulk(self, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -704,8 +714,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc = {
         let mut rx = shutdown_tx.subscribe();
+        // AddJobBulk accepts up to 5000 jobs per call; at ~1 KiB payloads that batch exceeds
+        // tonic's default 4 MiB decode cap, so raise the inbound message-size limit.
+        const MAX_DECODING_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
         Server::builder()
-            .add_service(QueueServiceServer::new(service))
+            .add_service(
+                QueueServiceServer::new(service)
+                    .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+            )
             .serve_with_shutdown(addr, async move {
                 let _ = rx.recv().await;
             })
