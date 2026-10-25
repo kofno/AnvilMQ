@@ -438,6 +438,24 @@ async fn fail(
             worker_id: worker.into(),
             attempt,
             error_message: format!("failure {attempt}"),
+            non_retryable: false,
+        }))
+        .await
+}
+
+async fn fail_non_retryable(
+    service: &MyQueueService,
+    id: &str,
+    worker: &str,
+    attempt: u32,
+) -> Result<Response<FailJobResponse>, Status> {
+    service
+        .fail_job(Request::new(FailJobRequest {
+            id: id.into(),
+            worker_id: worker.into(),
+            attempt,
+            error_message: format!("failure {attempt}"),
+            non_retryable: true,
         }))
         .await
 }
@@ -547,6 +565,63 @@ async fn retries_exhaust_limit_and_preserve_error() {
         fail(&service, &id, "worker", 2).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
+}
+
+#[tokio::test]
+async fn non_retryable_failure_moves_straight_to_failed_with_attempts_remaining() {
+    let (service, id) = setup(3).await;
+    assert_eq!(claim(&service).await.attempts, 1);
+    assert!(
+        fail_non_retryable(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+    // Terminal: gone from jobs, archived in job_history as Failed at attempt 1, no retry row.
+    let conn = service.db_manager.get_shared_connection();
+    let (live, delayed, history_state, history_attempts): (i64, i64, String, u32) =
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let live: i64 = conn
+                .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+                .unwrap();
+            let delayed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE state IN ('Waiting', 'Delayed')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let (state, attempts): (String, u32) = conn
+                .query_row(
+                    "SELECT state, attempts FROM job_history WHERE id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (live, delayed, state, attempts)
+        })
+        .await
+        .unwrap();
+    assert_eq!((live, delayed), (0, 0));
+    assert_eq!((history_state.as_str(), history_attempts), ("Failed", 1));
+    assert!(!claim(&service).await.found);
+}
+
+#[tokio::test]
+async fn retryable_failure_with_attempts_remaining_still_reschedules() {
+    let (service, id) = setup(3).await;
+    assert_eq!(claim(&service).await.attempts, 1);
+    assert!(
+        !fail(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+    let stored = snapshot(&service).await;
+    assert_eq!((stored.0.as_str(), stored.2), ("Waiting", 1));
 }
 
 #[tokio::test]

@@ -112,6 +112,40 @@ async fn conflicts_cover_payload_and_options_but_defaults_are_normalized() {
 }
 
 #[tokio::test]
+async fn retry_jitter_out_of_range_is_rejected_and_zero_is_default() {
+    let service = service(":memory:").await;
+    for jitter in [1.5_f64, -0.1, f64::NAN] {
+        let mut req = input();
+        req.idempotency_key.clear();
+        req.retry_jitter = jitter;
+        assert_eq!(
+            add(&service, req).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    // Boundary values 0.0 and 1.0 are accepted, and jitter is persisted.
+    for jitter in [0.0_f64, 1.0] {
+        let mut req = input();
+        req.idempotency_key.clear();
+        req.retry_jitter = jitter;
+        add(&service, req).await.unwrap();
+    }
+    let conn = service.db_manager.get_shared_connection();
+    let (min, max): (f64, f64) = tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(
+                "SELECT MIN(retry_jitter), MAX(retry_jitter) FROM jobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!((min, max), (0.0, 1.0));
+}
+
+#[tokio::test]
 async fn receipt_survives_completion_and_restart_without_rescheduling() {
     let path = std::env::temp_dir().join(format!("anvil-enqueue-{}.db", uuid::Uuid::new_v4()));
     let original;

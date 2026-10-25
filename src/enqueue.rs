@@ -63,6 +63,11 @@ pub async fn enqueue(
             "backoff cap must be at least the base",
         ));
     }
+    if req.retry_jitter.is_nan() || !(0.0..=1.0).contains(&req.retry_jitter) {
+        return Err(Status::invalid_argument(
+            "retry_jitter must be a fraction in [0, 1]",
+        ));
+    }
     if req.max_attempts == 0 {
         req.max_attempts = 3;
     }
@@ -259,11 +264,11 @@ pub async fn enqueue(
                 ON CONFLICT(trace_id) DO UPDATE SET job_count = job_count + 1, updated_at = ?2",
                 rusqlite::params![trace_id, now]).map_err(internal)?;
         }
-        tx.execute("INSERT INTO jobs (id, name, state, priority, payload, parent_id, trace_id, execution_depth, max_attempts, created_at, updated_at, rate_limit_facet, available_at, retry_backoff_ms, retry_backoff_max_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14)",
+        tx.execute("INSERT INTO jobs (id, name, state, priority, payload, parent_id, trace_id, execution_depth, max_attempts, created_at, updated_at, rate_limit_facet, available_at, retry_backoff_ms, retry_backoff_max_ms, retry_jitter)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![id, req.name, state, req.priority, req.payload,
                 parent_id, trace_id, effective_depth,
-                req.max_attempts, now, if req.rate_limit_facet.is_empty() { None } else { Some(req.rate_limit_facet) }, available_at, req.retry_backoff_ms, req.retry_backoff_max_ms]).map_err(internal)?;
+                req.max_attempts, now, if req.rate_limit_facet.is_empty() { None } else { Some(req.rate_limit_facet) }, available_at, req.retry_backoff_ms, req.retry_backoff_max_ms, req.retry_jitter]).map_err(internal)?;
         if let Some(original) = receipt_request.as_ref() {
             tx.execute("INSERT INTO enqueue_receipts(queue_name, idempotency_key, request, job_id, initial_state, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![req.name, req.idempotency_key, original, id, state, now]).map_err(internal)?;

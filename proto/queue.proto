@@ -36,6 +36,8 @@ message AddJobRequest {
   int64 retry_backoff_max_ms = 9;
   // Scoped to name. Empty disables deduplication; otherwise at most 256 UTF-8 bytes.
   string idempotency_key = 10;
+  // Backoff jitter fraction in [0, 1]; 0 disables jitter (exact exponential backoff).
+  double retry_jitter = 11;
 }
 
 message AddJobResponse {
@@ -86,6 +88,8 @@ message FailJobRequest {
   string worker_id = 2;
   string error_message = 3;
   uint32 attempt = 4;
+  // When true, the failure is terminal: the job moves straight to Failed even if attempts remain.
+  bool non_retryable = 5;
 }
 
 message FailJobResponse {

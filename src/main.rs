@@ -210,7 +210,7 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<CompleteJobResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("CompleteJob");
         let req = request.into_inner();
-        self.finish_job(req.id, req.worker_id, req.attempt, None)
+        self.finish_job(req.id, req.worker_id, req.attempt, None, false)
             .await?;
         Ok(Response::new(CompleteJobResponse { success: true }))
     }
@@ -292,7 +292,13 @@ impl QueueService for MyQueueService {
         let _timer = self.db_manager.metrics.timer("FailJob");
         let req = request.into_inner();
         let moved_to_failed_state = self
-            .finish_job(req.id, req.worker_id, req.attempt, Some(req.error_message))
+            .finish_job(
+                req.id,
+                req.worker_id,
+                req.attempt,
+                Some(req.error_message),
+                req.non_retryable,
+            )
             .await?;
         Ok(Response::new(FailJobResponse {
             success: true,
@@ -309,6 +315,7 @@ impl MyQueueService {
         worker_id: String,
         attempt: u32,
         error: Option<String>,
+        non_retryable: bool,
     ) -> Result<bool, Status> {
         if id.trim().is_empty() || worker_id.trim().is_empty() {
             return Err(Status::invalid_argument(
@@ -355,10 +362,12 @@ impl MyQueueService {
                 return Err(Status::failed_precondition("claim lease has expired"));
             }
             let failed = error.is_some();
+            let retry = failed && attempts < max_attempts && !non_retryable;
             let mut next_state = if failed { "Failed" } else { "Completed" };
-            if failed && attempts < max_attempts {
-                let (base, cap): (i64, i64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(internal)?;
+            if retry {
+                let (base, cap, jitter): (i64, i64, f64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms, retry_jitter FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(internal)?;
                 let delay = scheduling::retry_delay(base, cap, attempts);
+                let delay = scheduling::apply_jitter(delay, jitter, rand::random::<f64>());
                 let available_at = now.saturating_add(delay);
                 next_state = if delay == 0 { "Waiting" } else { "Delayed" };
                 tx.execute(
@@ -380,7 +389,7 @@ impl MyQueueService {
             }
             tx.commit().map_err(internal)?;
             metrics.transition(Some("Active"), next_state, if failed { "failed" } else { "completed" });
-            if failed && attempts < max_attempts {
+            if retry {
                 metrics.event("retried");
                 metrics.named.event(&name, "retried");
             } else {
@@ -388,7 +397,7 @@ impl MyQueueService {
                 metrics.named.observe_duration(&name, now.saturating_sub(created_at));
             }
             tracing::info!(job_id = %id, worker_id = %worker_id, attempt = attempts, from = "Active", to = next_state, "job transition");
-            Ok(failed && attempts >= max_attempts)
+            Ok(failed && !retry)
         }).await.map_err(|e| Status::internal(e.to_string()))?
     }
 }
