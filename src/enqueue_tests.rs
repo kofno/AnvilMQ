@@ -381,3 +381,177 @@ async fn ingress_admissions_resume_after_window_elapses() {
     .unwrap();
     assert!(add(&service, facet_req("c", "t")).await.is_ok());
 }
+
+use crate::queue::v1::{AddJobBulkRequest, AddJobBulkResponse, JobMetadata};
+
+async fn add_bulk(
+    service: &MyQueueService,
+    requests: Vec<AddJobRequest>,
+) -> Result<AddJobBulkResponse, Status> {
+    service
+        .add_job_bulk(Request::new(AddJobBulkRequest { requests }))
+        .await
+        .map(Response::into_inner)
+}
+
+async fn count(service: &MyQueueService, sql: &'static str) -> i64 {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn bulk_happy_path_inserts_all_jobs_in_order() {
+    let service = service(":memory:").await;
+    let n = 100usize;
+    let requests: Vec<_> = (0..n)
+        .map(|i| AddJobRequest {
+            name: format!("job-{i}"),
+            payload: format!("payload-{i}").into_bytes(),
+            delay_ms: if i % 2 == 0 { 0 } else { 1000 },
+            ..Default::default()
+        })
+        .collect();
+    let responses = add_bulk(&service, requests).await.unwrap().responses;
+    assert_eq!(responses.len(), n);
+    let mut ids = std::collections::HashSet::new();
+    for (i, response) in responses.iter().enumerate() {
+        assert!(ids.insert(response.id.clone()), "ids must be unique");
+        assert!(!response.replayed);
+        let expected = if i % 2 == 0 { "Waiting" } else { "Delayed" };
+        assert_eq!(response.state, expected);
+    }
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, n as i64);
+    assert_eq!(
+        count(
+            &service,
+            "SELECT COUNT(*) FROM jobs WHERE state = 'Delayed'"
+        )
+        .await,
+        (n / 2) as i64
+    );
+}
+
+#[tokio::test]
+async fn bulk_empty_and_oversized_are_rejected() {
+    let service = service(":memory:").await;
+    assert_eq!(
+        add_bulk(&service, Vec::new()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    let oversized: Vec<_> = (0..(crate::enqueue::MAX_BULK_BATCH_SIZE + 1))
+        .map(|_| AddJobRequest {
+            name: "x".into(),
+            ..Default::default()
+        })
+        .collect();
+    assert_eq!(
+        add_bulk(&service, oversized).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+}
+
+#[tokio::test]
+async fn bulk_accepts_exactly_the_max_batch_size() {
+    let service = service(":memory:").await;
+    let max = crate::enqueue::MAX_BULK_BATCH_SIZE;
+    let requests: Vec<_> = (0..max)
+        .map(|_| AddJobRequest {
+            name: "bulk".into(),
+            ..Default::default()
+        })
+        .collect();
+    let responses = add_bulk(&service, requests).await.unwrap().responses;
+    assert_eq!(responses.len(), max);
+    assert_eq!(
+        count(&service, "SELECT COUNT(*) FROM jobs").await,
+        max as i64
+    );
+}
+
+#[tokio::test]
+async fn bulk_rolls_back_entirely_when_one_job_is_rejected() {
+    let service = service(":memory:").await;
+    // Job at index 2 claims a parent that does not exist: a recorded ancestry rejection.
+    let mut requests: Vec<_> = (0..5)
+        .map(|i| AddJobRequest {
+            name: format!("job-{i}"),
+            payload: format!("p-{i}").into_bytes(),
+            ..Default::default()
+        })
+        .collect();
+    requests[2].metadata = Some(JobMetadata {
+        parent_id: "does-not-exist".into(),
+        ..Default::default()
+    });
+    let error = add_bulk(&service, requests).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().starts_with("bulk job 2:"),
+        "message should carry the offending index: {}",
+        error.message()
+    );
+    // Atomicity: nothing from the batch was inserted.
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+    // The offending job's rejection was durably recorded in its own transaction.
+    assert_eq!(
+        count(
+            &service,
+            "SELECT COUNT(*) FROM enqueue_rejections WHERE kind = 'parent_not_found'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn bulk_intra_batch_duplicate_replays_within_one_transaction() {
+    let service = service(":memory:").await;
+    let job = AddJobRequest {
+        name: "invoices".into(),
+        payload: b"same-bytes".to_vec(),
+        idempotency_key: "dedup:1".into(),
+        ..Default::default()
+    };
+    let responses = add_bulk(&service, vec![job.clone(), job])
+        .await
+        .unwrap()
+        .responses;
+    assert_eq!(responses.len(), 2);
+    assert!(!responses[0].replayed);
+    assert!(responses[1].replayed);
+    assert_eq!(responses[0].id, responses[1].id);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 1);
+    assert_eq!(
+        count(&service, "SELECT COUNT(*) FROM enqueue_receipts").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn bulk_intra_batch_conflict_rolls_back_whole_batch() {
+    let service = service(":memory:").await;
+    let first = AddJobRequest {
+        name: "invoices".into(),
+        payload: b"original".to_vec(),
+        idempotency_key: "dedup:1".into(),
+        ..Default::default()
+    };
+    let mut conflicting = first.clone();
+    conflicting.payload = b"different".to_vec();
+    let error = add_bulk(&service, vec![first, conflicting])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+    assert_eq!(
+        count(&service, "SELECT COUNT(*) FROM enqueue_receipts").await,
+        0
+    );
+}

@@ -26,8 +26,9 @@ const EVENTS: [&str; 6] = [
     "retried",
     "lease_expired",
 ];
-const METHODS: [&str; 11] = [
+const METHODS: [&str; 12] = [
     "AddJob",
+    "AddJobBulk",
     "GetNextJob",
     "CompleteJob",
     "FailJob",
@@ -311,7 +312,7 @@ pub struct Metrics {
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
-    latency: [Latency; 11],
+    latency: [Latency; 12],
     pub recovery_errors: AtomicU64,
     retention_deleted: [[AtomicU64; 3]; 3],
     retention_errors: AtomicU64,

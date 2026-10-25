@@ -3,6 +3,7 @@ package queue.v1;
 
 service QueueService {
   rpc AddJob (AddJobRequest) returns (AddJobResponse);
+  rpc AddJobBulk (AddJobBulkRequest) returns (AddJobBulkResponse);
   rpc GetNextJob (GetNextJobRequest) returns (GetNextJobResponse);
   rpc CompleteJob (CompleteJobRequest) returns (CompleteJobResponse);
   rpc FailJob (FailJobRequest) returns (FailJobResponse);
@@ -45,6 +46,17 @@ message AddJobResponse {
   string state = 2;
   // True when returning the original enqueue receipt, not the current job state.
   bool replayed = 3;
+}
+
+// Atomic, all-or-nothing batch enqueue (parity with BullMQ queue.addBulk). Every request is
+// admitted in a single transaction; if any job is rejected the whole batch rolls back.
+message AddJobBulkRequest {
+  repeated AddJobRequest requests = 1;
+}
+
+message AddJobBulkResponse {
+  // One response per request, in the same order as AddJobBulkRequest.requests.
+  repeated AddJobResponse responses = 1;
 }
 
 message GetNextJobRequest {
