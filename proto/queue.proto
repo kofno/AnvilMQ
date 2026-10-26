@@ -95,6 +95,11 @@ message CompleteJobRequest {
   string worker_id = 2;
   // Use attempts returned by GetNextJob. Zero is accepted only for attempt one.
   uint32 attempt = 3;
+  // Optional worker return value, retained on the terminal history row for
+  // debugging and (later) flow child-values. Empty means "no result" (stored as
+  // NULL). Opaque bytes: typically UTF-8 JSON, but any bytes are accepted. At
+  // most MAX_RESULT_BYTES (see server); larger is rejected with invalid_argument.
+  bytes result = 4;
 }
 
 message CompleteJobResponse {

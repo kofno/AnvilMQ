@@ -220,7 +220,19 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<CompleteJobResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("CompleteJob");
         let req = request.into_inner();
-        self.finish_job(req.id, req.worker_id, req.attempt, None, false)
+        // Reject oversize results before opening the transaction; results ride on job_history
+        // (retained until the retention sweeper prunes), so an unbounded blob bloats the DB/WAL.
+        if req.result.len() > MAX_RESULT_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "result exceeds {MAX_RESULT_BYTES} bytes"
+            )));
+        }
+        let result = if req.result.is_empty() {
+            None
+        } else {
+            Some(req.result)
+        };
+        self.finish_job(req.id, req.worker_id, req.attempt, None, false, result)
             .await?;
         Ok(Response::new(CompleteJobResponse { success: true }))
     }
@@ -308,6 +320,7 @@ impl QueueService for MyQueueService {
                 req.attempt,
                 Some(req.error_message),
                 req.non_retryable,
+                None,
             )
             .await?;
         Ok(Response::new(FailJobResponse {
@@ -326,6 +339,7 @@ impl MyQueueService {
         attempt: u32,
         error: Option<String>,
         non_retryable: bool,
+        result: Option<Vec<u8>>,
     ) -> Result<bool, Status> {
         if id.trim().is_empty() || worker_id.trim().is_empty() {
             return Err(Status::invalid_argument(
@@ -375,6 +389,7 @@ impl MyQueueService {
             let retry = failed && attempts < max_attempts && !non_retryable;
             let mut next_state = if failed { "Failed" } else { "Completed" };
             let mut released = 0usize;
+            let mut stored_result = false;
             if retry {
                 let (base, cap, jitter): (i64, i64, f64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms, retry_jitter FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(internal)?;
                 let delay = scheduling::retry_delay(base, cap, attempts);
@@ -389,13 +404,14 @@ impl MyQueueService {
             } else {
                 tx.execute(
                     "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id,
-                     execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet)
+                     execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet, result)
                      SELECT id, name, ?1, priority, payload, parent_id, trace_id, execution_depth, attempts,
                      max_attempts, created_at, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
-                     worker_id, CASE WHEN ?2 IS NULL THEN last_error ELSE ?2 END, rate_limit_facet
+                     worker_id, CASE WHEN ?2 IS NULL THEN last_error ELSE ?2 END, rate_limit_facet, ?4
                      FROM jobs WHERE id = ?3",
-                    rusqlite::params![if failed { "Failed" } else { "Completed" }, error, id],
+                    rusqlite::params![if failed { "Failed" } else { "Completed" }, error, id, result],
                 ).map_err(internal)?;
+                stored_result = result.is_some();
                 tx.execute("DELETE FROM jobs WHERE id = ?1", [&id]).map_err(internal)?;
                 // A4: release the idempotency slot only on a terminal transition. The
                 // release_on_finish = 1 guard guarantees a retain-mode receipt is untouched.
@@ -403,6 +419,9 @@ impl MyQueueService {
             }
             tx.commit().map_err(internal)?;
             metrics.dedup_released(released as u64);
+            if stored_result {
+                metrics.result_stored();
+            }
             metrics.transition(Some("Active"), next_state, if failed { "failed" } else { "completed" });
             if retry {
                 metrics.event("retried");
@@ -419,6 +438,11 @@ impl MyQueueService {
 
 /// Default worker lease recovery sweep cadence, overridable via `ANVILMQ_RECOVERY_INTERVAL_MS`.
 const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
+
+/// Maximum size of a worker return value stored on the terminal `job_history` row (A7). Results
+/// are retained until the retention sweeper prunes their row, so an unbounded blob would bloat the
+/// DB and WAL; 256 KiB stays comfortably under the 32 MiB server `max_decoding_message_size`.
+const MAX_RESULT_BYTES: usize = 256 * 1024;
 
 /// Default execution-depth circuit-breaker limit, overridable via `ANVILMQ_MAX_EXECUTION_DEPTH`.
 const DEFAULT_MAX_EXECUTION_DEPTH: u32 = 10;

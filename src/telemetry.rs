@@ -310,6 +310,7 @@ pub struct Metrics {
     enqueue_conflicts: AtomicU64,
     enqueue_receipts: AtomicI64,
     dedup_released: AtomicU64,
+    results_stored: AtomicU64,
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
@@ -389,6 +390,11 @@ impl Metrics {
         }
         self.dedup_released.fetch_add(n, Relaxed);
         self.enqueue_receipts.fetch_sub(n as i64, Relaxed);
+    }
+    /// A7: count a worker return value persisted on the terminal history row. Incremented once,
+    /// post-commit, only when a non-empty result was actually stored (empty results are NULL/no-op).
+    pub fn result_stored(&self) {
+        self.results_stored.fetch_add(1, Relaxed);
     }
     /// Records `n` retention deletions and decrements the matching level gauge so
     /// `anvilmq_jobs{state}` / `anvilmq_enqueue_receipts` flatten as history is pruned.
@@ -547,6 +553,7 @@ impl Metrics {
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_dedup_released_total Release-on-finish receipts released at terminal state since process start.\n# TYPE anvilmq_enqueue_dedup_released_total counter\nanvilmq_enqueue_dedup_released_total {}\n", self.dedup_released.load(Relaxed));
+        out += &format!("# HELP anvilmq_job_results_stored_total Worker return values persisted on terminal history rows since process start.\n# TYPE anvilmq_job_results_stored_total counter\nanvilmq_job_results_stored_total {}\n", self.results_stored.load(Relaxed));
         out += &format!("# HELP anvilmq_ancestry_rejections_total Enqueues rejected for missing parent or inconsistent execution depth.\n# TYPE anvilmq_ancestry_rejections_total counter\nanvilmq_ancestry_rejections_total {}\n# HELP anvilmq_chain_quarantines_total Enqueues rejected because their lineage exceeded the runaway-chain cap.\n# TYPE anvilmq_chain_quarantines_total counter\nanvilmq_chain_quarantines_total {}\n# HELP anvilmq_chain_counters_pruned_total Idle per-lineage counter rows reclaimed by the retention sweeper.\n# TYPE anvilmq_chain_counters_pruned_total counter\nanvilmq_chain_counters_pruned_total {}\n", self.ancestry_rejections.load(Relaxed), self.chain_quarantines.load(Relaxed), self.chain_counters_pruned.load(Relaxed));
         out += &format!("# HELP anvilmq_ingress_rejected_total Enqueues rejected by the sliding-window ingress velocity control.\n# TYPE anvilmq_ingress_rejected_total counter\nanvilmq_ingress_rejected_total {}\n", self.ingress_rejections.load(Relaxed));
         out += &format!("# HELP anvilmq_facet_dispatch_pruned_total Idle per-facet fairness rotation rows reclaimed by the retention sweeper.\n# TYPE anvilmq_facet_dispatch_pruned_total counter\nanvilmq_facet_dispatch_pruned_total {}\n", self.facet_dispatch_pruned.load(Relaxed));
@@ -1069,6 +1076,7 @@ struct RawJob {
     lease_expires_at_ms: Option<i64>,
     available_at: Option<i64>,
     payload: Vec<u8>,
+    result: Option<Vec<u8>>,
 }
 
 /// Full detail for a single job, unified across the live `jobs` table and terminal `job_history`
@@ -1101,6 +1109,11 @@ pub struct JobDetail {
     /// drill-down. Raw JSON is embedded directly when the bytes are valid UTF-8 JSON; otherwise the
     /// bytes are base64-encoded (see `payload_encoding`).
     payload: serde_json::Value,
+    /// None when the job stored no result. Otherwise "json" or "base64", matching payload_encoding.
+    result_encoding: Option<&'static str>,
+    /// The worker return value (A7). Absent/null when no result was stored. Raw JSON when the
+    /// bytes are valid UTF-8 JSON, else a base64 string (see result_encoding).
+    result: Option<serde_json::Value>,
 }
 
 /// Read-only single-job detail served off the WAL replica connection.
@@ -1150,6 +1163,7 @@ async fn job_detail(
                             worker_id: r.get(12)?,
                             lease_expires_at_ms: r.get(13)?,
                             available_at: r.get(14)?,
+                            result: None,
                         })
                     },
                 )
@@ -1161,7 +1175,7 @@ async fn job_detail(
             conn.query_row(
                 "SELECT id, name, state, priority, payload, parent_id, trace_id, \
                  execution_depth, attempts, max_attempts, created_at, finished_at, last_error, \
-                 worker_id, rate_limit_facet \
+                 worker_id, rate_limit_facet, result \
                  FROM job_history WHERE id = ?1",
                 rusqlite::params![id],
                 |r| {
@@ -1184,6 +1198,7 @@ async fn job_detail(
                         rate_limit_facet: r.get(14)?,
                         lease_expires_at_ms: None,
                         available_at: None,
+                        result: r.get(15)?,
                     })
                 },
             )
@@ -1197,16 +1212,23 @@ async fn job_detail(
             ReaderError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
     let raw = raw.ok_or(StatusCode::NOT_FOUND)?;
-    // Embed the payload as raw JSON when the bytes are valid UTF-8 JSON; otherwise base64-encode.
-    let (payload, payload_encoding) = match std::str::from_utf8(&raw.payload)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-    {
-        Some(value) => (value, "json"),
-        None => (
-            serde_json::Value::String(base64_encode(&raw.payload)),
-            "base64",
-        ),
+    // Embed a blob as raw JSON when its bytes are valid UTF-8 JSON; otherwise base64-encode.
+    fn encode_blob(bytes: &[u8]) -> (serde_json::Value, &'static str) {
+        match std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        {
+            Some(value) => (value, "json"),
+            None => (serde_json::Value::String(base64_encode(bytes)), "base64"),
+        }
+    }
+    let (payload, payload_encoding) = encode_blob(&raw.payload);
+    let (result, result_encoding) = match &raw.result {
+        Some(bytes) => {
+            let (value, encoding) = encode_blob(bytes);
+            (Some(value), Some(encoding))
+        }
+        None => (None, None),
     };
     Ok(Json(JobDetail {
         id: raw.id,
@@ -1228,6 +1250,8 @@ async fn job_detail(
         available_at: raw.available_at,
         payload_encoding,
         payload,
+        result_encoding,
+        result,
     }))
 }
 
@@ -2138,24 +2162,136 @@ mod tests {
         payload: &[u8],
         last_error: Option<&str>,
     ) {
-        let (id, state, payload, last_error) = (
+        insert_history_job_with_result(db, id, state, payload, last_error, None).await;
+    }
+
+    async fn insert_history_job_with_result(
+        db: &DatabaseManager,
+        id: &str,
+        state: &str,
+        payload: &[u8],
+        last_error: Option<&str>,
+        result: Option<&[u8]>,
+    ) {
+        let (id, state, payload, last_error, result) = (
             id.to_string(),
             state.to_string(),
             payload.to_vec(),
             last_error.map(|e| e.to_string()),
+            result.map(|r| r.to_vec()),
         );
         let conn = db.get_shared_connection();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, last_error, worker_id, rate_limit_facet) \
-                 VALUES (?1, 'email', ?2, 0, ?3, 'root', 'trace', 2, 3, 3, 5, 900, ?4, 'w-1', 'facet-a')",
-                rusqlite::params![id, state, payload, last_error],
+                "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, last_error, worker_id, rate_limit_facet, result) \
+                 VALUES (?1, 'email', ?2, 0, ?3, 'root', 'trace', 2, 3, 3, 5, 900, ?4, 'w-1', 'facet-a', ?5)",
+                rusqlite::params![id, state, payload, last_error, result],
             )
             .unwrap();
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_surfaces_stored_result_and_encodings() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-result-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        // JSON result is embedded raw with result_encoding "json".
+        insert_history_job_with_result(
+            &db,
+            "res-json",
+            "Completed",
+            br#"{"ok":true}"#,
+            None,
+            Some(br#"{"answer":42}"#),
+        )
+        .await;
+        // Binary result falls back to base64.
+        let binary = [0xffu8, 0xfe, 0x00, 0x01];
+        insert_history_job_with_result(
+            &db,
+            "res-bin",
+            "Completed",
+            br#"{"ok":true}"#,
+            None,
+            Some(&binary),
+        )
+        .await;
+        // No stored result => both fields null.
+        insert_history_job_with_result(&db, "res-none", "Completed", br#"{"ok":true}"#, None, None)
+            .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let json = job_detail(State(app.clone()), Path("res-json".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(json.source, "history");
+        assert_eq!(json.state, "Completed");
+        assert_eq!(json.result_encoding, Some("json"));
+        assert_eq!(json.result, Some(serde_json::json!({"answer": 42})));
+
+        let bin = job_detail(State(app.clone()), Path("res-bin".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(bin.result_encoding, Some("base64"));
+        assert_eq!(
+            bin.result,
+            Some(serde_json::Value::String(base64_encode(&binary)))
+        );
+
+        let none = job_detail(State(app.clone()), Path("res-none".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(none.result, None);
+        assert_eq!(none.result_encoding, None);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_detail_live_job_has_no_result() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-detail-live-res-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(
+            DatabaseManager::with_durability(path.to_str().unwrap(), Durability::Normal)
+                .await
+                .unwrap(),
+        );
+        insert_live_job(
+            &db,
+            "live",
+            "Active",
+            br#"{"n":1}"#,
+            Some("w-1"),
+            Some(1),
+            None,
+        )
+        .await;
+        let app = state_for(db.clone(), path.to_str().unwrap());
+
+        let detail = job_detail(State(app.clone()), Path("live".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(detail.source, "live");
+        assert_eq!(detail.result, None);
+        assert_eq!(detail.result_encoding, None);
+
+        drop(app);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
