@@ -165,6 +165,7 @@ async fn receipt_survives_completion_and_restart_without_rescheduling() {
                 id: claim.id,
                 worker_id: "worker".into(),
                 attempt: 1,
+                result: Vec::new(),
             }))
             .await
             .unwrap();

@@ -142,6 +142,7 @@ async fn parent_resolved_from_history_validates() {
             id: claim.id,
             worker_id: "w".into(),
             attempt: 1,
+            result: Vec::new(),
         }))
         .await
         .unwrap();

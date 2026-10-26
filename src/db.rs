@@ -140,12 +140,18 @@ mod tests {
             ALTER TABLE jobs DROP COLUMN last_error;
             ALTER TABLE job_history DROP COLUMN worker_id;
             ALTER TABLE job_history DROP COLUMN last_error;
-            ALTER TABLE job_history DROP COLUMN rate_limit_facet;",
+            ALTER TABLE job_history DROP COLUMN rate_limit_facet;
+            ALTER TABLE job_history DROP COLUMN result;",
         )
         .unwrap();
         conn.execute(
             "INSERT INTO jobs (id, name, state, priority, payload, trace_id, execution_depth, created_at, updated_at)
              VALUES ('existing', 'email', 'Waiting', 0, X'01', 'trace', 0, 1, 1)", [],
+        ).unwrap();
+        // A legacy history row predating the result column must survive with result IS NULL.
+        conn.execute(
+            "INSERT INTO job_history (id, name, state, priority, payload, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at)
+             VALUES ('legacy-done', 'email', 'Completed', 0, X'03', 'trace', 0, 1, 3, 1, 2)", [],
         ).unwrap();
         // A legacy receipt predating the column must survive as retain-mode (0).
         conn.execute(
@@ -180,6 +186,14 @@ mod tests {
         assert_eq!(error, None);
         conn.prepare("SELECT worker_id, last_error, rate_limit_facet FROM job_history")
             .unwrap();
+        let legacy_result: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT result FROM job_history WHERE id = 'legacy-done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_result, None);
         conn.prepare("SELECT trace_id, job_count, updated_at FROM chain_counters")
             .unwrap();
         conn.prepare("SELECT facet_key, last_served_seq, last_served_at FROM facet_dispatch")
@@ -338,7 +352,8 @@ impl DatabaseManager {
                 attempts INTEGER NOT NULL,
                 max_attempts INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
-                finished_at INTEGER NOT NULL
+                finished_at INTEGER NOT NULL,
+                result BLOB
             );
 
             CREATE TABLE IF NOT EXISTS rate_limit_rules (
@@ -505,6 +520,19 @@ impl DatabaseManager {
                 "ALTER TABLE enqueue_receipts ADD COLUMN release_on_finish INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        // job_history.result: A7 job result storage. BLOB (not TEXT), nullable, no default, so it
+        // does not fit the TEXT-column loop above. Legacy history rows carry NULL (no result).
+        let has_result = {
+            let mut statement = tx.prepare("PRAGMA table_info(job_history)")?;
+            let columns = statement.query_map([], |r| r.get::<_, String>(1))?;
+            columns
+                .collect::<SqlResult<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "result")
+        };
+        if !has_result {
+            tx.execute("ALTER TABLE job_history ADD COLUMN result BLOB", [])?;
         }
         // Partial index so the terminal-time receipt delete is an index probe; it only holds
         // release-on-finish receipts, so retain-forever receipts carry no index cost.

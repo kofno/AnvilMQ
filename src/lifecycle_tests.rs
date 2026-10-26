@@ -422,6 +422,7 @@ async fn complete(
             id: id.into(),
             worker_id: worker.into(),
             attempt,
+            result: Vec::new(),
         }))
         .await
 }
@@ -1446,4 +1447,135 @@ async fn release_on_finish_frees_the_slot_on_lease_expiry_exhaustion() {
         .metrics
         .render()
         .contains("anvilmq_enqueue_dedup_released_total 1\n"));
+}
+
+async fn complete_with_result(
+    service: &MyQueueService,
+    id: &str,
+    worker: &str,
+    attempt: u32,
+    result: Vec<u8>,
+) -> Result<Response<CompleteJobResponse>, Status> {
+    service
+        .complete_job(Request::new(CompleteJobRequest {
+            id: id.into(),
+            worker_id: worker.into(),
+            attempt,
+            result,
+        }))
+        .await
+}
+
+async fn history_result(service: &MyQueueService, id: &str) -> Option<Vec<u8>> {
+    let conn = service.db_manager.get_shared_connection();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row("SELECT result FROM job_history WHERE id = ?1", [&id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+async fn history_count(service: &MyQueueService) -> i64 {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row("SELECT COUNT(*) FROM job_history", [], |r| r.get(0))
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn completion_persists_json_result_and_counts_it() {
+    let (service, id) = setup(3).await;
+    claim(&service).await;
+    let result = br#"{"answer":42}"#.to_vec();
+    complete_with_result(&service, &id, "worker", 0, result.clone())
+        .await
+        .unwrap();
+    assert_eq!(history_result(&service, &id).await, Some(result));
+    assert_eq!(snapshot(&service).await.0, "Completed");
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_job_results_stored_total 1\n"));
+}
+
+#[tokio::test]
+async fn oversize_result_is_rejected_and_job_stays_active() {
+    let (service, id) = setup(3).await;
+    claim(&service).await;
+    let oversize = vec![0u8; MAX_RESULT_BYTES + 1];
+    assert_eq!(
+        complete_with_result(&service, &id, "worker", 0, oversize)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    // The job is untouched: still Active, nothing archived, nothing deleted.
+    assert_eq!(snapshot(&service).await.0, "Active");
+    assert_eq!(history_count(&service).await, 0);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_job_results_stored_total 0\n"));
+}
+
+#[tokio::test]
+async fn empty_result_is_stored_as_null_and_not_counted() {
+    let (service, id) = setup(3).await;
+    claim(&service).await;
+    complete_with_result(&service, &id, "worker", 0, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(history_result(&service, &id).await, None);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_job_results_stored_total 0\n"));
+}
+
+#[tokio::test]
+async fn failed_job_stores_no_result() {
+    let (service, id) = setup(1).await;
+    claim(&service).await;
+    assert!(
+        fail_non_retryable(&service, &id, "worker", 1)
+            .await
+            .unwrap()
+            .into_inner()
+            .moved_to_failed_state
+    );
+    assert_eq!(history_result(&service, &id).await, None);
+}
+
+#[tokio::test]
+async fn replayed_completion_keeps_the_original_result() {
+    let (service, id) = setup(3).await;
+    claim(&service).await;
+    let result = br#"{"v":1}"#.to_vec();
+    complete_with_result(&service, &id, "worker", 1, result.clone())
+        .await
+        .unwrap();
+    // A duplicate CompleteJob replays via the archived early-return and never re-runs the
+    // INSERT, so the stored result is written exactly once and never overwritten.
+    complete_with_result(&service, &id, "worker", 1, b"different".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(history_result(&service, &id).await, Some(result));
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_job_results_stored_total 1\n"));
 }
