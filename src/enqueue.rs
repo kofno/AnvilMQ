@@ -158,6 +158,11 @@ fn validate_and_prepare(
             "idempotency_key must be nonblank and at most 256 UTF-8 bytes",
         ));
     }
+    if req.release_on_finish && req.idempotency_key.is_empty() {
+        return Err(Status::invalid_argument(
+            "release_on_finish requires an idempotency_key",
+        ));
+    }
     if req.delay_ms < 0 || req.retry_backoff_ms < 0 || req.retry_backoff_max_ms < 0 {
         return Err(Status::invalid_argument("delays must not be negative"));
     }
@@ -437,8 +442,8 @@ fn enqueue_one(
     let receipt_created = receipt_request.is_some();
     if let Some(original) = receipt_request.as_ref() {
         tx.execute(
-            "INSERT INTO enqueue_receipts(queue_name, idempotency_key, request, job_id, initial_state, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![req.name, req.idempotency_key, original, id, state, now],
+            "INSERT INTO enqueue_receipts(queue_name, idempotency_key, request, job_id, initial_state, created_at, release_on_finish) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![req.name, req.idempotency_key, original, id, state, now, req.release_on_finish as i64],
         )
         .map_err(db_fail)?;
     }

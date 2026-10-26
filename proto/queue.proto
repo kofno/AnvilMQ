@@ -39,6 +39,12 @@ message AddJobRequest {
   string idempotency_key = 10;
   // Backoff jitter fraction in [0, 1]; 0 disables jitter (exact exponential backoff).
   double retry_jitter = 11;
+  // When true, the idempotency receipt for this job is released automatically once the
+  // job reaches a terminal state (Completed or terminally Failed), so the same
+  // idempotency_key can be enqueued again (BullMQ singleton / release-on-finish dedup).
+  // Requires idempotency_key to be set. Default false retains the receipt until retention
+  // prunes the underlying job (current behavior).
+  bool release_on_finish = 12;
 }
 
 message AddJobResponse {
