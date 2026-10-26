@@ -374,6 +374,7 @@ impl MyQueueService {
             let failed = error.is_some();
             let retry = failed && attempts < max_attempts && !non_retryable;
             let mut next_state = if failed { "Failed" } else { "Completed" };
+            let mut released = 0usize;
             if retry {
                 let (base, cap, jitter): (i64, i64, f64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms, retry_jitter FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(internal)?;
                 let delay = scheduling::retry_delay(base, cap, attempts);
@@ -396,8 +397,12 @@ impl MyQueueService {
                     rusqlite::params![if failed { "Failed" } else { "Completed" }, error, id],
                 ).map_err(internal)?;
                 tx.execute("DELETE FROM jobs WHERE id = ?1", [&id]).map_err(internal)?;
+                // A4: release the idempotency slot only on a terminal transition. The
+                // release_on_finish = 1 guard guarantees a retain-mode receipt is untouched.
+                released = tx.execute("DELETE FROM enqueue_receipts WHERE job_id = ?1 AND release_on_finish = 1", [&id]).map_err(internal)?;
             }
             tx.commit().map_err(internal)?;
+            metrics.dedup_released(released as u64);
             metrics.transition(Some("Active"), next_state, if failed { "failed" } else { "completed" });
             if retry {
                 metrics.event("retried");

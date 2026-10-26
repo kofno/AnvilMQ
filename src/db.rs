@@ -132,8 +132,10 @@ mod tests {
             DROP INDEX idx_chain_counters_updated;
             DROP INDEX idx_facet_dispatch_seq;
             DROP INDEX idx_facet_dispatch_served_at;
+            DROP INDEX idx_receipts_release;
             DROP TABLE facet_dispatch;
             DROP TABLE chain_counters;
+            ALTER TABLE enqueue_receipts DROP COLUMN release_on_finish;
             ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
             ALTER TABLE jobs DROP COLUMN last_error;
             ALTER TABLE job_history DROP COLUMN worker_id;
@@ -145,8 +147,21 @@ mod tests {
             "INSERT INTO jobs (id, name, state, priority, payload, trace_id, execution_depth, created_at, updated_at)
              VALUES ('existing', 'email', 'Waiting', 0, X'01', 'trace', 0, 1, 1)", [],
         ).unwrap();
+        // A legacy receipt predating the column must survive as retain-mode (0).
+        conn.execute(
+            "INSERT INTO enqueue_receipts (queue_name, idempotency_key, request, job_id, initial_state, created_at)
+             VALUES ('email', 'legacy-key', X'02', 'existing', 'Waiting', 1)", [],
+        ).unwrap();
         DatabaseManager::run_migrations(&mut conn).unwrap();
         DatabaseManager::run_migrations(&mut conn).unwrap();
+        let release: i64 = conn
+            .query_row(
+                "SELECT release_on_finish FROM enqueue_receipts WHERE idempotency_key = 'legacy-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(release, 0);
         let row = conn
             .query_row(
                 "SELECT state, worker_id FROM jobs WHERE id = 'existing'",
@@ -339,6 +354,7 @@ impl DatabaseManager {
                 job_id TEXT NOT NULL,
                 initial_state TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                release_on_finish INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (queue_name, idempotency_key)
             );
 
@@ -474,6 +490,25 @@ impl DatabaseManager {
         // Old Delayed jobs have no recoverable deadline; leave them unscheduled.
         tx.execute("UPDATE jobs SET available_at = created_at WHERE available_at IS NULL AND state != 'Delayed'", [])?;
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedulable ON jobs(priority, created_at, id, available_at) WHERE state IN ('Waiting', 'Delayed')", [])?;
+        // enqueue_receipts.release_on_finish: A4 release-on-finish dedup. Default 0 keeps
+        // legacy receipts in retain-forever mode.
+        let has_release = {
+            let mut statement = tx.prepare("PRAGMA table_info(enqueue_receipts)")?;
+            let columns = statement.query_map([], |r| r.get::<_, String>(1))?;
+            columns
+                .collect::<SqlResult<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "release_on_finish")
+        };
+        if !has_release {
+            tx.execute(
+                "ALTER TABLE enqueue_receipts ADD COLUMN release_on_finish INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // Partial index so the terminal-time receipt delete is an index probe; it only holds
+        // release-on-finish receipts, so retain-forever receipts carry no index cost.
+        tx.execute("CREATE INDEX IF NOT EXISTS idx_receipts_release ON enqueue_receipts(job_id) WHERE release_on_finish = 1", [])?;
         // Keep periodic pressure scans away from payload pages; adds write/storage cost.
         tx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pressure ON jobs(name, state, available_at, created_at, lease_expires_at_ms)", [])?;
         // Retention sweeps: age prune scans (state, finished_at) oldest-first; per-name count

@@ -71,6 +71,7 @@ pub async fn recover_expired(db: Arc<DatabaseManager>, batch_size: usize) -> Res
             let rows = statement.query_map(rusqlite::params![now, batch_size as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, u32>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let mut released = 0usize;
         for (id, attempts, max_attempts, base, cap, _name, _created_at) in &jobs {
             if attempts < max_attempts {
                 let delay = crate::scheduling::retry_delay(*base, *cap, *attempts);
@@ -79,9 +80,12 @@ pub async fn recover_expired(db: Arc<DatabaseManager>, batch_size: usize) -> Res
                 tx.execute("INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet)
                     SELECT id, name, 'Failed', priority, payload, parent_id, trace_id, execution_depth, attempts, max_attempts, created_at, ?1, worker_id, 'Worker lease expired', rate_limit_facet FROM jobs WHERE id = ?2", rusqlite::params![now, id])?;
                 tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+                // A4: release the idempotency slot on terminal attempt-exhaustion only.
+                released += tx.execute("DELETE FROM enqueue_receipts WHERE job_id = ?1 AND release_on_finish = 1", [id])?;
             }
         }
         tx.commit()?;
+        metrics.dedup_released(released as u64);
         for (id, attempts, max_attempts, base, cap, name, created_at) in &jobs {
             let retry = attempts < max_attempts;
             let to = if !retry { "Failed" } else if crate::scheduling::retry_delay(*base, *cap, *attempts) == 0 { "Waiting" } else { "Delayed" };

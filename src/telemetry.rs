@@ -309,6 +309,7 @@ pub struct Metrics {
     enqueue_replays: AtomicU64,
     enqueue_conflicts: AtomicU64,
     enqueue_receipts: AtomicI64,
+    dedup_released: AtomicU64,
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
@@ -379,6 +380,15 @@ impl Metrics {
     }
     pub fn enqueue_receipt_created(&self) {
         self.enqueue_receipts.fetch_add(1, Relaxed);
+    }
+    /// Record `n` receipts released by A4 release-on-finish dedup at terminal time, and
+    /// decrement the retained-receipts gauge so `anvilmq_enqueue_receipts` stays accurate.
+    pub fn dedup_released(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.dedup_released.fetch_add(n, Relaxed);
+        self.enqueue_receipts.fetch_sub(n as i64, Relaxed);
     }
     /// Records `n` retention deletions and decrements the matching level gauge so
     /// `anvilmq_jobs{state}` / `anvilmq_enqueue_receipts` flatten as history is pruned.
@@ -536,6 +546,7 @@ impl Metrics {
         );
         out += &format!("# HELP anvilmq_throttled_polls_total Polls encountering at least one due throttled job.\n# TYPE anvilmq_throttled_polls_total counter\nanvilmq_throttled_polls_total {}\n", self.throttled_polls.load(Relaxed));
         out += &format!("# HELP anvilmq_enqueue_replays_total Matching enqueue retries since process start.\n# TYPE anvilmq_enqueue_replays_total counter\nanvilmq_enqueue_replays_total {}\n# HELP anvilmq_enqueue_conflicts_total Conflicting enqueue keys since process start.\n# TYPE anvilmq_enqueue_conflicts_total counter\nanvilmq_enqueue_conflicts_total {}\n# HELP anvilmq_enqueue_receipts Retained enqueue idempotency receipts.\n# TYPE anvilmq_enqueue_receipts gauge\nanvilmq_enqueue_receipts {}\n", self.enqueue_replays.load(Relaxed), self.enqueue_conflicts.load(Relaxed), self.enqueue_receipts.load(Relaxed));
+        out += &format!("# HELP anvilmq_enqueue_dedup_released_total Release-on-finish receipts released at terminal state since process start.\n# TYPE anvilmq_enqueue_dedup_released_total counter\nanvilmq_enqueue_dedup_released_total {}\n", self.dedup_released.load(Relaxed));
         out += &format!("# HELP anvilmq_ancestry_rejections_total Enqueues rejected for missing parent or inconsistent execution depth.\n# TYPE anvilmq_ancestry_rejections_total counter\nanvilmq_ancestry_rejections_total {}\n# HELP anvilmq_chain_quarantines_total Enqueues rejected because their lineage exceeded the runaway-chain cap.\n# TYPE anvilmq_chain_quarantines_total counter\nanvilmq_chain_quarantines_total {}\n# HELP anvilmq_chain_counters_pruned_total Idle per-lineage counter rows reclaimed by the retention sweeper.\n# TYPE anvilmq_chain_counters_pruned_total counter\nanvilmq_chain_counters_pruned_total {}\n", self.ancestry_rejections.load(Relaxed), self.chain_quarantines.load(Relaxed), self.chain_counters_pruned.load(Relaxed));
         out += &format!("# HELP anvilmq_ingress_rejected_total Enqueues rejected by the sliding-window ingress velocity control.\n# TYPE anvilmq_ingress_rejected_total counter\nanvilmq_ingress_rejected_total {}\n", self.ingress_rejections.load(Relaxed));
         out += &format!("# HELP anvilmq_facet_dispatch_pruned_total Idle per-facet fairness rotation rows reclaimed by the retention sweeper.\n# TYPE anvilmq_facet_dispatch_pruned_total counter\nanvilmq_facet_dispatch_pruned_total {}\n", self.facet_dispatch_pruned.load(Relaxed));

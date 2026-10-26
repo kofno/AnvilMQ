@@ -555,3 +555,74 @@ async fn bulk_intra_batch_conflict_rolls_back_whole_batch() {
         0
     );
 }
+
+#[tokio::test]
+async fn release_on_finish_requires_an_idempotency_key() {
+    let service = service(":memory:").await;
+    let error = add(
+        &service,
+        AddJobRequest {
+            name: "invoices".into(),
+            release_on_finish: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+}
+
+#[tokio::test]
+async fn release_on_finish_flag_is_part_of_receipt_match() {
+    let service = service(":memory:").await;
+    let mut req = input();
+    req.release_on_finish = true;
+    let original = add(&service, req.clone()).await.unwrap();
+    // Same request (same key + flag) still replays.
+    assert_eq!(add(&service, req.clone()).await.unwrap().id, original.id);
+    // Flipping the flag for the same key conflicts like any other field change.
+    let mut retain = req;
+    retain.release_on_finish = false;
+    assert_eq!(
+        add(&service, retain).await.unwrap_err().code(),
+        tonic::Code::AlreadyExists
+    );
+}
+
+#[tokio::test]
+async fn bulk_persists_release_on_finish_flag_per_job() {
+    let service = service(":memory:").await;
+    let released = AddJobRequest {
+        name: "invoices".into(),
+        idempotency_key: "released:1".into(),
+        release_on_finish: true,
+        ..Default::default()
+    };
+    let retained = AddJobRequest {
+        name: "invoices".into(),
+        idempotency_key: "retained:1".into(),
+        ..Default::default()
+    };
+    let responses = add_bulk(&service, vec![released, retained])
+        .await
+        .unwrap()
+        .responses;
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        count(
+            &service,
+            "SELECT release_on_finish FROM enqueue_receipts WHERE idempotency_key = 'released:1'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &service,
+            "SELECT release_on_finish FROM enqueue_receipts WHERE idempotency_key = 'retained:1'"
+        )
+        .await,
+        0
+    );
+}

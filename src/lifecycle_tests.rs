@@ -1310,3 +1310,140 @@ async fn fairness_disabled_preserves_priority_fifo_and_writes_nothing() {
     // Disabled path must not write the fairness table at all.
     assert!(facet_dispatch_keys(&service).await.is_empty());
 }
+
+// ----- A4: release-on-finish dedup -----
+
+async fn dedup_service() -> MyQueueService {
+    MyQueueService {
+        db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
+        max_execution_depth: 10,
+        max_chain_size: 0,
+        fairness_enabled: false,
+        lease_duration_ms: leases::LEASE_DURATION_MS,
+    }
+}
+
+async fn enqueue(service: &MyQueueService, req: AddJobRequest) -> AddJobResponse {
+    service
+        .add_job(Request::new(req))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+fn dedup_job(release: bool, max_attempts: u32) -> AddJobRequest {
+    AddJobRequest {
+        name: "dedup".into(),
+        payload: vec![7],
+        idempotency_key: "singleton:1".into(),
+        release_on_finish: release,
+        max_attempts,
+        ..Default::default()
+    }
+}
+
+async fn receipt_count(service: &MyQueueService) -> i64 {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(
+                "SELECT COUNT(*) FROM enqueue_receipts WHERE idempotency_key = 'singleton:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn release_on_finish_frees_the_slot_on_completion() {
+    let service = dedup_service().await;
+    let first = enqueue(&service, dedup_job(true, 3)).await;
+    assert!(!first.replayed);
+    claim(&service).await;
+    complete(&service, &first.id, "worker", 1).await.unwrap();
+    // Terminal completion released the receipt.
+    assert_eq!(receipt_count(&service).await, 0);
+    let second = enqueue(&service, dedup_job(true, 3)).await;
+    assert!(!second.replayed, "freed slot must admit a brand-new job");
+    assert_ne!(second.id, first.id);
+    assert_eq!(receipt_count(&service).await, 1);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_enqueue_dedup_released_total 1\n"));
+}
+
+#[tokio::test]
+async fn retain_default_preserves_receipt_after_completion() {
+    let service = dedup_service().await;
+    let first = enqueue(&service, dedup_job(false, 3)).await;
+    claim(&service).await;
+    complete(&service, &first.id, "worker", 1).await.unwrap();
+    // Default retain-forever mode keeps the receipt.
+    assert_eq!(receipt_count(&service).await, 1);
+    let second = enqueue(&service, dedup_job(false, 3)).await;
+    assert!(second.replayed, "retained receipt must replay");
+    assert_eq!(second.id, first.id);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_enqueue_dedup_released_total 0\n"));
+}
+
+#[tokio::test]
+async fn release_on_finish_frees_the_slot_on_terminal_failure() {
+    let service = dedup_service().await;
+    let first = enqueue(&service, dedup_job(true, 1)).await;
+    claim(&service).await;
+    // max_attempts = 1, so a retryable failure still exhausts attempts: terminal Failed.
+    fail(&service, &first.id, "worker", 1).await.unwrap();
+    assert_eq!(receipt_count(&service).await, 0);
+    let second = enqueue(&service, dedup_job(true, 1)).await;
+    assert!(!second.replayed);
+    assert_ne!(second.id, first.id);
+}
+
+#[tokio::test]
+async fn release_on_finish_holds_the_slot_across_retry() {
+    let service = dedup_service().await;
+    let first = enqueue(&service, dedup_job(true, 2)).await;
+    claim(&service).await;
+    // Retryable failure with attempts remaining: the job goes back to the queue.
+    fail(&service, &first.id, "worker", 1).await.unwrap();
+    // Slot is NOT released while the job can still run.
+    assert_eq!(receipt_count(&service).await, 1);
+    let second = enqueue(&service, dedup_job(true, 2)).await;
+    assert!(second.replayed, "held slot must still replay");
+    assert_eq!(second.id, first.id);
+}
+
+#[tokio::test]
+async fn release_on_finish_frees_the_slot_on_lease_expiry_exhaustion() {
+    let service = dedup_service().await;
+    let first = enqueue(&service, dedup_job(true, 1)).await;
+    claim(&service).await;
+    sql(&service, "UPDATE jobs SET lease_expires_at_ms = 0").await;
+    assert_eq!(
+        leases::recover_expired(
+            service.db_manager.clone(),
+            leases::DEFAULT_RECOVERY_BATCH_SIZE
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(receipt_count(&service).await, 0);
+    let second = enqueue(&service, dedup_job(true, 1)).await;
+    assert!(!second.replayed);
+    assert_ne!(second.id, first.id);
+    assert!(service
+        .db_manager
+        .metrics
+        .render()
+        .contains("anvilmq_enqueue_dedup_released_total 1\n"));
+}
