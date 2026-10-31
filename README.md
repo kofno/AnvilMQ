@@ -178,7 +178,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 Declarative **job schedulers** produce jobs on a timezone-aware cron schedule (parity with BullMQ job schedulers). Four RPCs manage them: `UpsertJobScheduler`, `DeleteJobScheduler`, `GetJobScheduler`, and `ListJobSchedulers`. A scheduler's `id` **is** the produced job's `name`, so there is exactly one scheduler per name; upsert replaces it in place. Each scheduler carries a `JobTemplate` (the produced job's name, payload, and the same option fields a single `AddJob` accepts — priority, attempts, backoff, jitter, facet) and a `RepeatSpec` (a `cron` pattern and a `timezone`).
 
-The schedule is a standard **5-field cron** pattern, evaluated timezone-aware via `croner` + `chrono-tz`, so Daylight Saving transitions are handled correctly (production runs `America/Denver`). An empty `timezone` means UTC. Note that `croner` normalizes `N/M` step syntax — e.g. `0/20` is accepted and rewritten to `0-59/20`.
+The schedule is a standard **5-field cron** pattern, evaluated timezone-aware via `croner` + `chrono-tz`, so Daylight Saving transitions are handled correctly across any IANA timezone (e.g. `America/New_York`). An empty `timezone` means UTC. Note that `croner` normalizes `N/M` step syntax — e.g. `0/20` is accepted and rewritten to `0-59/20`.
 
 A background loop scans due schedulers on a fixed cadence and produces **one job per due scheduler**, enqueued as a **root** job (no parent, `execution_depth` 0, fresh `trace_id`) in the **Waiting** state and immediately claimable. Firing is **exactly-once per fire**: the job insert and the advance of the scheduler's `next_run_at` to the next future cron occurrence commit together in a single IMMEDIATE transaction, so a crash mid-fire rolls back both and the fire retries on the next tick. Each scheduler fires in its own transaction, so one failing scheduler never blocks the rest of the batch. The model is **skip-missed / no backfill**: only `next_run_at` is persisted, so after a long outage a scheduler fires once on the first tick and then jumps to the next future occurrence rather than replaying every missed interval. Clients reconcile declaratively: list the existing schedulers, delete any no longer declared, then upsert the desired set.
 
@@ -200,7 +200,7 @@ The loop exposes three metrics on `/metrics`: `anvilmq_scheduler_jobs_produced_t
 
 ## Roadmap
 
-For a near-term, test-driven slice aimed at a head-to-head evaluation against the current BullMQ/Valkey deployment, see the [BullMQ workload parity roadmap](docs/bullmq-parity-roadmap.md) (Milestone 1 — non-retryable failure, backoff jitter, bulk enqueue, release-on-finish dedup, cron schedulers, and job result storage — delivered; flows deferred to Milestone 2).
+For AnvilMQ's feature-parity tracking against BullMQ, see the [BullMQ feature parity roadmap](docs/bullmq-parity-roadmap.md) (Milestone 1 — non-retryable failure, backoff jitter, bulk enqueue, release-on-finish dedup, cron schedulers, and job result storage — delivered; flows deferred to Milestone 2).
 
 ### Phase 1: Core plumbing
 
@@ -235,7 +235,7 @@ For a near-term, test-driven slice aimed at a head-to-head evaluation against th
 
 ### Phase 5: Regional high availability
 
-Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](harness/BENCHMARKS.md)) and observed production load: a single broker's sustainable completion throughput sits well above current demand, so availability and durability — not throughput or partitioning — are the remaining gap. The phase is split into production operability first, then consensus.
+Reprioritized after local capacity benchmarking (see [harness/BENCHMARKS.md](harness/BENCHMARKS.md)): a single broker's sustainable completion throughput is high enough that availability and durability — not throughput or partitioning — are the remaining gap. The phase is split into production operability first, then consensus.
 
 #### Phase 5a: Production operability (next)
 
@@ -488,7 +488,7 @@ The chart surfaces the broker's operational knobs as an optional `engine` values
 helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml
 ```
 
-The overlay picks NORMAL durability (a deliberate throughput choice — FULL's per-commit fsync caps sustained completion throughput near 55 ops/s, below the ~80 ops/s peak demand observed in production; the recovery point is then bounded by the local snapshot cadence), tuned resource requests/limits, tenant fairness on, and the local snapshot writer on (2 min cadence, retain 3). Snapshot **upload stays disabled** in the shipped profile so it is schema-valid and never launches a misconfigured sidecar. To ship snapshots off-node, enable it (edit the overlay or pass the values on the CLI):
+The overlay picks NORMAL durability (a deliberate throughput choice — FULL's per-commit fsync caps sustained completion throughput near 55 ops/s per [harness/BENCHMARKS.md](harness/BENCHMARKS.md); the recovery point is then bounded by the local snapshot cadence), tuned resource requests/limits, tenant fairness on, and the local snapshot writer on (2 min cadence, retain 3). Snapshot **upload stays disabled** in the shipped profile so it is schema-valid and never launches a misconfigured sidecar. To ship snapshots off-node, enable it (edit the overlay or pass the values on the CLI):
 
 ```bash
 helm upgrade --install anvilmq charts/anvilmq -f charts/anvilmq/values-production.yaml \
