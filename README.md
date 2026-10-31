@@ -79,6 +79,12 @@ Make handler side effects idempotent (natural keys, upserts, conditional writes,
 
 Optional `idempotency_key` (protobuf tag 10) deduplicates within the exact job/queue `name`. Empty/omitted means ordinary enqueue; nonempty keys must be nonblank and at most 256 UTF-8 bytes. Matching retries return the original ID and initial enqueue state with `replayed=true` (response tag 3), even after completion or failure. This is an enqueue receipt, not a current-state query. Replays do not reset delays, create another job, consume attempts, or increment the enqueued counter.
 
+Optional `release_on_finish` (protobuf tag 12, requires `idempotency_key`) opts a keyed enqueue into BullMQ singleton semantics: the receipt is released automatically once the job reaches a terminal state, so the same key can be enqueued again. Default `false` retains the receipt until retention prunes it (see [Idempotent enqueue](#idempotent-enqueue)).
+
+### Bulk enqueue
+
+`AddJobBulk` enqueues a batch of jobs atomically, all-or-nothing (parity with BullMQ `queue.addBulk`). The request carries `repeated AddJobRequest requests`; every job is admitted in a single IMMEDIATE transaction and the response returns one `AddJobResponse` per request **in request order**. The batch holds at most `MAX_BULK_BATCH_SIZE` = 5000 jobs; an empty batch or one exceeding the cap is rejected with `INVALID_ARGUMENT` before any write. If **any** job in the batch is rejected — a bad argument, a tripped circuit breaker, a chain quarantine — the whole transaction rolls back and no job is persisted, so a partially applied batch is impossible. Each job runs the same admission path as a single `AddJob`, including idempotency: intra-batch duplicates (two requests sharing a `name`/`idempotency_key`) dedupe against each other and replay normally. The server raises `max_decoding_message_size` to 32 MiB to accommodate large batches.
+
 ### Ancestry validation and runaway-chain quarantine
 
 The execution-depth cap only holds if callers honestly propagate and increment `execution_depth`. Two enqueue-time controls harden this, both evaluated inside the existing immediate transaction using indexed point lookups so the hot path stays cheap. They are backward compatible: an enqueue with no `parent_id` (and with the chain cap unset) behaves exactly as before.
@@ -110,7 +116,9 @@ Idle `chain_counters` rows are reclaimed by the retention sweeper: a lineage who
 
 New per-job protobuf fields `retry_backoff_ms` (tag 8) and `retry_backoff_max_ms` (tag 9) configure retries. Base zero preserves immediate retries. A zero cap selects `max(60000, base)` milliseconds; an explicit cap must be at least the base. Negative delays/backoff values and overflowing initial timestamps return InvalidArgument.
 
-After attempt N fails, delay is `min(base * 2^(N-1), cap)`. For base 1000 and cap 10000, delays are 1s, 2s, 4s, 8s, then 10s. The same policy applies to expired leases, measured from recovery time. Positive retries enter Delayed; zero-delay retries enter Waiting. Exhausted jobs go straight to Failed history. Arithmetic saturates to avoid overflow; no jitter is applied.
+After attempt N fails, delay is `min(base * 2^(N-1), cap)`. For base 1000 and cap 10000, delays are 1s, 2s, 4s, 8s, then 10s. The same policy applies to expired leases, measured from recovery time. Positive retries enter Delayed; zero-delay retries enter Waiting. Exhausted jobs go straight to Failed history. Arithmetic saturates to avoid overflow.
+
+The per-job field `retry_jitter` (tag 11) is a fraction in `[0, 1]` that adds randomized jitter to each exponential backoff delay, spreading retries so a burst of simultaneous failures does not stampede on the same schedule (BullMQ-style jitter). `0` (the default) disables jitter and preserves exact exponential backoff — the prior behavior. Jitter is applied after the exponential formula and stays within the cap.
 
 Due times and policies survive restart. Existing jobs default to zero backoff; legacy Waiting jobs remain eligible. These timestamps use the server wall clock, so clock adjustments can change scheduling timing.
 
@@ -156,13 +164,32 @@ The daemon shuts down cleanly on `SIGTERM` (the signal Kubernetes sends on pod t
 
 `CompleteJob` verifies that the job is Active and owned by the requesting worker, inserts a Completed history record, and deletes the live job in one immediate transaction. History preserves payload, ancestry, priority, attempt counts, creation time, finish time, worker, facet, and the most recent failure message (if any).
 
-`FailJob` performs the same ownership checks and records `error_message`. If `attempts < max_attempts`, it reschedules the job and clears worker ownership; `moved_to_failed_state=false`. Otherwise it atomically moves the job to history as Failed and returns `moved_to_failed_state=true`. Attempts increment only on dequeue. `max_attempts=0` at enqueue defaults to three total attempts. Retries retain original priority/creation time and follow the per-job backoff policy below. Only the latest error is retained, not a per-attempt log.
+An optional `result` (tag 4) carries the worker's return value: opaque bytes (typically UTF-8 JSON, but any bytes are accepted) retained on the Completed history row for debugging and later flow child-values. It is capped at `MAX_RESULT_BYTES` = 256 KiB; a larger result is rejected with `INVALID_ARGUMENT`. Empty means "no result" (stored as `NULL`). The stored value is surfaced on the single-job telemetry endpoint (`GET /v1/jobs/{id}`); non-UTF-8 bytes are base64-encoded there.
+
+`FailJob` performs the same ownership checks and records `error_message`. If `attempts < max_attempts`, it reschedules the job and clears worker ownership; `moved_to_failed_state=false`. Otherwise it atomically moves the job to history as Failed and returns `moved_to_failed_state=true`. Setting `non_retryable=true` (tag 5) makes the failure terminal (BullMQ `UnrecoverableError`): the job moves straight to Failed history even when attempts remain, and `moved_to_failed_state=true`. Default `false` keeps the reschedule-while-attempts-remain behavior. Attempts increment only on dequeue. `max_attempts=0` at enqueue defaults to three total attempts. Retries retain original priority/creation time and follow the per-job backoff policy below. Only the latest error is retained, not a per-attempt log.
 
 Workers must send the dequeue response's `attempts` as `attempt` in completion/failure requests. This prevents acknowledgments from an older claim affecting a later claim by the same worker.
 
 Acknowledgments return success only after commit. If a completion response is lost, repeating `CompleteJob` with the same job ID, worker ID, and successful attempt returns success from the Completed history record, including after restart. Zero remains an alias for attempt one. Replays do not change history or increment transition/state metrics; RPC latency metrics still count each request. The original lease need not remain valid once completion has committed.
 
 Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect Active-job owner returns PermissionDenied. Non-Active live jobs, stale attempts, and archived records with a different owner, attempt, or outcome return FailedPrecondition without mutation. `FailJob` replays remain rejected. Completion receipts last as long as the history record is retained; legacy records without worker identity cannot prove a match. These ownership checks compare caller-provided identifiers; they are not authentication, and completion idempotency does not deduplicate external handler side effects.
+
+### Scheduled jobs (declarative cron)
+
+Declarative **job schedulers** produce jobs on a timezone-aware cron schedule (parity with BullMQ job schedulers). Four RPCs manage them: `UpsertJobScheduler`, `DeleteJobScheduler`, `GetJobScheduler`, and `ListJobSchedulers`. A scheduler's `id` **is** the produced job's `name`, so there is exactly one scheduler per name; upsert replaces it in place. Each scheduler carries a `JobTemplate` (the produced job's name, payload, and the same option fields a single `AddJob` accepts — priority, attempts, backoff, jitter, facet) and a `RepeatSpec` (a `cron` pattern and a `timezone`).
+
+The schedule is a standard **5-field cron** pattern, evaluated timezone-aware via `croner` + `chrono-tz`, so Daylight Saving transitions are handled correctly (production runs `America/Denver`). An empty `timezone` means UTC. Note that `croner` normalizes `N/M` step syntax — e.g. `0/20` is accepted and rewritten to `0-59/20`.
+
+A background loop scans due schedulers on a fixed cadence and produces **one job per due scheduler**, enqueued as a **root** job (no parent, `execution_depth` 0, fresh `trace_id`) in the **Waiting** state and immediately claimable. Firing is **exactly-once per fire**: the job insert and the advance of the scheduler's `next_run_at` to the next future cron occurrence commit together in a single IMMEDIATE transaction, so a crash mid-fire rolls back both and the fire retries on the next tick. Each scheduler fires in its own transaction, so one failing scheduler never blocks the rest of the batch. The model is **skip-missed / no backfill**: only `next_run_at` is persisted, so after a long outage a scheduler fires once on the first tick and then jumps to the next future occurrence rather than replaying every missed interval. Clients reconcile declaratively: list the existing schedulers, delete any no longer declared, then upsert the desired set.
+
+Two startup-validated env knobs tune the loop, consistent with the recovery knobs (both must be positive integers; a present-but-invalid value fails startup):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ANVILMQ_SCHEDULER_INTERVAL_MS` | `1000` | Cadence in milliseconds of the background scan for due schedulers. Must be a positive integer; a present-but-invalid value fails startup. |
+| `ANVILMQ_SCHEDULER_BATCH_SIZE` | `256` | Maximum due schedulers fired per tick, bounding how long the single writer is held per scan. Must be an integer `>= 1`; a present-but-invalid value fails startup. |
+
+The loop exposes three metrics on `/metrics`: `anvilmq_scheduler_jobs_produced_total`, `anvilmq_scheduler_errors_total`, and `anvilmq_schedulers_active` (see [Observability](#observability)).
 
 ## Known limitations
 
@@ -173,7 +200,7 @@ Blank IDs return InvalidArgument, unknown jobs return NotFound, and an incorrect
 
 ## Roadmap
 
-For a near-term, test-driven slice aimed at a head-to-head evaluation against the current BullMQ/Valkey deployment, see the [BullMQ workload parity roadmap](docs/bullmq-parity-roadmap.md) (draft).
+For a near-term, test-driven slice aimed at a head-to-head evaluation against the current BullMQ/Valkey deployment, see the [BullMQ workload parity roadmap](docs/bullmq-parity-roadmap.md) (Milestone 1 — non-retryable failure, backoff jitter, bulk enqueue, release-on-finish dedup, cron schedulers, and job result storage — delivered; flows deferred to Milestone 2).
 
 ### Phase 1: Core plumbing
 
@@ -279,6 +306,10 @@ if (receipt.replayed) {
   // A prior submission already created this job; do not treat it as new work.
 }
 ```
+
+### Release-on-finish dedup
+
+By default a receipt is a *permanent* enqueue record: it lives until retention drops its job from both the live and history tables (see below), so the same key can never re-enqueue while the original is retained. Set `release_on_finish=true` on `AddJob` (requires `idempotency_key`) to opt into BullMQ singleton semantics instead: the receipt is released automatically once the job reaches a **terminal** state (Completed, or terminally Failed), so the same key can be enqueued again as genuinely new work. This fits the cron/singleton pattern of "reuse one logical key, let it release on completion" without any producer coordination. Default `false` retains the receipt until retention prunes it, as described below.
 
 ### Durability, cost, and metrics
 
@@ -483,6 +514,8 @@ Each `engine` key is optional. An empty string (or `false`) means "use the broke
 
 A default `helm install` (without the overlay) sets none of these keys, so it renders exactly as before — the new values are inert until set.
 
+The declarative scheduler loop has two additional broker env knobs — `ANVILMQ_SCHEDULER_INTERVAL_MS` (default `1000`) and `ANVILMQ_SCHEDULER_BATCH_SIZE` (default `256`) — validated at startup like the recovery knobs (see [Scheduled jobs](#scheduled-jobs-declarative-cron)). The chart does not yet surface them as `engine` values, so set them directly on the container environment if you need to override the defaults.
+
 ### Runtime-provisioned limits
 
 Faceted **dispatch** rate limits and **ingress velocity** limits are intentionally *not* part of this profile. They are per-facet/per-tenant rules — runtime RPC data, not chart config — applied while the broker is running via the `UpsertRateLimitRule` and `UpsertIngressLimitRule` gRPC RPCs (see [proto/queue.proto](proto/queue.proto)). There is no global env or values toggle for them, so the chart cannot enable them by default. Provision them per facet after deploy, e.g. with [`grpcurl`](https://github.com/fullstorydev/grpcurl):
@@ -541,6 +574,9 @@ Metrics have only fixed state, event, method, and histogram-bound labels:
 | `anvilmq_last_backup_timestamp_ms` | Wall-clock time of the last successful snapshot (unix ms); alert on staleness |
 | `anvilmq_last_backup_duration_ms` | Duration of the last successful snapshot in milliseconds |
 | `anvilmq_last_backup_size_bytes` | Size of the last successful snapshot in bytes |
+| `anvilmq_scheduler_jobs_produced_total` | Jobs produced by the declarative scheduler loop since process start |
+| `anvilmq_scheduler_errors_total` | Scheduler fires that failed and will retry next tick |
+| `anvilmq_schedulers_active` | Declarative schedulers with a pending next run |
 | `anvilmq_enqueue_replays_total` | Matching keyed enqueue retries since startup; rising rates can indicate lost responses or producer retry pressure |
 | `anvilmq_enqueue_conflicts_total` | Key reuse with different request contents since startup; investigate producer identity/serialization mistakes |
 | `anvilmq_enqueue_receipts` | Retained idempotency records, initialized from storage; monitor alongside PVC usage |

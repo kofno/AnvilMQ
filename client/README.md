@@ -51,6 +51,8 @@ gracefulShutdown([worker]);
 
 `Queue(name).add(data, options)` serializes JSON; the queue name maps to the protocol's `name`. There is no separate job-type field. Put a `kind` in your payload when needed. Options also include `priority`, `metadata`, `rateLimitFacet`, and the durability knobs `idempotencyKey`, `enqueueRetryMaxMs`, `enqueueRetryBaseMs`, and `noIdempotencyKey` (see [Producer durability](#producer-durability)). `Queue.addBulk(items, bulkOpts?)` fans out to one `add` per item with bounded concurrency. Generic types provide compile-time help, not runtime payload validation.
 
+> **Server surface not yet wrapped by this client.** The broker exposes two additional capabilities this client does not yet provide typed methods for: the **atomic bulk enqueue** RPC `AddJobBulk` (all-or-nothing, up to 5000 jobs per transaction — the client's `addBulk` is a client-side fan-out, not this RPC) and the **declarative job schedulers** (`UpsertJobScheduler`, `DeleteJobScheduler`, `GetJobScheduler`, `ListJobSchedulers`) for timezone-aware cron. Both are documented in the [server README](../README.md#implemented-behavior); call them over gRPC directly (e.g. with `grpcurl`) until the client adds wrappers.
+
 Both constructors accept `address` (default `[::1]:50051`) and `rpcTimeoutMs` (default 5000). They also accept `keepalive` to tune HTTP/2 transport liveness (see [Transport resilience](#transport-resilience)). Workers accept `workerId` (default a fresh UUID), `pollIntervalMs` (250), `heartbeatIntervalMs` (10000, maximum 10000), `onError`, the resilience options `pollBackoffMaxMs`, `connectionLostThreshold`, `onConnectionLost`, and `onConnectionRestored`, plus the health options `livenessStaleMs` and `readinessStaleMs` (see [Kubernetes health](#kubernetes-health)). A single `Worker` runs up to `concurrency` handlers in parallel (default `1`, i.e. strictly one job at a time); raise it to process more jobs over one connection instead of creating extra workers (see [Concurrency & throughput](#concurrency--throughput)).
 
 Workers poll immediately, send heartbeats during async processing, and acknowledge with the claimed attempt number. Handler errors, including JSON decoding errors, invoke FailJob. If heartbeat fails or times out, the handler's signal aborts and the client sends no acknowledgment. Handlers must honor cancellation; the client cannot undo external side effects. Avoid blocking the event loop, which prevents heartbeats.
@@ -251,7 +253,9 @@ Retry is attempted only for `Unavailable`/`DeadlineExceeded`; any other status (
 
 ### `addBulk`: bounded client-side fan-out
 
-There is no batch RPC; `addBulk` fans out to one independent `add` per item through a bounded worker pool (default concurrency 8) so a large batch never spawns unbounded promises. Results are **positional** — one `AddResult` per input, in order:
+The client's `addBulk` fans out to one independent `add` per item through a bounded worker pool (default concurrency 8) so a large batch never spawns unbounded promises. Results are **positional** — one `AddResult` per input, in order:
+
+> **Note:** this is client-side fan-out, **not** the broker's atomic batch RPC. The server exposes `AddJobBulk` (all-or-nothing, up to 5000 jobs in one transaction — see the [server README](../README.md#bulk-enqueue)), but this client does not call it yet: `addBulk` issues independent `add` calls, so a mid-batch failure leaves earlier jobs enqueued (see `stopOnError` below). Use the server RPC directly if you need transactional all-or-nothing semantics.
 
 ```typescript
 const results = await queue.addBulk(
