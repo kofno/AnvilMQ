@@ -126,6 +126,7 @@ pub async fn upsert(
     };
 
     let conn = db.get_shared_connection();
+    let metrics = db.metrics.clone();
     tokio::task::spawn_blocking(move || {
         let mut conn = conn.blocking_lock();
         let tx = conn
@@ -133,12 +134,19 @@ pub async fn upsert(
             .map_err(internal)?;
         let now = now_ms(&tx).map_err(internal)?;
         let next = next_cron_after(now, &cron, &timezone).map_err(map_scheduler_error)?;
+        // Detect insert-vs-update so the active-schedulers gauge only increments when a new
+        // scheduler row is created. A5 schedulers are always active (next_run_at non-NULL), so an
+        // update leaves the active count unchanged.
+        let existed = db::get_scheduler(&tx, &id).map_err(internal)?.is_some();
         let spec = SchedulerSpec {
             next_run_at: Some(next),
             ..spec_base
         };
         db::upsert_scheduler(&tx, &spec, now).map_err(internal)?;
         tx.commit().map_err(internal)?;
+        if !existed {
+            metrics.scheduler_activated();
+        }
         tracing::info!(id = %id, cron = %cron, next_run_at = next, "job scheduler upserted");
         Ok(UpsertJobSchedulerResponse {
             id,
@@ -158,6 +166,7 @@ pub async fn delete(
         return Err(Status::invalid_argument("id must not be blank"));
     }
     let conn = db.get_shared_connection();
+    let metrics = db.metrics.clone();
     tokio::task::spawn_blocking(move || {
         let mut conn = conn.blocking_lock();
         let tx = conn
@@ -165,6 +174,9 @@ pub async fn delete(
             .map_err(internal)?;
         let deleted = db::delete_scheduler(&tx, &id).map_err(internal)?;
         tx.commit().map_err(internal)?;
+        if deleted {
+            metrics.scheduler_deactivated();
+        }
         Ok(DeleteJobSchedulerResponse { deleted })
     })
     .await

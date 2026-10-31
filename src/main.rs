@@ -18,6 +18,7 @@ mod pressure;
 mod rate_limit;
 mod reader;
 mod retention;
+mod scheduler;
 mod schedulers;
 mod scheduling;
 mod telemetry;
@@ -559,6 +560,42 @@ fn parse_recovery_batch_size(raw: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// Parse `ANVILMQ_SCHEDULER_INTERVAL_MS`. Absent -> default; present must be a positive integer.
+fn parse_scheduler_interval_ms(raw: Option<&str>) -> Result<u64, String> {
+    match raw {
+        None => Ok(scheduler::DEFAULT_SCHEDULER_INTERVAL_MS),
+        Some(value) => {
+            let parsed = value.trim().parse::<i64>().map_err(|_| {
+                format!("ANVILMQ_SCHEDULER_INTERVAL_MS must be an integer, got {value:?}")
+            })?;
+            if parsed <= 0 {
+                return Err(format!(
+                    "ANVILMQ_SCHEDULER_INTERVAL_MS={parsed} must be positive"
+                ));
+            }
+            Ok(parsed as u64)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_SCHEDULER_BATCH_SIZE`. Absent -> default; present must be an integer >= 1.
+fn parse_scheduler_batch_size(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(scheduler::DEFAULT_SCHEDULER_BATCH_SIZE),
+        Some(value) => {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                format!("ANVILMQ_SCHEDULER_BATCH_SIZE must be an integer, got {value:?}")
+            })?;
+            if parsed < 1 {
+                return Err(format!(
+                    "ANVILMQ_SCHEDULER_BATCH_SIZE={parsed} must be >= 1"
+                ));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
@@ -771,6 +808,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .unwrap_or(false);
+    // A5b declarative scheduler loop: scan due schedulers each tick and produce jobs through the
+    // enqueue core with the same depth/chain limits the gRPC service enforces.
+    let scheduler_interval_ms = parse_scheduler_interval_ms(
+        std::env::var("ANVILMQ_SCHEDULER_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
+    let scheduler_batch_size = parse_scheduler_batch_size(
+        std::env::var("ANVILMQ_SCHEDULER_BATCH_SIZE")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
+    let scheduler_config = scheduler::SchedulerConfig {
+        interval_ms: scheduler_interval_ms,
+        batch_size: scheduler_batch_size,
+        max_execution_depth,
+        max_chain_size,
+    };
+    tracing::info!(
+        scheduler_interval_ms,
+        scheduler_batch_size,
+        "scheduler loop configured"
+    );
+    let scheduler_db = db_manager.clone();
+    let scheduler = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            scheduler_config.interval_ms,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let produced = scheduler::run_once(scheduler_db.clone(), scheduler_config).await;
+            if produced > 0 {
+                tracing::info!(produced, "scheduled jobs produced");
+            }
+        }
+    });
+
     let shutdown_db = db_manager.clone();
     let service = MyQueueService {
         db_manager,
@@ -823,6 +900,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Both servers have drained. Stop the background tasks so nothing else writes, then checkpoint
     // the WAL. A checkpoint failure is logged but never blocks a clean exit.
     recovery.abort();
+    scheduler.abort();
     sampler.abort();
     if let Some(retention) = retention {
         retention.abort();
@@ -955,6 +1033,32 @@ mod tests {
         assert!(parse_recovery_interval_ms(Some("0")).is_err());
         assert!(parse_recovery_interval_ms(Some("-1")).is_err());
         assert!(parse_recovery_interval_ms(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn scheduler_interval_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_scheduler_interval_ms(None).unwrap(),
+            scheduler::DEFAULT_SCHEDULER_INTERVAL_MS
+        );
+        assert_eq!(parse_scheduler_interval_ms(Some("250")).unwrap(), 250);
+        assert_eq!(parse_scheduler_interval_ms(Some(" 500 ")).unwrap(), 500);
+        assert!(parse_scheduler_interval_ms(Some("0")).is_err());
+        assert!(parse_scheduler_interval_ms(Some("-1")).is_err());
+        assert!(parse_scheduler_interval_ms(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn scheduler_batch_size_parses_defaults_and_rejects_invalid() {
+        assert_eq!(
+            parse_scheduler_batch_size(None).unwrap(),
+            scheduler::DEFAULT_SCHEDULER_BATCH_SIZE
+        );
+        assert_eq!(parse_scheduler_batch_size(Some("64")).unwrap(), 64);
+        assert_eq!(parse_scheduler_batch_size(Some(" 32 ")).unwrap(), 32);
+        assert!(parse_scheduler_batch_size(Some("0")).is_err());
+        assert!(parse_scheduler_batch_size(Some("-1")).is_err());
+        assert!(parse_scheduler_batch_size(Some("nope")).is_err());
     }
 
     #[test]

@@ -334,6 +334,9 @@ pub struct Metrics {
     last_backup_timestamp_ms: AtomicI64,
     last_backup_duration_ms: AtomicI64,
     last_backup_size_bytes: AtomicI64,
+    scheduler_jobs_produced: AtomicU64,
+    scheduler_errors: AtomicU64,
+    schedulers_active: AtomicI64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -351,6 +354,17 @@ impl Metrics {
                 metrics.states[i].store(count, Relaxed);
             }
         }
+        // Seed the active-schedulers gauge from persisted state. A5 has no stop conditions, so
+        // every scheduler with a non-NULL `next_run_at` is active; the gauge is maintained
+        // lock-free thereafter via upsert-insert / delete deltas (never a DB query in `render`).
+        metrics.schedulers_active.store(
+            conn.query_row(
+                "SELECT COUNT(*) FROM job_schedulers WHERE next_run_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?,
+            Relaxed,
+        );
         Ok(metrics)
     }
     pub fn transition(&self, from: Option<&str>, to: &str, event: &str) {
@@ -443,6 +457,23 @@ impl Metrics {
     /// Record a failed snapshot run. The broker keeps running and retries on the next tick.
     pub fn backup_failure(&self) {
         self.backup_failures_total.fetch_add(1, Relaxed);
+    }
+    /// A5b: count one job produced by the scheduler loop. Fired once, post-commit, per fire.
+    pub fn scheduler_job_produced(&self) {
+        self.scheduler_jobs_produced.fetch_add(1, Relaxed);
+    }
+    /// A5b: a scheduler fire failed (produce/cron/db). The fire rolls back and retries next tick.
+    pub fn scheduler_error(&self) {
+        self.scheduler_errors.fetch_add(1, Relaxed);
+    }
+    /// A5b: a scheduler newly became active (upsert-insert). Keeps `schedulers_active` accurate
+    /// lock-free without a `render`-time DB query.
+    pub fn scheduler_activated(&self) {
+        self.schedulers_active.fetch_add(1, Relaxed);
+    }
+    /// A5b: an active scheduler was removed (delete). Decrements the active-schedulers gauge.
+    pub fn scheduler_deactivated(&self) {
+        self.schedulers_active.fetch_sub(1, Relaxed);
     }
     /// Enqueue rejected because a supplied `parent_id` did not resolve or the child's
     /// `execution_depth` was not exactly `parent + 1`.
@@ -569,6 +600,9 @@ impl Metrics {
             );
         }
         out += &format!("# HELP anvilmq_rejections_pruned_total Aged-out forensic enqueue-rejection rows reclaimed by the retention sweeper.\n# TYPE anvilmq_rejections_pruned_total counter\nanvilmq_rejections_pruned_total {}\n", self.rejections_pruned.load(Relaxed));
+        out += &format!("# HELP anvilmq_scheduler_jobs_produced_total Jobs produced by the declarative scheduler loop since process start.\n# TYPE anvilmq_scheduler_jobs_produced_total counter\nanvilmq_scheduler_jobs_produced_total {}\n", self.scheduler_jobs_produced.load(Relaxed));
+        out += &format!("# HELP anvilmq_scheduler_errors_total Scheduler fires that failed and will retry next tick.\n# TYPE anvilmq_scheduler_errors_total counter\nanvilmq_scheduler_errors_total {}\n", self.scheduler_errors.load(Relaxed));
+        out += &format!("# HELP anvilmq_schedulers_active Declarative schedulers with a pending next run.\n# TYPE anvilmq_schedulers_active gauge\nanvilmq_schedulers_active {}\n", self.schedulers_active.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out

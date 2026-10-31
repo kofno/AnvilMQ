@@ -316,7 +316,7 @@ impl DatabaseManager {
         .unwrap()
     }
 
-    fn run_migrations(conn: &mut Connection) -> SqlResult<()> {
+    pub(crate) fn run_migrations(conn: &mut Connection) -> SqlResult<()> {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "
@@ -714,6 +714,41 @@ pub fn list_schedulers(conn: &Connection) -> SqlResult<Vec<JobSchedulerRow>> {
     ))?;
     let rows = stmt.query_map([], scheduler_from_row)?;
     rows.collect()
+}
+
+/// Select a bounded batch of schedulers that are due at `now` (A5b loop index). A scheduler is
+/// due when it has a non-NULL `next_run_at <= now`. Ordered by `next_run_at` so the oldest fires
+/// first, backed by `idx_schedulers_due`. `limit` bounds how long the single writer is held per
+/// tick.
+pub fn select_due_schedulers(
+    conn: &Connection,
+    now: i64,
+    limit: usize,
+) -> SqlResult<Vec<JobSchedulerRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCHEDULER_COLUMNS} FROM job_schedulers \
+         WHERE next_run_at IS NOT NULL AND next_run_at <= ?1 ORDER BY next_run_at, id LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![now, limit as i64], scheduler_from_row)?;
+    rows.collect()
+}
+
+/// Advance a scheduler after it fires (A5b): set the next future `next_run_at`, increment
+/// `produced_count`, record the produced `last_job_id`, and refresh `updated_at`. Runs in the
+/// SAME transaction as the produced job insert so the two commit atomically (exactly-once).
+pub fn advance_scheduler(
+    conn: &Connection,
+    id: &str,
+    next_run_at: i64,
+    last_job_id: &str,
+    now: i64,
+) -> SqlResult<()> {
+    conn.execute(
+        "UPDATE job_schedulers SET next_run_at = ?2, produced_count = produced_count + 1, \
+         last_job_id = ?3, updated_at = ?4 WHERE id = ?1",
+        rusqlite::params![id, next_run_at, last_job_id, now],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
