@@ -1,11 +1,13 @@
 # BullMQ workload parity roadmap
 
-Status: **Draft / for discussion.** This document proposes a modified, test-driven
-slice of the roadmap whose goal is a **head-to-head evaluation** of AnvilMQ
-against the current BullMQ/Valkey deployment, running a representative (simulated)
-copy of the production workload. It does not replace the [README roadmap](../README.md#roadmap);
-it sequences a near-term **workload-parity track** ahead of the deferred
-high-availability work.
+Status: **Milestone 1 delivered.** The broker slice that unblocks the first
+head-to-head — **A1, A2, A3, A4, A5, and A7** — has merged (PRs #51–#56); only
+**A6 (flows)** remains, deferred to Milestone 2. This document proposes a
+modified, test-driven slice of the roadmap whose goal is a **head-to-head
+evaluation** of AnvilMQ against the current BullMQ/Valkey deployment, running a
+representative (simulated) copy of the production workload. It does not replace
+the [README roadmap](../README.md#roadmap); it sequences a near-term
+**workload-parity track** ahead of the deferred high-availability work.
 
 The scope here is derived from an audit of the BullMQ features the application
 actually uses, reconciled against AnvilMQ's real wire contract
@@ -29,23 +31,24 @@ deferred.
 
 Each BullMQ feature the application uses falls into one of four buckets.
 
-### A. Broker gaps (must build) — A1–A5 + A7 critical path; A6 is Milestone 2
+### A. Broker gaps — A1–A5 + A7 **delivered** (Milestone 1); A6 is Milestone 2
 
-| ID | Feature | Current reality | Size |
-|----|---------|-----------------|------|
-| A1 | **Non-retryable failure** (`UnrecoverableError`) | `FailJob` always reschedules while attempts remain; no terminal flag | XS |
-| A2 | **Backoff jitter** | Exponential backoff + per-job attempts exist; "no jitter is applied" | XS |
-| A3 | **Bulk enqueue** (`addBulk`) | Single `AddJob` only; fan-outs batch up to 5000 | S/M |
-| A4 | **Release-on-finish dedup** | `idempotency_key` exists but receipts are permanent; no release/lookup/delete by key | S |
-| A5 | **Scheduler / cron** (tz-aware) | No scheduler, cron, timezone, or declarative reconcile exists | **L** |
-| A6 | **Flows** (parent waits for children) | `parent_id` is lineage metadata only; dequeue has no dependency gate | **XL** |
-| A7 | **Job result storage** | `CompleteJob` stores no result; BullMQ retains the return value for *all* jobs (debugging use outside flows; child values inside) | XS/S |
+| ID | Feature | Current reality | Size | Status |
+|----|---------|-----------------|------|--------|
+| A1 | **Non-retryable failure** (`UnrecoverableError`) | `FailJob` always reschedules while attempts remain; no terminal flag | XS | ✅ Delivered (#51) |
+| A2 | **Backoff jitter** | Exponential backoff + per-job attempts exist; "no jitter is applied" | XS | ✅ Delivered (#51) |
+| A3 | **Bulk enqueue** (`addBulk`) | Single `AddJob` only; fan-outs batch up to 5000 | S/M | ✅ Delivered (#52) |
+| A4 | **Release-on-finish dedup** | `idempotency_key` exists but receipts are permanent; no release/lookup/delete by key | S | ✅ Delivered (#53) |
+| A5 | **Scheduler / cron** (tz-aware) | No scheduler, cron, timezone, or declarative reconcile exists | **L** | ✅ Delivered (#55 + #56) |
+| A6 | **Flows** (parent waits for children) | `parent_id` is lineage metadata only; dequeue has no dependency gate | **XL** | ⬜ Milestone 2 |
+| A7 | **Job result storage** | `CompleteJob` stores no result; BullMQ retains the return value for *all* jobs (debugging use outside flows; child values inside) | XS/S | ✅ Delivered (#54) |
 
-**A5 (cron) is the critical path for Milestone 1** — it unblocks the ~35 cron
-jobs that are the bulk of the workload. **A6 (flows) moves to Milestone 2**: the
-application's workflows, despite the name, do not use BullMQ flows (per review),
-so the first head-to-head does not need them. A1–A4 and A7 are small
-correctness/realism items.
+**A5 (cron) was the critical path for Milestone 1** — it unblocks the ~35 cron
+jobs that are the bulk of the workload, and shipped across #55 (CRUD + tz-aware
+cron) and #56 (the background producer loop). **A6 (flows) moves to Milestone
+2**: the application's workflows, despite the name, do not use BullMQ flows (per
+review), so the first head-to-head does not need them. A1–A4 and A7 landed as
+small correctness/realism items alongside cron.
 
 #### A4 note — the dedup semantics gap
 
@@ -56,11 +59,13 @@ the underlying job, and the contract exposes no way to fetch or delete a receipt
 by key. The application pattern of "reuse one logical key, let it release on
 completion" therefore needs a server affordance.
 
-**Recommended design:** a dedup *mode* on `AddJob` where the receipt is released
-automatically when the job reaches a terminal state (completed/failed), matching
-BullMQ singleton semantics with no producer coordination. The current
-retain-forever behavior stays available as the other mode. This is small and
-server-side, and it subsumes the "fetch/remove by key" ask for the common case.
+**Recommended design (delivered in #53):** a dedup *mode* on `AddJob` where the
+receipt is released automatically when the job reaches a terminal state
+(completed/failed), matching BullMQ singleton semantics with no producer
+coordination. This shipped as the `AddJobRequest.release_on_finish` flag
+(requires `idempotency_key`); the current retain-forever behavior stays the
+default. It is small and server-side, and it subsumes the "fetch/remove by key"
+ask for the common case.
 
 #### A6 note — flows is the largest single item (Milestone 2)
 
@@ -134,18 +139,20 @@ Work splits into two milestones. **Milestone 1 delivers the first head-to-head
 without flows**; Milestone 2 adds flows only if the comparison (or a later
 migration) needs them.
 
-### Milestone 1 — first head-to-head (no flows)
+### Milestone 1 — first head-to-head (no flows) — **delivered**
 
 ```
-Track A (broker)   A1 A2 ──▶ A3 A4 A7 ──▶ A5 (cron)
+Track A (broker)   A1 A2 ──▶ A3 A4 A7 ──▶ A5 (cron)   [all merged, #51–#56]
 Track B (client)        B1 B2 ──────────▶ B3 (thin BullMQ-shaped shim)
 Track C (scenario)              C1 harness ──▶ C2 side-by-side ──▶ C3 dashboards ──▶ C4 failure injection
 ```
 
-Land the XS/S items first (A1, A2, A3, A4, A7) for quick parity wins and to
-de-risk, then **cron (A5)** — the single largest Milestone 1 item, unblocking the
-~35 cron jobs that are the bulk of the workload. Keep the client **thin** while
-validating (B3 is a compatibility shim, not a rewrite).
+The XS/S items landed first for quick parity wins and to de-risk — A1 + A2 (#51),
+A3 (#52), A4 (#53), A7 (#54) — then **cron (A5)**, the single largest Milestone 1
+item, across #55 (CRUD + tz-aware cron) and #56 (background producer loop),
+unblocking the ~35 cron jobs that are the bulk of the workload. The broker track
+is complete; the client stays **thin** while validating (B3 is a compatibility
+shim, not a rewrite).
 
 ### Milestone 2 — flows (only if needed)
 

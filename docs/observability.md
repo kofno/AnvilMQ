@@ -40,6 +40,9 @@ Allowlisted names (`ANVILMQ_METRICS_QUEUES`) are pre-seeded up front in `all` mo
 | `anvilmq_pressure_sample_duration_seconds` | Duration of the last sampling attempt. |
 | `anvilmq_enqueue_rejections_total{kind}` | Admission-time enqueue rejections by kind (`ingress_velocity`, `parent_not_found`, `inconsistent_depth`, `circuit_breaker`, `chain_quarantine`). Each corresponds to a durable row in the [enqueue-rejections feed](#enqueue-rejections-feed); rejected enqueues never become jobs. |
 | `anvilmq_rejections_pruned_total` | Aged-out forensic `enqueue_rejections` rows reclaimed by the retention sweeper (`ANVILMQ_RETENTION_REJECTIONS_AGE_MS`). |
+| `anvilmq_scheduler_jobs_produced_total` | Jobs produced by the declarative scheduler loop since process start. |
+| `anvilmq_scheduler_errors_total` | Scheduler fires that failed and will retry next tick. |
+| `anvilmq_schedulers_active` | Declarative schedulers with a pending next run. |
 
 `scope="all",queue=""` is the aggregate; `scope="queue"` identifies allowlisted queues. Do not sum both scopes. Named queues remain present at zero after they drain. Histograms and lifecycle event rates are broker-wide in this increment, not per queue. Counters/histograms reset on restart; use `rate`/`increase`, not subtraction across restarts.
 
