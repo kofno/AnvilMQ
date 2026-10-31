@@ -26,7 +26,7 @@ const EVENTS: [&str; 6] = [
     "retried",
     "lease_expired",
 ];
-const METHODS: [&str; 12] = [
+const METHODS: [&str; 16] = [
     "AddJob",
     "AddJobBulk",
     "GetNextJob",
@@ -39,6 +39,10 @@ const METHODS: [&str; 12] = [
     "UpsertIngressLimitRule",
     "DeleteIngressLimitRule",
     "GetIngressLimitStatus",
+    "UpsertJobScheduler",
+    "DeleteJobScheduler",
+    "GetJobScheduler",
+    "ListJobSchedulers",
 ];
 const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
@@ -314,7 +318,7 @@ pub struct Metrics {
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
-    latency: [Latency; 12],
+    latency: [Latency; 16],
     pub recovery_errors: AtomicU64,
     retention_deleted: [[AtomicU64; 3]; 3],
     retention_errors: AtomicU64,

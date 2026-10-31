@@ -13,6 +13,10 @@ service QueueService {
   rpc UpsertIngressLimitRule (UpsertIngressLimitRuleRequest) returns (UpsertIngressLimitRuleResponse);
   rpc DeleteIngressLimitRule (DeleteIngressLimitRuleRequest) returns (DeleteIngressLimitRuleResponse);
   rpc GetIngressLimitStatus (GetIngressLimitStatusRequest) returns (GetIngressLimitStatusResponse);
+  rpc UpsertJobScheduler (UpsertJobSchedulerRequest) returns (UpsertJobSchedulerResponse);
+  rpc DeleteJobScheduler (DeleteJobSchedulerRequest) returns (DeleteJobSchedulerResponse);
+  rpc GetJobScheduler (GetJobSchedulerRequest) returns (JobScheduler);
+  rpc ListJobSchedulers (ListJobSchedulersRequest) returns (ListJobSchedulersResponse);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -160,3 +164,63 @@ message GetIngressLimitStatusResponse {
   bool is_throttled = 6;
   bool rule_exists = 7;
 }
+
+// Declarative job scheduler (A5 — cron / tz-aware). A5a persists the record and computes the
+// next fire time on upsert; the background loop that actually produces jobs is A5b. Field
+// types for template options mirror AddJobRequest so a produced job maps 1:1.
+message JobTemplate {
+  string name = 1;                        // produced job's name (required)
+  bytes payload = 2;                      // template payload (may be empty)
+  optional int32 priority = 3;
+  optional uint32 max_attempts = 4;
+  optional int64 retry_backoff_ms = 5;
+  optional int64 retry_backoff_max_ms = 6;
+  optional double retry_jitter = 7;
+  optional string rate_limit_facet = 8;
+}
+
+// Cron-only repeat spec. No every/limit/start/end/immediately: A5a is pure cron scheduling.
+message RepeatSpec {
+  string cron = 1;      // 5-field standard cron pattern (required)
+  string timezone = 2;  // IANA name; empty => UTC
+}
+
+message UpsertJobSchedulerRequest {
+  string id = 1;            // scheduler key == produced job name (upsert key)
+  JobTemplate template = 2;
+  RepeatSpec repeat = 3;
+}
+
+message UpsertJobSchedulerResponse {
+  string id = 1;
+  int64 next_run_at = 2; // next fire time (epoch ms)
+}
+
+message DeleteJobSchedulerRequest { string id = 1; }
+message DeleteJobSchedulerResponse { bool deleted = 1; }
+
+message GetJobSchedulerRequest { string id = 1; }
+
+// Full persisted scheduler record. Runtime fields (produced_count, last_job_id) are written by
+// A5b; A5a always returns their initial values (0 / unset).
+message JobScheduler {
+  string id = 1;
+  string job_name = 2;
+  bytes payload = 3;
+  string cron = 4;
+  string timezone = 5;
+  optional int64 next_run_at = 6; // unset => stopped
+  int64 produced_count = 7;
+  optional string last_job_id = 8;
+  optional int32 priority = 9;
+  optional uint32 max_attempts = 10;
+  optional int64 retry_backoff_ms = 11;
+  optional int64 retry_backoff_max_ms = 12;
+  optional double retry_jitter = 13;
+  optional string rate_limit_facet = 14;
+  int64 created_at = 15;
+  int64 updated_at = 16;
+}
+
+message ListJobSchedulersRequest {}
+message ListJobSchedulersResponse { repeated JobScheduler schedulers = 1; }

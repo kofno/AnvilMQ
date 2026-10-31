@@ -18,6 +18,7 @@ mod pressure;
 mod rate_limit;
 mod reader;
 mod retention;
+mod schedulers;
 mod scheduling;
 mod telemetry;
 use db::DatabaseManager;
@@ -303,6 +304,46 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<queue::v1::HeartbeatResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("Heartbeat");
         self.renew_lease(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn upsert_job_scheduler(
+        &self,
+        request: Request<queue::v1::UpsertJobSchedulerRequest>,
+    ) -> Result<Response<queue::v1::UpsertJobSchedulerResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("UpsertJobScheduler");
+        schedulers::upsert(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete_job_scheduler(
+        &self,
+        request: Request<queue::v1::DeleteJobSchedulerRequest>,
+    ) -> Result<Response<queue::v1::DeleteJobSchedulerResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("DeleteJobScheduler");
+        schedulers::delete(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_job_scheduler(
+        &self,
+        request: Request<queue::v1::GetJobSchedulerRequest>,
+    ) -> Result<Response<queue::v1::JobScheduler>, Status> {
+        let _timer = self.db_manager.metrics.timer("GetJobScheduler");
+        schedulers::get(self.db_manager.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn list_job_schedulers(
+        &self,
+        request: Request<queue::v1::ListJobSchedulersRequest>,
+    ) -> Result<Response<queue::v1::ListJobSchedulersResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("ListJobSchedulers");
+        schedulers::list(self.db_manager.clone(), request.into_inner())
             .await
             .map(Response::new)
     }

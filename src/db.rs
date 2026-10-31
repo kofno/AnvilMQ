@@ -430,6 +430,28 @@ impl DatabaseManager {
 
             CREATE INDEX IF NOT EXISTS idx_rejections_name_rejected
             ON enqueue_rejections (name, rejected_at DESC);
+
+            CREATE TABLE IF NOT EXISTS job_schedulers (
+                id TEXT PRIMARY KEY,
+                job_name TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                cron TEXT NOT NULL,
+                timezone TEXT,
+                produced_count INTEGER NOT NULL DEFAULT 0,
+                next_run_at INTEGER,
+                last_job_id TEXT,
+                priority INTEGER,
+                max_attempts INTEGER,
+                retry_backoff_ms INTEGER,
+                retry_backoff_max_ms INTEGER,
+                retry_jitter REAL,
+                rate_limit_facet TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schedulers_due
+            ON job_schedulers (next_run_at) WHERE next_run_at IS NOT NULL;
             ",
         )?;
 
@@ -558,5 +580,246 @@ impl DatabaseManager {
         tx.commit()?;
         tracing::info!("Database migrations completed successfully");
         Ok(())
+    }
+}
+
+use rusqlite::OptionalExtension;
+
+/// Mutable spec for a job scheduler upsert. Runtime fields (`produced_count`, `last_job_id`) are
+/// owned by the scheduler loop (A5b) and are never set here, so an upsert preserves them.
+#[derive(Debug, Clone)]
+pub struct SchedulerSpec {
+    pub id: String,
+    pub job_name: String,
+    pub payload: Vec<u8>,
+    pub cron: String,
+    pub timezone: Option<String>,
+    pub next_run_at: Option<i64>,
+    pub priority: Option<i64>,
+    pub max_attempts: Option<i64>,
+    pub retry_backoff_ms: Option<i64>,
+    pub retry_backoff_max_ms: Option<i64>,
+    pub retry_jitter: Option<f64>,
+    pub rate_limit_facet: Option<String>,
+}
+
+/// Full persisted job scheduler row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobSchedulerRow {
+    pub id: String,
+    pub job_name: String,
+    pub payload: Vec<u8>,
+    pub cron: String,
+    pub timezone: Option<String>,
+    pub produced_count: i64,
+    pub next_run_at: Option<i64>,
+    pub last_job_id: Option<String>,
+    pub priority: Option<i64>,
+    pub max_attempts: Option<i64>,
+    pub retry_backoff_ms: Option<i64>,
+    pub retry_backoff_max_ms: Option<i64>,
+    pub retry_jitter: Option<f64>,
+    pub rate_limit_facet: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+const SCHEDULER_COLUMNS: &str = "id, job_name, payload, cron, timezone, produced_count, \
+    next_run_at, last_job_id, priority, max_attempts, retry_backoff_ms, retry_backoff_max_ms, \
+    retry_jitter, rate_limit_facet, created_at, updated_at";
+
+fn scheduler_from_row(row: &rusqlite::Row<'_>) -> SqlResult<JobSchedulerRow> {
+    Ok(JobSchedulerRow {
+        id: row.get(0)?,
+        job_name: row.get(1)?,
+        payload: row.get(2)?,
+        cron: row.get(3)?,
+        timezone: row.get(4)?,
+        produced_count: row.get(5)?,
+        next_run_at: row.get(6)?,
+        last_job_id: row.get(7)?,
+        priority: row.get(8)?,
+        max_attempts: row.get(9)?,
+        retry_backoff_ms: row.get(10)?,
+        retry_backoff_max_ms: row.get(11)?,
+        retry_jitter: row.get(12)?,
+        rate_limit_facet: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+/// Insert or update a scheduler keyed by `id`. On conflict the original `created_at`,
+/// `produced_count`, and `last_job_id` are preserved while the spec fields, `next_run_at`, and
+/// `updated_at` are refreshed. `now` stamps `created_at`/`updated_at` on insert and `updated_at`
+/// on update.
+pub fn upsert_scheduler(conn: &Connection, spec: &SchedulerSpec, now: i64) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO job_schedulers
+            (id, job_name, payload, cron, timezone, produced_count, next_run_at, last_job_id,
+             priority, max_attempts, retry_backoff_ms, retry_backoff_max_ms, retry_jitter,
+             rate_limit_facet, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+         ON CONFLICT(id) DO UPDATE SET
+            job_name = excluded.job_name,
+            payload = excluded.payload,
+            cron = excluded.cron,
+            timezone = excluded.timezone,
+            next_run_at = excluded.next_run_at,
+            priority = excluded.priority,
+            max_attempts = excluded.max_attempts,
+            retry_backoff_ms = excluded.retry_backoff_ms,
+            retry_backoff_max_ms = excluded.retry_backoff_max_ms,
+            retry_jitter = excluded.retry_jitter,
+            rate_limit_facet = excluded.rate_limit_facet,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            spec.id,
+            spec.job_name,
+            spec.payload,
+            spec.cron,
+            spec.timezone,
+            spec.next_run_at,
+            spec.priority,
+            spec.max_attempts,
+            spec.retry_backoff_ms,
+            spec.retry_backoff_max_ms,
+            spec.retry_jitter,
+            spec.rate_limit_facet,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a scheduler by id, returning whether a row existed.
+pub fn delete_scheduler(conn: &Connection, id: &str) -> SqlResult<bool> {
+    Ok(conn.execute("DELETE FROM job_schedulers WHERE id = ?1", [id])? > 0)
+}
+
+/// Fetch a scheduler by id.
+pub fn get_scheduler(conn: &Connection, id: &str) -> SqlResult<Option<JobSchedulerRow>> {
+    conn.query_row(
+        &format!("SELECT {SCHEDULER_COLUMNS} FROM job_schedulers WHERE id = ?1"),
+        [id],
+        scheduler_from_row,
+    )
+    .optional()
+}
+
+/// List all schedulers ordered by id for a stable reconcile.
+pub fn list_schedulers(conn: &Connection) -> SqlResult<Vec<JobSchedulerRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCHEDULER_COLUMNS} FROM job_schedulers ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map([], scheduler_from_row)?;
+    rows.collect()
+}
+
+#[cfg(test)]
+mod scheduler_crud_tests {
+    use super::*;
+
+    fn spec(id: &str) -> SchedulerSpec {
+        SchedulerSpec {
+            id: id.to_string(),
+            job_name: id.to_string(),
+            payload: b"hello".to_vec(),
+            cron: "0 3 * * *".to_string(),
+            timezone: Some("America/Denver".to_string()),
+            next_run_at: Some(1_000),
+            priority: Some(5),
+            max_attempts: Some(4),
+            retry_backoff_ms: Some(1_000),
+            retry_backoff_max_ms: Some(60_000),
+            retry_jitter: Some(0.25),
+            rate_limit_facet: Some("tenant:a".to_string()),
+        }
+    }
+
+    fn conn() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        DatabaseManager::run_migrations(&mut c).unwrap();
+        c
+    }
+
+    #[test]
+    fn upsert_get_list_delete_roundtrip() {
+        let c = conn();
+        assert!(get_scheduler(&c, "s1").unwrap().is_none());
+        upsert_scheduler(&c, &spec("s1"), 100).unwrap();
+        let row = get_scheduler(&c, "s1").unwrap().unwrap();
+        assert_eq!(row.job_name, "s1");
+        assert_eq!(row.payload, b"hello");
+        assert_eq!(row.produced_count, 0);
+        assert_eq!(row.next_run_at, Some(1_000));
+        assert_eq!(row.priority, Some(5));
+        assert_eq!(row.retry_jitter, Some(0.25));
+        assert_eq!(row.created_at, 100);
+        assert_eq!(row.updated_at, 100);
+
+        upsert_scheduler(&c, &spec("s2"), 100).unwrap();
+        let all = list_schedulers(&c).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "s1");
+        assert_eq!(all[1].id, "s2");
+
+        assert!(delete_scheduler(&c, "s1").unwrap());
+        assert!(!delete_scheduler(&c, "s1").unwrap());
+        assert_eq!(list_schedulers(&c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_preserves_created_at_and_runtime_fields() {
+        let c = conn();
+        upsert_scheduler(&c, &spec("s1"), 100).unwrap();
+        // Simulate A5b runtime advancement.
+        c.execute(
+            "UPDATE job_schedulers SET produced_count = 7, last_job_id = 'j7' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+
+        let mut updated = spec("s1");
+        updated.cron = "0 4 * * *".to_string();
+        updated.next_run_at = Some(2_000);
+        updated.priority = Some(9);
+        upsert_scheduler(&c, &updated, 500).unwrap();
+
+        let row = get_scheduler(&c, "s1").unwrap().unwrap();
+        assert_eq!(row.created_at, 100, "created_at preserved across upsert");
+        assert_eq!(row.updated_at, 500, "updated_at refreshed");
+        assert_eq!(row.produced_count, 7, "produced_count preserved");
+        assert_eq!(
+            row.last_job_id,
+            Some("j7".to_string()),
+            "last_job_id preserved"
+        );
+        assert_eq!(row.cron, "0 4 * * *");
+        assert_eq!(row.next_run_at, Some(2_000));
+        assert_eq!(row.priority, Some(9));
+    }
+
+    #[test]
+    fn optional_fields_roundtrip_as_null() {
+        let c = conn();
+        let mut s = spec("s1");
+        s.timezone = None;
+        s.next_run_at = None;
+        s.priority = None;
+        s.max_attempts = None;
+        s.retry_backoff_ms = None;
+        s.retry_backoff_max_ms = None;
+        s.retry_jitter = None;
+        s.rate_limit_facet = None;
+        s.payload = Vec::new();
+        upsert_scheduler(&c, &s, 1).unwrap();
+        let row = get_scheduler(&c, "s1").unwrap().unwrap();
+        assert_eq!(row.timezone, None);
+        assert_eq!(row.next_run_at, None);
+        assert_eq!(row.priority, None);
+        assert_eq!(row.retry_jitter, None);
+        assert_eq!(row.rate_limit_facet, None);
+        assert!(row.payload.is_empty());
     }
 }

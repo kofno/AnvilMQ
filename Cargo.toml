@@ -14,6 +14,9 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 thiserror = "1.0"
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 rand = "0.8"
+croner = "4.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
 axum = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
