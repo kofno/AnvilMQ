@@ -52,7 +52,7 @@ enum EnqueueFailure {
 /// A deferred success-metric intention. Success counters MUST NOT fire until the enqueue
 /// transaction commits, otherwise a rolled-back atomic batch would inflate them. The core
 /// returns one of these per job and the caller flushes them only after `tx.commit()`.
-enum SuccessMetric {
+pub(crate) enum SuccessMetric {
     Inserted {
         job_id: String,
         state: &'static str,
@@ -65,7 +65,7 @@ enum SuccessMetric {
 }
 
 impl SuccessMetric {
-    fn flush(&self, metrics: &Metrics) {
+    pub(crate) fn flush(&self, metrics: &Metrics) {
         match self {
             SuccessMetric::Inserted {
                 job_id,
@@ -528,6 +528,37 @@ fn execute_batch(
         })
         .collect();
     Ok(responses)
+}
+
+/// Produce one scheduled job (A5b) inside the caller's IMMEDIATE transaction, reusing the full
+/// admission core (validation + ingress/ancestry/chain guards) so a scheduled job is
+/// indistinguishable from a client enqueue. Scheduled jobs are never deduplicated, so no
+/// idempotency receipt is written. Returns the produced job id plus the deferred `SuccessMetric`;
+/// the caller MUST advance the scheduler in the SAME tx and `flush` the metric only AFTER commit.
+/// Any admission failure (including a business rejection) maps to a `Status`, leaving the caller's
+/// transaction to roll back so neither the job nor the scheduler advance persists.
+pub(crate) fn enqueue_scheduled(
+    tx: &rusqlite::Transaction,
+    mut req: AddJobRequest,
+    now: i64,
+    max_execution_depth: u32,
+    max_chain_size: u64,
+    metrics: &Metrics,
+) -> Result<(String, SuccessMetric), Status> {
+    let receipt_request = validate_and_prepare(&mut req, max_execution_depth)?;
+    match enqueue_one(
+        tx,
+        req,
+        now,
+        max_execution_depth,
+        max_chain_size,
+        receipt_request,
+        metrics,
+    ) {
+        Ok(outcome) => Ok((outcome.response.id, outcome.success)),
+        Err(EnqueueFailure::Status(status)) => Err(status),
+        Err(EnqueueFailure::Rejected { status, .. }) => Err(status),
+    }
 }
 
 pub async fn enqueue(
