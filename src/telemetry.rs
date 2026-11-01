@@ -26,7 +26,7 @@ const EVENTS: [&str; 6] = [
     "retried",
     "lease_expired",
 ];
-const METHODS: [&str; 16] = [
+const METHODS: [&str; 18] = [
     "AddJob",
     "AddJobBulk",
     "GetNextJob",
@@ -43,6 +43,8 @@ const METHODS: [&str; 16] = [
     "DeleteJobScheduler",
     "GetJobScheduler",
     "ListJobSchedulers",
+    "AddFlow",
+    "GetChildrenValues",
 ];
 const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
@@ -318,7 +320,7 @@ pub struct Metrics {
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
-    latency: [Latency; 16],
+    latency: [Latency; 18],
     pub recovery_errors: AtomicU64,
     retention_deleted: [[AtomicU64; 3]; 3],
     retention_errors: AtomicU64,
@@ -337,6 +339,11 @@ pub struct Metrics {
     scheduler_jobs_produced: AtomicU64,
     scheduler_errors: AtomicU64,
     schedulers_active: AtomicI64,
+    flows_created: AtomicU64,
+    flow_nodes_created: AtomicU64,
+    flow_waiting_children: AtomicI64,
+    flow_parent_failures: AtomicU64,
+    flows_rejected: AtomicU64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -360,6 +367,16 @@ impl Metrics {
         metrics.schedulers_active.store(
             conn.query_row(
                 "SELECT COUNT(*) FROM job_schedulers WHERE next_run_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?,
+            Relaxed,
+        );
+        // Seed the WaitingChildren gauge from persisted flow state so a restart reflects parents
+        // still blocked on children. Maintained lock-free thereafter via create/release/fail deltas.
+        metrics.flow_waiting_children.store(
+            conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'WaitingChildren'",
                 [],
                 |r| r.get(0),
             )?,
@@ -474,6 +491,36 @@ impl Metrics {
     /// A5b: an active scheduler was removed (delete). Decrements the active-schedulers gauge.
     pub fn scheduler_deactivated(&self) {
         self.schedulers_active.fetch_sub(1, Relaxed);
+    }
+    /// A6a: one flow tree was created by AddFlow. Fired once, post-commit, per tree.
+    pub fn flow_created(&self) {
+        self.flows_created.fetch_add(1, Relaxed);
+    }
+    /// A6a: count `n` nodes created by a flow tree. Fired once, post-commit, per tree.
+    pub fn flow_nodes_created(&self, n: u64) {
+        if n > 0 {
+            self.flow_nodes_created.fetch_add(n, Relaxed);
+        }
+    }
+    /// A6a: `n` nodes entered WaitingChildren (parents inserted with pending children).
+    pub fn flow_waiting_children_inc(&self, n: u64) {
+        if n > 0 {
+            self.flow_waiting_children.fetch_add(n as i64, Relaxed);
+        }
+    }
+    /// A6a: `n` nodes left WaitingChildren (released to Waiting/Delayed or failed via cascade).
+    pub fn flow_waiting_children_dec(&self, n: u64) {
+        if n > 0 {
+            self.flow_waiting_children.fetch_sub(n as i64, Relaxed);
+        }
+    }
+    /// A6a: one failParentOnFailure propagation was applied to a parent.
+    pub fn flow_parent_failure(&self) {
+        self.flow_parent_failures.fetch_add(1, Relaxed);
+    }
+    /// A6a: one AddFlow was rejected by a depth/size cap or per-node validation.
+    pub fn flow_rejected(&self) {
+        self.flows_rejected.fetch_add(1, Relaxed);
     }
     /// Enqueue rejected because a supplied `parent_id` did not resolve or the child's
     /// `execution_depth` was not exactly `parent + 1`.
@@ -603,6 +650,11 @@ impl Metrics {
         out += &format!("# HELP anvilmq_scheduler_jobs_produced_total Jobs produced by the declarative scheduler loop since process start.\n# TYPE anvilmq_scheduler_jobs_produced_total counter\nanvilmq_scheduler_jobs_produced_total {}\n", self.scheduler_jobs_produced.load(Relaxed));
         out += &format!("# HELP anvilmq_scheduler_errors_total Scheduler fires that failed and will retry next tick.\n# TYPE anvilmq_scheduler_errors_total counter\nanvilmq_scheduler_errors_total {}\n", self.scheduler_errors.load(Relaxed));
         out += &format!("# HELP anvilmq_schedulers_active Declarative schedulers with a pending next run.\n# TYPE anvilmq_schedulers_active gauge\nanvilmq_schedulers_active {}\n", self.schedulers_active.load(Relaxed));
+        out += &format!("# HELP anvilmq_flows_created_total Flow trees successfully created by AddFlow since process start.\n# TYPE anvilmq_flows_created_total counter\nanvilmq_flows_created_total {}\n", self.flows_created.load(Relaxed));
+        out += &format!("# HELP anvilmq_flow_nodes_created_total Nodes created via flow trees since process start.\n# TYPE anvilmq_flow_nodes_created_total counter\nanvilmq_flow_nodes_created_total {}\n", self.flow_nodes_created.load(Relaxed));
+        out += &format!("# HELP anvilmq_flow_waiting_children Flow nodes currently parked in WaitingChildren.\n# TYPE anvilmq_flow_waiting_children gauge\nanvilmq_flow_waiting_children {}\n", self.flow_waiting_children.load(Relaxed));
+        out += &format!("# HELP anvilmq_flow_parent_failures_total failParentOnFailure propagations applied to a parent since process start.\n# TYPE anvilmq_flow_parent_failures_total counter\nanvilmq_flow_parent_failures_total {}\n", self.flow_parent_failures.load(Relaxed));
+        out += &format!("# HELP anvilmq_flows_rejected_total AddFlow calls rejected by a depth/size cap or validation since process start.\n# TYPE anvilmq_flows_rejected_total counter\nanvilmq_flows_rejected_total {}\n", self.flows_rejected.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out
