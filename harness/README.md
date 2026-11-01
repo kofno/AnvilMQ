@@ -84,6 +84,37 @@ This is a controlled active-lease/process-crash test, not arbitrary-instruction 
 
 See [CRASH-RECOVERY.md](CRASH-RECOVERY.md) for the initial measured results.
 
+## Scenario (C1 cron + bulk)
+
+```powershell
+pwsh harness/scenario.ps1
+# Smaller/faster run:
+pwsh harness/scenario.ps1 -Schedulers 10 -Minutes 1 -BulkBatches 2 -BulkSize 500
+```
+
+`scenario` drives the two Milestone 1 broker features the `load` throughput test never touches: **A5 cron schedulers** (`UpsertJobScheduler` + the background producer loop) and **A3 atomic bulk enqueue** (`AddJobBulk`). It runs two sequential phases against the already-running harness broker and asserts correctness (exactly-once, atomicity, no dupes/errors) alongside throughput/latency.
+
+- **Phase A — cron.** Registers `SCENARIO_SCHEDULERS` schedulers, all with cron `* * * * *` (every minute) and distinct ids but a **shared** `template.name`, so every produced job lands under one queue name that a single `Worker` pool drains. It observes `SCENARIO_MINUTES` whole minutes, then tears the schedulers down. Passes when `anvilmq_schedulers_active` rose by exactly `SCENARIO_SCHEDULERS`, every scheduler's `produced_count` is ≥ 1 and uniform within ±1, `anvilmq_scheduler_errors_total` did not move, and exactly-once holds (unique deliveries == `anvilmq_scheduler_jobs_produced_total` delta == completed, zero duplicates).
+- **Phase B — bulk.** Sends `SCENARIO_BULK_BATCHES` `AddJobBulk` calls of `SCENARIO_BULK_SIZE` jobs each (server cap `MAX_BULK_BATCH_SIZE` = 5000), spaced by `SCENARIO_BULK_INTERVAL_MS`. Passes when every batch returns exactly `SCENARIO_BULK_SIZE` non-empty ids (atomic), all jobs complete with zero duplicates and no drain timeout. Reports enqueue ops/s and AddJobBulk round-trip latency percentiles.
+
+**Cron granularity:** standard 5-field cron has a hard 1-minute minimum, so Phase A must run several real minutes to see multiple fires. The scenario aligns to observed firing behaviour (counter deltas and per-scheduler `produced_count`) rather than predicting an exact fire count.
+
+Configuration (also usable via `docker compose run --rm -e NAME=value runner scenario`):
+
+| Environment variable | Default | Range | Meaning |
+| --- | ---: | :--- | --- |
+| SCENARIO_SCHEDULERS | 50 | [1, 500] | Every-minute cron schedulers |
+| SCENARIO_MINUTES | 3 | [1, 15] | Whole minutes to observe cron production |
+| SCENARIO_WORKERS | 8 | [1, 128] | Workers draining each phase |
+| SCENARIO_BULK_BATCHES | 5 | [1, 1000] | `AddJobBulk` calls |
+| SCENARIO_BULK_SIZE | 2000 | [1, 5000] | Jobs per bulk call |
+| SCENARIO_BULK_INTERVAL_MS | 1000 | [0, 60000] | Gap between bulk batches |
+| SCENARIO_PAYLOAD_BYTES | 256 | [0, 1000000] | Payload padding bytes |
+| SCENARIO_DRAIN_SECONDS | 120 | [1, 600] | Max wait for completion per phase |
+| SCENARIO_POLL_MS | 10 | [1, 1000] | Idle worker poll interval |
+
+Each run writes timestamped JSON/Markdown, `latest.json`/`latest.md`, and Prometheus snapshots before/after into `harness/artifacts`; a thrown error writes a timestamped `*-error.json`. The scenario exits non-zero on any failed gate. Run one scenario at a time against the dedicated broker — completion and scheduler counters are process-wide.
+
 ## Configurable load and latency reports
 
 ```powershell

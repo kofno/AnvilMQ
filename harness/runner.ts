@@ -1,5 +1,6 @@
 if (process.argv[2] === "load") { await import("./load"); process.exit(process.exitCode ?? 0); }
 if (process.argv[2] === "crash-active") { await import("./crash-active"); process.exit(process.exitCode ?? 0); }
+if (process.argv[2] === "scenario") { await import("./scenario"); process.exit(process.exitCode ?? 0); }
 import { Queue, Worker } from "../client/src/index";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
