@@ -35,6 +35,7 @@ pub mod queue {
 
 use queue::v1::{
     queue_service_server::{QueueService, QueueServiceServer},
+    AddFlowBulkRequest, AddFlowBulkResponse, AddFlowMergeRequest, AddFlowMergeResponse,
     AddFlowRequest, AddFlowResponse, AddJobBulkRequest, AddJobBulkResponse, AddJobRequest,
     AddJobResponse, CompleteJobRequest, CompleteJobResponse, FailJobRequest, FailJobResponse,
     GetChildrenValuesRequest, GetChildrenValuesResponse, GetNextJobRequest, GetNextJobResponse,
@@ -48,6 +49,7 @@ pub struct MyQueueService {
     lease_duration_ms: i64,
     max_flow_depth: u32,
     max_flow_nodes: u32,
+    max_flow_bulk: u32,
 }
 
 #[tonic::async_trait]
@@ -88,6 +90,26 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<GetChildrenValuesResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("GetChildrenValues");
         flow::get_children_values(self, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn add_flow_bulk(
+        &self,
+        request: Request<AddFlowBulkRequest>,
+    ) -> Result<Response<AddFlowBulkResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("AddFlowBulk");
+        flow::add_flow_bulk(self, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn add_flow_merge(
+        &self,
+        request: Request<AddFlowMergeRequest>,
+    ) -> Result<Response<AddFlowMergeResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("AddFlowMerge");
+        flow::add_flow_merge(self, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -682,6 +704,9 @@ const DEFAULT_MAX_FLOW_DEPTH: u32 = 10;
 /// Default maximum total node count in one flow tree, via `ANVILMQ_MAX_FLOW_NODES`.
 const DEFAULT_MAX_FLOW_NODES: u32 = 1_000;
 
+/// Default maximum number of flow trees in one `AddFlowBulk`, via `ANVILMQ_MAX_FLOW_BULK`.
+const DEFAULT_MAX_FLOW_BULK: u32 = 100;
+
 /// Parse `ANVILMQ_MAX_FLOW_DEPTH`. Absent -> default; present must be an integer >= 1.
 fn parse_max_flow_depth(raw: Option<&str>) -> Result<u32, String> {
     match raw {
@@ -710,6 +735,23 @@ fn parse_max_flow_nodes(raw: Option<&str>) -> Result<u32, String> {
                 .map_err(|_| format!("ANVILMQ_MAX_FLOW_NODES must be an integer, got {value:?}"))?;
             if parsed < 1 {
                 return Err(format!("ANVILMQ_MAX_FLOW_NODES={parsed} must be >= 1"));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_MAX_FLOW_BULK`. Absent -> default; present must be an integer >= 1.
+fn parse_max_flow_bulk(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(DEFAULT_MAX_FLOW_BULK),
+        Some(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("ANVILMQ_MAX_FLOW_BULK must be an integer, got {value:?}"))?;
+            if parsed < 1 {
+                return Err(format!("ANVILMQ_MAX_FLOW_BULK={parsed} must be >= 1"));
             }
             Ok(parsed)
         }
@@ -1027,7 +1069,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_flow_nodes =
         parse_max_flow_nodes(std::env::var("ANVILMQ_MAX_FLOW_NODES").ok().as_deref())
             .map_err(std::io::Error::other)?;
-    tracing::info!(max_flow_depth, max_flow_nodes, "flow caps configured");
+    let max_flow_bulk = parse_max_flow_bulk(std::env::var("ANVILMQ_MAX_FLOW_BULK").ok().as_deref())
+        .map_err(std::io::Error::other)?;
+    tracing::info!(
+        max_flow_depth,
+        max_flow_nodes,
+        max_flow_bulk,
+        "flow caps configured"
+    );
 
     let shutdown_db = db_manager.clone();
     let service = MyQueueService {
@@ -1038,6 +1087,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_duration_ms,   // Worker lease TTL; ANVILMQ_LEASE_DURATION_MS (default 30s)
         max_flow_depth,      // Max flow-tree height; ANVILMQ_MAX_FLOW_DEPTH (default 10)
         max_flow_nodes,      // Max flow-tree node count; ANVILMQ_MAX_FLOW_NODES (default 1000)
+        max_flow_bulk,       // Max trees per AddFlowBulk; ANVILMQ_MAX_FLOW_BULK (default 100)
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -1145,6 +1195,7 @@ mod tests {
             lease_duration_ms,
             max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
             max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+            max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
         };
         // Seed the ancestry parent referenced by the enqueue helper so that supplied
         // parent_id/execution_depth pass ancestry validation. Parked in job_history so it
@@ -1277,6 +1328,16 @@ mod tests {
         assert!(parse_max_flow_nodes(Some("0")).is_err());
         assert!(parse_max_flow_nodes(Some("-1")).is_err());
         assert!(parse_max_flow_nodes(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn max_flow_bulk_parses_defaults_and_rejects_invalid() {
+        assert_eq!(parse_max_flow_bulk(None).unwrap(), DEFAULT_MAX_FLOW_BULK);
+        assert_eq!(parse_max_flow_bulk(Some("250")).unwrap(), 250);
+        assert_eq!(parse_max_flow_bulk(Some(" 7 ")).unwrap(), 7);
+        assert!(parse_max_flow_bulk(Some("0")).is_err());
+        assert!(parse_max_flow_bulk(Some("-1")).is_err());
+        assert!(parse_max_flow_bulk(Some("nope")).is_err());
     }
 
     #[test]

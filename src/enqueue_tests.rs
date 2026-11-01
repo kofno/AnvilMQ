@@ -17,6 +17,7 @@ async fn service(path: &str) -> MyQueueService {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     }
 }
 async fn add(service: &MyQueueService, req: AddJobRequest) -> Result<AddJobResponse, Status> {

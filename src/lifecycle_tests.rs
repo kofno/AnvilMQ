@@ -54,6 +54,7 @@ async fn completion_receipt_survives_reopening_database() {
             lease_duration_ms: leases::LEASE_DURATION_MS,
             max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
             max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+            max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
         };
         id = service
             .add_job(Request::new(AddJobRequest {
@@ -76,6 +77,7 @@ async fn completion_receipt_survives_reopening_database() {
             lease_duration_ms: leases::LEASE_DURATION_MS,
             max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
             max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+            max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
         };
         complete(&service, &id, "worker", 1).await.unwrap();
         complete(&service, &id, "worker", 0).await.unwrap();
@@ -291,6 +293,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -312,6 +315,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     assert_eq!(
         leases::recover_expired(
@@ -341,6 +345,7 @@ async fn persisted_leases_survive_reopen_and_legacy_claims_recover() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     assert_eq!(
         leases::recover_expired(
@@ -396,6 +401,7 @@ async fn setup(max_attempts: u32) -> (MyQueueService, String) {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     let id = service
         .add_job(Request::new(AddJobRequest {
@@ -859,6 +865,7 @@ async fn schedule_and_policy_survive_restart() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     service
         .add_job(Request::new(AddJobRequest {
@@ -879,6 +886,7 @@ async fn schedule_and_policy_survive_restart() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     assert!(!claim(&service).await.found);
     let conn = service.db_manager.get_shared_connection();
@@ -1118,6 +1126,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     service
         .upsert_rate_limit_rule(Request::new(UpsertRateLimitRuleRequest {
@@ -1147,6 +1156,7 @@ async fn rate_limit_usage_survives_restart_and_rule_update_resets_it() {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     };
     assert!(!claim(&service).await.found);
     let status = service
@@ -1181,6 +1191,7 @@ async fn fairness_service(enabled: bool) -> MyQueueService {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     }
 }
 
@@ -1345,6 +1356,7 @@ async fn dedup_service() -> MyQueueService {
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
         max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
+        max_flow_bulk: DEFAULT_MAX_FLOW_BULK,
     }
 }
 
