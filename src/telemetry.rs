@@ -26,7 +26,7 @@ const EVENTS: [&str; 6] = [
     "retried",
     "lease_expired",
 ];
-const METHODS: [&str; 18] = [
+const METHODS: [&str; 20] = [
     "AddJob",
     "AddJobBulk",
     "GetNextJob",
@@ -45,6 +45,8 @@ const METHODS: [&str; 18] = [
     "ListJobSchedulers",
     "AddFlow",
     "GetChildrenValues",
+    "AddFlowBulk",
+    "AddFlowMerge",
 ];
 const BOUNDS: [u64; 7] = [1000, 5000, 10000, 50000, 100000, 1000000, 5000000];
 // Per-name lifecycle labels for the bounded-cardinality named series. These mirror the
@@ -320,7 +322,7 @@ pub struct Metrics {
     throttled_polls: AtomicU64,
     states: [AtomicI64; 5],
     events: [AtomicU64; 6],
-    latency: [Latency; 18],
+    latency: [Latency; 20],
     pub recovery_errors: AtomicU64,
     retention_deleted: [[AtomicU64; 3]; 3],
     retention_errors: AtomicU64,
@@ -344,6 +346,8 @@ pub struct Metrics {
     flow_waiting_children: AtomicI64,
     flow_parent_failures: AtomicU64,
     flows_rejected: AtomicU64,
+    flow_merges: AtomicU64,
+    flow_merge_nodes: AtomicU64,
 }
 impl Metrics {
     pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
@@ -522,6 +526,16 @@ impl Metrics {
     pub fn flow_rejected(&self) {
         self.flows_rejected.fetch_add(1, Relaxed);
     }
+    /// A6b: one AddFlowMerge successfully attached new children to an existing node.
+    pub fn flow_merge(&self) {
+        self.flow_merges.fetch_add(1, Relaxed);
+    }
+    /// A6b: count `n` new nodes attached by a successful merge.
+    pub fn flow_merge_nodes(&self, n: u64) {
+        if n > 0 {
+            self.flow_merge_nodes.fetch_add(n, Relaxed);
+        }
+    }
     /// Enqueue rejected because a supplied `parent_id` did not resolve or the child's
     /// `execution_depth` was not exactly `parent + 1`.
     pub fn ancestry_rejection(&self) {
@@ -655,6 +669,8 @@ impl Metrics {
         out += &format!("# HELP anvilmq_flow_waiting_children Flow nodes currently parked in WaitingChildren.\n# TYPE anvilmq_flow_waiting_children gauge\nanvilmq_flow_waiting_children {}\n", self.flow_waiting_children.load(Relaxed));
         out += &format!("# HELP anvilmq_flow_parent_failures_total failParentOnFailure propagations applied to a parent since process start.\n# TYPE anvilmq_flow_parent_failures_total counter\nanvilmq_flow_parent_failures_total {}\n", self.flow_parent_failures.load(Relaxed));
         out += &format!("# HELP anvilmq_flows_rejected_total AddFlow calls rejected by a depth/size cap or validation since process start.\n# TYPE anvilmq_flows_rejected_total counter\nanvilmq_flows_rejected_total {}\n", self.flows_rejected.load(Relaxed));
+        out += &format!("# HELP anvilmq_flow_merges_total AddFlowMerge calls that attached children to an existing node since process start.\n# TYPE anvilmq_flow_merges_total counter\nanvilmq_flow_merges_total {}\n", self.flow_merges.load(Relaxed));
+        out += &format!("# HELP anvilmq_flow_merge_nodes_total Nodes attached by AddFlowMerge since process start.\n# TYPE anvilmq_flow_merge_nodes_total counter\nanvilmq_flow_merge_nodes_total {}\n", self.flow_merge_nodes.load(Relaxed));
         self.named.render(&mut out);
         self.pressure.render(&mut out);
         out

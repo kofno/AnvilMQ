@@ -12,6 +12,12 @@ service QueueService {
   rpc AddFlow (AddFlowRequest) returns (AddFlowResponse);
   // A6a flows: read the completed direct children's return values for a flow parent.
   rpc GetChildrenValues (GetChildrenValuesRequest) returns (GetChildrenValuesResponse);
+  // A6b flows: atomically create multiple independent flow trees in one transaction
+  // (FlowProducer.addBulk). All-or-nothing: if any tree fails, the whole batch rolls back.
+  rpc AddFlowBulk (AddFlowBulkRequest) returns (AddFlowBulkResponse);
+  // A6b flows: attach new child subtrees under an existing flow node identified by the request
+  // root's name + idempotency_key (FlowProducer merge-by-jobId). Only the new nodes are created.
+  rpc AddFlowMerge (AddFlowMergeRequest) returns (AddFlowMergeResponse);
   rpc UpsertRateLimitRule (UpsertRateLimitRuleRequest) returns (UpsertRateLimitRuleResponse);
   rpc DeleteRateLimitRule (DeleteRateLimitRuleRequest) returns (DeleteRateLimitRuleResponse);
   rpc GetRateLimitStatus (GetRateLimitStatusRequest) returns (GetRateLimitStatusResponse);
@@ -121,6 +127,29 @@ message GetChildrenValuesRequest {
 message GetChildrenValuesResponse {
   // Completed direct-child id -> result bytes. Children with a NULL (no) result are omitted.
   map<string, bytes> values = 1;
+}
+
+// A6b flows: FlowProducer.addBulk — several independent flow trees created in one atomic call.
+message AddFlowBulkRequest {
+  repeated FlowJob flows = 1;
+}
+
+message AddFlowBulkResponse {
+  // One AddFlowResponse per tree, index-aligned with AddFlowBulkRequest.flows.
+  repeated AddFlowResponse results = 1;
+}
+
+// A6b flows: merge new child subtrees under an existing flow node. The root identifies the
+// already-existing attach target by name + idempotency_key; its descendants are created fresh.
+message AddFlowMergeRequest {
+  FlowJob flow = 1;
+}
+
+message AddFlowMergeResponse {
+  // Resolved job_id of the existing attach target.
+  string parent_id = 1;
+  // Only the newly created nodes (the pre-existing target is not included).
+  repeated FlowNode attached = 2;
 }
 
 message GetNextJobRequest {

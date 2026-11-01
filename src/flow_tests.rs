@@ -6,6 +6,14 @@ async fn flow_service() -> MyQueueService {
 }
 
 async fn flow_service_with_caps(max_flow_depth: u32, max_flow_nodes: u32) -> MyQueueService {
+    flow_service_full(max_flow_depth, max_flow_nodes, DEFAULT_MAX_FLOW_BULK).await
+}
+
+async fn flow_service_full(
+    max_flow_depth: u32,
+    max_flow_nodes: u32,
+    max_flow_bulk: u32,
+) -> MyQueueService {
     MyQueueService {
         db_manager: Arc::new(DatabaseManager::new(":memory:").await.unwrap()),
         max_execution_depth: 10,
@@ -14,6 +22,7 @@ async fn flow_service_with_caps(max_flow_depth: u32, max_flow_nodes: u32) -> MyQ
         lease_duration_ms: leases::LEASE_DURATION_MS,
         max_flow_depth,
         max_flow_nodes,
+        max_flow_bulk,
     }
 }
 
@@ -39,6 +48,48 @@ async fn add_flow(service: &MyQueueService, flow: FlowJob) -> Result<AddFlowResp
         .map(|r| r.into_inner())
 }
 
+async fn add_flow_bulk(
+    service: &MyQueueService,
+    flows: Vec<FlowJob>,
+) -> Result<AddFlowBulkResponse, Status> {
+    service
+        .add_flow_bulk(Request::new(AddFlowBulkRequest { flows }))
+        .await
+        .map(|r| r.into_inner())
+}
+
+async fn add_flow_merge(
+    service: &MyQueueService,
+    flow: FlowJob,
+) -> Result<AddFlowMergeResponse, Status> {
+    service
+        .add_flow_merge(Request::new(AddFlowMergeRequest { flow: Some(flow) }))
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// A keyed root/leaf (name == idempotency_key) for building merge attach targets.
+fn keyed(name: &str, key: &str) -> FlowJob {
+    FlowJob {
+        name: name.into(),
+        idempotency_key: key.into(),
+        ..Default::default()
+    }
+}
+
+/// Current value of a single-line `gauge`/counter from the rendered metrics text.
+fn metric_value(service: &MyQueueService, metric: &str) -> i64 {
+    let rendered = service.db_manager.metrics.render();
+    for line in rendered.lines() {
+        if let Some(rest) = line.strip_prefix(metric) {
+            if let Some(value) = rest.strip_prefix(' ') {
+                return value.trim().parse().unwrap();
+            }
+        }
+    }
+    panic!("metric {metric} not found");
+}
+
 fn node_id(resp: &AddFlowResponse, name: &str) -> String {
     resp.nodes
         .iter()
@@ -46,6 +97,27 @@ fn node_id(resp: &AddFlowResponse, name: &str) -> String {
         .unwrap_or_else(|| panic!("node {name} not in response"))
         .id
         .clone()
+}
+
+fn node_id_merge(resp: &AddFlowMergeResponse, name: &str) -> String {
+    resp.attached
+        .iter()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("node {name} not in merge response"))
+        .id
+        .clone()
+}
+
+/// First `id` column returned by a query (panics if no row).
+async fn first_id(service: &MyQueueService, sql: &'static str) -> String {
+    let conn = service.db_manager.get_shared_connection();
+    tokio::task::spawn_blocking(move || {
+        conn.blocking_lock()
+            .query_row(sql, [], |r| r.get::<_, String>(0))
+            .unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 /// (state, pending_children, parent_id, tree_id, tree_depth) for a live job, or None if absent.
@@ -499,5 +571,370 @@ async fn add_flow_rejects_replayed_idempotency_key() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     // Whole tree rolled back: only the standalone pre-seeded job remains.
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 1);
+}
+
+// ==== A6b: AddFlowBulk ====
+
+// ---- 1. Happy path: 3 independent trees inserted atomically, results index-aligned ----
+
+#[tokio::test]
+async fn add_flow_bulk_creates_all_trees() {
+    let service = flow_service().await;
+    let before = metric_value(&service, "anvilmq_flows_created_total");
+    let resp = add_flow_bulk(
+        &service,
+        vec![
+            parent("r1", vec![leaf("a1")]),
+            leaf("r2"),
+            parent("r3", vec![leaf("a3"), leaf("b3")]),
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.results.len(), 3);
+    // Index-aligned with the request: each result carries its own tree's root first.
+    assert_eq!(resp.results[0].nodes[0].name, "r1");
+    assert_eq!(resp.results[0].nodes.len(), 2);
+    assert_eq!(resp.results[1].nodes[0].name, "r2");
+    assert_eq!(resp.results[1].root_id, resp.results[1].nodes[0].id);
+    assert_eq!(resp.results[2].nodes[0].name, "r3");
+    assert_eq!(resp.results[2].nodes.len(), 3);
+
+    // Every node of every tree persisted (2 + 1 + 3), each tree bumped flows_created once.
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 6);
+    assert_eq!(
+        metric_value(&service, "anvilmq_flows_created_total"),
+        before + 3
+    );
+}
+
+// ---- 2. Atomic rollback: one over-cap tree aborts the whole batch, nothing written ----
+
+#[tokio::test]
+async fn add_flow_bulk_rolls_back_whole_batch_on_cap_violation() {
+    let service = flow_service_with_caps(10, 2).await;
+    // Tree #2 has 4 nodes, exceeding max_flow_nodes = 2.
+    let err = add_flow_bulk(
+        &service,
+        vec![
+            parent("r1", vec![leaf("a1")]),
+            parent("r2", vec![leaf("a2"), leaf("b2"), leaf("c2")]),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    // Not even tree #1 was written.
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+}
+
+// ---- 3. Cross-tree idempotency-key collision rejects the batch ----
+
+#[tokio::test]
+async fn add_flow_bulk_rejects_cross_tree_key_collision() {
+    let service = flow_service().await;
+    let mut n1 = leaf("x");
+    n1.idempotency_key = "k".into();
+    let mut n2 = leaf("x");
+    n2.idempotency_key = "k".into();
+    let err = add_flow_bulk(
+        &service,
+        vec![parent("r1", vec![n1]), parent("r2", vec![n2])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+}
+
+// ---- 4. Batch-count cap: too many trees, and an empty batch, both rejected ----
+
+#[tokio::test]
+async fn add_flow_bulk_enforces_batch_count_cap() {
+    let service = flow_service_full(10, 1000, 2).await;
+    // 3 trees exceeds ANVILMQ_MAX_FLOW_BULK = 2.
+    let err = add_flow_bulk(&service, vec![leaf("a"), leaf("b"), leaf("c")])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+
+    // Empty batch is rejected too.
+    let err = add_flow_bulk(&service, vec![]).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+// ---- 5. Reused pre-existing key inside a batch tree rolls the whole batch back ----
+
+#[tokio::test]
+async fn add_flow_bulk_rejects_preexisting_key_and_rolls_back() {
+    let service = flow_service().await;
+    service
+        .add_job(Request::new(AddJobRequest {
+            name: "pre".into(),
+            idempotency_key: "pk".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let mut child = leaf("pre");
+    child.idempotency_key = "pk".into();
+    let err = add_flow_bulk(
+        &service,
+        vec![parent("r1", vec![leaf("ok")]), parent("r2", vec![child])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    // Whole batch rolled back: only the standalone pre-seeded job remains.
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 1);
+}
+
+// ==== A6b: AddFlowMerge ====
+
+// ---- 6. Happy path: attach 2 children, re-gate a runnable target, gauge +1 ----
+
+#[tokio::test]
+async fn add_flow_merge_attaches_children_and_regates_target() {
+    let service = flow_service().await;
+    // Keyed single-node flow: the target is runnable (Waiting) and locatable via its receipt.
+    let created = add_flow(&service, keyed("target", "jobkey")).await.unwrap();
+    let target = created.root_id.clone();
+    assert_eq!(job_row(&service, &target).await.unwrap().0, "Waiting");
+    let before_gauge = metric_value(&service, "anvilmq_flow_waiting_children");
+    let before_merges = metric_value(&service, "anvilmq_flow_merges_total");
+
+    let mut merge_root = keyed("target", "jobkey");
+    merge_root.children = vec![leaf("newA"), leaf("newB")];
+    let resp = add_flow_merge(&service, merge_root).await.unwrap();
+
+    assert_eq!(resp.parent_id, target);
+    assert_eq!(resp.attached.len(), 2);
+    for node in &resp.attached {
+        assert_eq!(node.parent_id, target);
+        assert_eq!(node.depth, 1);
+        assert_eq!(node.state, "Waiting");
+    }
+
+    // Target re-gated Waiting -> WaitingChildren, pending_children bumped by 2.
+    let (state, pending, _, _, _) = job_row(&service, &target).await.unwrap();
+    assert_eq!(state, "WaitingChildren");
+    assert_eq!(pending, 2);
+    assert_eq!(
+        metric_value(&service, "anvilmq_flow_waiting_children"),
+        before_gauge + 1
+    );
+    assert_eq!(
+        metric_value(&service, "anvilmq_flow_merges_total"),
+        before_merges + 1
+    );
+    assert_eq!(metric_value(&service, "anvilmq_flow_merge_nodes_total"), 2);
+    // Both new children share the target's tree lineage.
+    let (_, _, _, tree_id, _) = job_row(&service, &node_id_merge(&resp, "newA"))
+        .await
+        .unwrap();
+    assert_eq!(tree_id.as_deref(), Some(target.as_str()));
+}
+
+// ---- 7. Attach to an already-WaitingChildren target: state kept, gauge unchanged ----
+
+#[tokio::test]
+async fn add_flow_merge_onto_waiting_children_target_keeps_state() {
+    let service = flow_service().await;
+    let mut root = keyed("target", "jk");
+    root.children = vec![leaf("origChild")];
+    let created = add_flow(&service, root).await.unwrap();
+    let target = created.root_id.clone();
+    assert_eq!(
+        job_row(&service, &target).await.unwrap().0,
+        "WaitingChildren"
+    );
+    let before_gauge = metric_value(&service, "anvilmq_flow_waiting_children");
+
+    let mut merge_root = keyed("target", "jk");
+    merge_root.children = vec![leaf("newA")];
+    add_flow_merge(&service, merge_root).await.unwrap();
+
+    let (state, pending, _, _, _) = job_row(&service, &target).await.unwrap();
+    assert_eq!(state, "WaitingChildren");
+    assert_eq!(pending, 2); // 1 original + 1 attached
+    assert_eq!(
+        metric_value(&service, "anvilmq_flow_waiting_children"),
+        before_gauge
+    );
+}
+
+// ---- 8. Completing all children (old + attached) releases the parent exactly once ----
+
+#[tokio::test]
+async fn add_flow_merge_parent_released_after_all_children_complete() {
+    let service = flow_service().await;
+    let mut root = keyed("target", "jk");
+    root.children = vec![leaf("origChild")];
+    let created = add_flow(&service, root).await.unwrap();
+    let target = created.root_id.clone();
+
+    let mut merge_root = keyed("target", "jk");
+    merge_root.children = vec![leaf("newA")];
+    add_flow_merge(&service, merge_root).await.unwrap();
+
+    // Two leaves are claimable; the parent stays blocked until BOTH complete.
+    let first = claim_and_complete(&service).await.unwrap();
+    assert_ne!(first, target);
+    assert_eq!(
+        job_row(&service, &target).await.unwrap().0,
+        "WaitingChildren"
+    );
+    let second = claim_and_complete(&service).await.unwrap();
+    assert_ne!(second, target);
+
+    // Parent released exactly once to Waiting with pending 0.
+    let (state, pending, _, _, _) = job_row(&service, &target).await.unwrap();
+    assert_eq!(state, "Waiting");
+    assert_eq!(pending, 0);
+
+    // The parent then runs and completes last; the tree fully drains.
+    let third = claim_and_complete(&service).await.unwrap();
+    assert_eq!(third, target);
+    assert!(claim_and_complete(&service).await.is_none());
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 0);
+    assert_eq!(
+        history_state(&service, &target).await.as_deref(),
+        Some("Completed")
+    );
+}
+
+// ---- 9. Locate/validation failures: missing key, empty key, empty children ----
+
+#[tokio::test]
+async fn add_flow_merge_locate_and_validation_errors() {
+    let service = flow_service().await;
+
+    // No receipt matches -> not_found.
+    let mut missing = keyed("nope", "missingkey");
+    missing.children = vec![leaf("x")];
+    let err = add_flow_merge(&service, missing).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Empty root key -> invalid_argument.
+    let empty_key = parent("t", vec![leaf("x")]);
+    let err = add_flow_merge(&service, empty_key).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Empty root children -> invalid_argument.
+    let err = add_flow_merge(&service, keyed("t", "k")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+// ---- 10. Attach-target state guards: Active and terminal both rejected ----
+
+#[tokio::test]
+async fn add_flow_merge_rejects_active_and_terminal_targets() {
+    let service = flow_service().await;
+
+    // Active target: claim the keyed job so a worker holds it.
+    add_flow(&service, keyed("active", "ak")).await.unwrap();
+    let claimed = claim(&service).await;
+    assert!(claimed.found);
+    let mut merge_active = keyed("active", "ak");
+    merge_active.children = vec![leaf("x")];
+    let err = add_flow_merge(&service, merge_active).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // Terminal target: a completed job drained to history (its receipt survives).
+    add_flow(&service, keyed("done", "dk")).await.unwrap();
+    let job = claim(&service).await;
+    complete_with_result(&service, &job.id, Vec::new()).await;
+    let mut merge_done = keyed("done", "dk");
+    merge_done.children = vec![leaf("y")];
+    let err = add_flow_merge(&service, merge_done).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+// ---- 11. Scope guard: a non-root new node referencing an existing job is rejected ----
+
+#[tokio::test]
+async fn add_flow_merge_rejects_nonroot_existing_key() {
+    let service = flow_service().await;
+    add_flow(&service, keyed("target", "tk")).await.unwrap();
+    // Pre-seed a standalone job whose key a new merge node will illegally reference.
+    service
+        .add_job(Request::new(AddJobRequest {
+            name: "childX".into(),
+            idempotency_key: "ck".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let mut child = leaf("childX");
+    child.idempotency_key = "ck".into();
+    let mut merge_root = keyed("target", "tk");
+    merge_root.children = vec![child];
+    let err = add_flow_merge(&service, merge_root).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // Rollback: the target keeps its original runnable state and pending count.
+    let target = count(&service, "SELECT COUNT(*) FROM jobs WHERE name = 'target'").await;
+    assert_eq!(target, 1);
+    let (state, pending, _, _, _) = job_row(
+        &service,
+        &first_id(&service, "SELECT id FROM jobs WHERE name = 'target'").await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state, "Waiting");
+    assert_eq!(pending, 0);
+}
+
+// ---- 12. Depth and size caps on the merged tree ----
+
+#[tokio::test]
+async fn add_flow_merge_enforces_depth_and_size_caps() {
+    // Depth: target at depth 0, attaching a height-3 subtree exceeds max_flow_depth = 2.
+    let service = flow_service_with_caps(2, 1000).await;
+    add_flow(&service, keyed("t", "k")).await.unwrap();
+    let mut merge_root = keyed("t", "k");
+    merge_root.children = vec![parent("c1", vec![parent("c2", vec![leaf("c3")])])];
+    let err = add_flow_merge(&service, merge_root).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    // Nothing attached; target stays runnable with no pending children.
+    let (state, pending, _, _, _) = job_row(
+        &service,
+        &first_id(&service, "SELECT id FROM jobs WHERE name = 't'").await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state, "Waiting");
+    assert_eq!(pending, 0);
+
+    // Size: a 1-node tree plus 2 new nodes exceeds max_flow_nodes = 2.
+    let service = flow_service_with_caps(10, 2).await;
+    add_flow(&service, keyed("t", "k")).await.unwrap();
+    let mut merge_root = keyed("t", "k");
+    merge_root.children = vec![leaf("a"), leaf("b")];
+    let err = add_flow_merge(&service, merge_root).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 1);
+}
+
+// ---- 13. Within-merge-request duplicate (name, key) among new nodes ----
+
+#[tokio::test]
+async fn add_flow_merge_rejects_within_request_duplicate_key() {
+    let service = flow_service().await;
+    add_flow(&service, keyed("t", "k")).await.unwrap();
+    let mut c1 = leaf("dup");
+    c1.idempotency_key = "d".into();
+    let mut c2 = leaf("dup");
+    c2.idempotency_key = "d".into();
+    let mut merge_root = keyed("t", "k");
+    merge_root.children = vec![c1, c2];
+    let err = add_flow_merge(&service, merge_root).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    // Nothing attached.
     assert_eq!(count(&service, "SELECT COUNT(*) FROM jobs").await, 1);
 }
