@@ -133,15 +133,23 @@ mod tests {
             DROP INDEX idx_facet_dispatch_seq;
             DROP INDEX idx_facet_dispatch_served_at;
             DROP INDEX idx_receipts_release;
+            DROP INDEX idx_jobs_parent;
             DROP TABLE facet_dispatch;
             DROP TABLE chain_counters;
             ALTER TABLE enqueue_receipts DROP COLUMN release_on_finish;
             ALTER TABLE jobs DROP COLUMN lease_expires_at_ms;
             ALTER TABLE jobs DROP COLUMN last_error;
+            ALTER TABLE jobs DROP COLUMN pending_children;
+            ALTER TABLE jobs DROP COLUMN fail_parent_on_failure;
+            ALTER TABLE jobs DROP COLUMN tree_id;
+            ALTER TABLE jobs DROP COLUMN tree_depth;
             ALTER TABLE job_history DROP COLUMN worker_id;
             ALTER TABLE job_history DROP COLUMN last_error;
             ALTER TABLE job_history DROP COLUMN rate_limit_facet;
-            ALTER TABLE job_history DROP COLUMN result;",
+            ALTER TABLE job_history DROP COLUMN result;
+            ALTER TABLE job_history DROP COLUMN fail_parent_on_failure;
+            ALTER TABLE job_history DROP COLUMN tree_id;
+            ALTER TABLE job_history DROP COLUMN tree_depth;",
         )
         .unwrap();
         conn.execute(
@@ -194,6 +202,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_result, None);
+        // New A6a columns default safely on legacy rows (standalone jobs, no tree).
+        let (pending, fail_parent, tree_id, tree_depth): (i64, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT pending_children, fail_parent_on_failure, tree_id, tree_depth FROM jobs WHERE id = 'existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((pending, fail_parent, tree_id, tree_depth), (0, 0, None, 0));
+        let (hist_fail_parent, hist_tree_id, hist_tree_depth): (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT fail_parent_on_failure, tree_id, tree_depth FROM job_history WHERE id = 'legacy-done'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (hist_fail_parent, hist_tree_id, hist_tree_depth),
+            (0, None, 0)
+        );
         conn.prepare("SELECT trace_id, job_count, updated_at FROM chain_counters")
             .unwrap();
         conn.prepare("SELECT facet_key, last_served_seq, last_served_at FROM facet_dispatch")
@@ -556,6 +584,51 @@ impl DatabaseManager {
         if !has_result {
             tx.execute("ALTER TABLE job_history ADD COLUMN result BLOB", [])?;
         }
+        // A6a flows: parent/child dependency tree bookkeeping. All added via idempotent, repeatable
+        // ALTER TABLE ADD COLUMN with safe defaults so legacy rows survive untouched.
+        //   pending_children         - direct children of this node not yet Completed; a parent
+        //                              flips WaitingChildren -> Waiting when it reaches 0.
+        //   fail_parent_on_failure   - whether THIS node's terminal failure fails its parent.
+        //   tree_id                  - root job id of the flow tree; NULL for standalone jobs.
+        //   tree_depth               - this node's depth within its tree (root = 0).
+        for (table, column, definition) in [
+            ("jobs", "pending_children", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "jobs",
+                "fail_parent_on_failure",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("jobs", "tree_id", "TEXT"),
+            ("jobs", "tree_depth", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "job_history",
+                "fail_parent_on_failure",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("job_history", "tree_id", "TEXT"),
+            ("job_history", "tree_depth", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let exists = {
+                let mut statement = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+                let columns = statement.query_map([], |r| r.get::<_, String>(1))?;
+                columns
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .iter()
+                    .any(|name| name == column)
+            };
+            if !exists {
+                tx.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        // Flow child-completion release and failParentOnFailure cascade seek by parent_id; the
+        // partial index keeps standalone (parentless) jobs out of it so they carry no index cost.
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL",
+            [],
+        )?;
         // Partial index so the terminal-time receipt delete is an index probe; it only holds
         // release-on-finish receipts, so retain-forever receipts carry no index cost.
         tx.execute("CREATE INDEX IF NOT EXISTS idx_receipts_release ON enqueue_receipts(job_id) WHERE release_on_finish = 1", [])?;

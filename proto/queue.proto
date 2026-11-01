@@ -7,6 +7,11 @@ service QueueService {
   rpc GetNextJob (GetNextJobRequest) returns (GetNextJobResponse);
   rpc CompleteJob (CompleteJobRequest) returns (CompleteJobResponse);
   rpc FailJob (FailJobRequest) returns (FailJobResponse);
+  // A6a flows: atomically create a parent/child dependency tree. Children run first; a parent is
+  // not claimable until all of its children reach a terminal state.
+  rpc AddFlow (AddFlowRequest) returns (AddFlowResponse);
+  // A6a flows: read the completed direct children's return values for a flow parent.
+  rpc GetChildrenValues (GetChildrenValuesRequest) returns (GetChildrenValuesResponse);
   rpc UpsertRateLimitRule (UpsertRateLimitRuleRequest) returns (UpsertRateLimitRuleResponse);
   rpc DeleteRateLimitRule (DeleteRateLimitRuleRequest) returns (DeleteRateLimitRuleResponse);
   rpc GetRateLimitStatus (GetRateLimitStatusRequest) returns (GetRateLimitStatusResponse);
@@ -67,6 +72,55 @@ message AddJobBulkRequest {
 message AddJobBulkResponse {
   // One response per request, in the same order as AddJobBulkRequest.requests.
   repeated AddJobResponse responses = 1;
+}
+
+// A6a flows: one node in a parent/child dependency tree. Scheduling/retry fields mirror
+// AddJobRequest so a flow node is admitted with the same semantics as a standalone job. The
+// whole tree is created in a single atomic AddFlow call; leaf nodes become immediately
+// runnable (Waiting/Delayed) while nodes with children are parked WaitingChildren until every
+// child reaches a terminal state.
+message FlowJob {
+  string name = 1;                  // queue name, like AddJobRequest.name
+  bytes payload = 2;
+  int32 priority = 3;
+  uint32 max_attempts = 4;
+  int64 delay_ms = 5;
+  string rate_limit_facet = 6;
+  int64 retry_backoff_ms = 7;
+  int64 retry_backoff_max_ms = 8;
+  double retry_jitter = 9;
+  string idempotency_key = 10;      // per-node, via existing A4 receipts
+  // This node's terminal failure fails its parent, cascading up through ancestors that also set
+  // it; siblings continue running.
+  bool fail_parent_on_failure = 11;
+  repeated FlowJob children = 12;
+}
+
+message AddFlowRequest {
+  FlowJob flow = 1;
+}
+
+message AddFlowResponse {
+  string root_id = 1;
+  // Every created node, root first, in topological order.
+  repeated FlowNode nodes = 2;
+}
+
+message FlowNode {
+  string id = 1;
+  string parent_id = 2;
+  string name = 3;
+  uint32 depth = 4;
+  string state = 5;
+}
+
+message GetChildrenValuesRequest {
+  string parent_id = 1;
+}
+
+message GetChildrenValuesResponse {
+  // Completed direct-child id -> result bytes. Children with a NULL (no) result are omitted.
+  map<string, bytes> values = 1;
 }
 
 message GetNextJobRequest {

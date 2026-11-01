@@ -9,6 +9,9 @@ mod db;
 mod enqueue;
 #[cfg(test)]
 mod enqueue_tests;
+mod flow;
+#[cfg(test)]
+mod flow_tests;
 mod fts;
 mod ingress_limit;
 mod leases;
@@ -32,8 +35,9 @@ pub mod queue {
 
 use queue::v1::{
     queue_service_server::{QueueService, QueueServiceServer},
-    AddJobBulkRequest, AddJobBulkResponse, AddJobRequest, AddJobResponse, CompleteJobRequest,
-    CompleteJobResponse, FailJobRequest, FailJobResponse, GetNextJobRequest, GetNextJobResponse,
+    AddFlowRequest, AddFlowResponse, AddJobBulkRequest, AddJobBulkResponse, AddJobRequest,
+    AddJobResponse, CompleteJobRequest, CompleteJobResponse, FailJobRequest, FailJobResponse,
+    GetChildrenValuesRequest, GetChildrenValuesResponse, GetNextJobRequest, GetNextJobResponse,
 };
 
 pub struct MyQueueService {
@@ -42,6 +46,8 @@ pub struct MyQueueService {
     max_chain_size: u64,
     fairness_enabled: bool,
     lease_duration_ms: i64,
+    max_flow_depth: u32,
+    max_flow_nodes: u32,
 }
 
 #[tonic::async_trait]
@@ -62,6 +68,26 @@ impl QueueService for MyQueueService {
     ) -> Result<Response<AddJobBulkResponse>, Status> {
         let _timer = self.db_manager.metrics.timer("AddJobBulk");
         enqueue::enqueue_bulk(self, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn add_flow(
+        &self,
+        request: Request<AddFlowRequest>,
+    ) -> Result<Response<AddFlowResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("AddFlow");
+        flow::add_flow(self, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_children_values(
+        &self,
+        request: Request<GetChildrenValuesRequest>,
+    ) -> Result<Response<GetChildrenValuesResponse>, Status> {
+        let _timer = self.db_manager.metrics.timer("GetChildrenValues");
+        flow::get_children_values(self, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -395,10 +421,10 @@ impl MyQueueService {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(internal)?;
             let job = tx.query_row(
-                "SELECT state, worker_id, attempts, max_attempts, name, created_at FROM jobs WHERE id = ?1", [&id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?)),
+                "SELECT state, worker_id, attempts, max_attempts, name, created_at, parent_id, fail_parent_on_failure FROM jobs WHERE id = ?1", [&id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?, row.get::<_, u32>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, i64>(7)?)),
             ).optional().map_err(internal)?;
-            let Some((state, owner, attempts, max_attempts, name, created_at)) = job else {
+            let Some((state, owner, attempts, max_attempts, name, created_at, parent_id, fail_parent_on_failure)) = job else {
                 let archived = tx.query_row("SELECT state, worker_id, attempts FROM job_history WHERE id = ?1", [&id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, u32>(2)?))).optional().map_err(internal)?;
                 if let Some((state, owner, attempts)) = archived {
@@ -432,6 +458,10 @@ impl MyQueueService {
             let mut next_state = if failed { "Failed" } else { "Completed" };
             let mut released = 0usize;
             let mut stored_result = false;
+            // Deferred flow-metric intentions, flushed only after the tx commits (like enqueue).
+            let mut parent_released: Option<&'static str> = None;
+            let mut flow_parent_failures = 0u64;
+            let mut flow_parents_left_waiting = 0u64;
             if retry {
                 let (base, cap, jitter): (i64, i64, f64) = tx.query_row("SELECT retry_backoff_ms, retry_backoff_max_ms, retry_jitter FROM jobs WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(internal)?;
                 let delay = scheduling::retry_delay(base, cap, attempts);
@@ -446,10 +476,10 @@ impl MyQueueService {
             } else {
                 tx.execute(
                     "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id,
-                     execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet, result)
+                     execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet, result, fail_parent_on_failure, tree_id, tree_depth)
                      SELECT id, name, ?1, priority, payload, parent_id, trace_id, execution_depth, attempts,
                      max_attempts, created_at, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
-                     worker_id, CASE WHEN ?2 IS NULL THEN last_error ELSE ?2 END, rate_limit_facet, ?4
+                     worker_id, CASE WHEN ?2 IS NULL THEN last_error ELSE ?2 END, rate_limit_facet, ?4, fail_parent_on_failure, tree_id, tree_depth
                      FROM jobs WHERE id = ?3",
                     rusqlite::params![if failed { "Failed" } else { "Completed" }, error, id, result],
                 ).map_err(internal)?;
@@ -458,6 +488,95 @@ impl MyQueueService {
                 // A4: release the idempotency slot only on a terminal transition. The
                 // release_on_finish = 1 guard guarantees a retain-mode receipt is untouched.
                 released = tx.execute("DELETE FROM enqueue_receipts WHERE job_id = ?1 AND release_on_finish = 1", [&id]).map_err(internal)?;
+                if !failed {
+                    // A6a child completion -> parent release. Decrement the parent's pending count;
+                    // when it reaches 0 and the parent is parked in WaitingChildren, the dependency
+                    // gate opens and the parent becomes claimable (Waiting, or Delayed if it still
+                    // carries a future available_at). The surrounding finish_job guards (Active +
+                    // owner + attempt + live lease, with history replay short-circuited above) make
+                    // this decrement fire exactly once per child.
+                    if let Some(parent) = parent_id.as_deref() {
+                        tx.execute(
+                            "UPDATE jobs SET pending_children = pending_children - 1 WHERE id = ?1",
+                            [parent],
+                        )
+                        .map_err(internal)?;
+                        let parent_row: Option<(String, i64, Option<i64>)> = tx
+                            .query_row(
+                                "SELECT state, pending_children, available_at FROM jobs WHERE id = ?1",
+                                [parent],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .optional()
+                            .map_err(internal)?;
+                        if let Some((parent_state, pending, available_at)) = parent_row {
+                            if parent_state == "WaitingChildren" && pending <= 0 {
+                                let new_state = if available_at.is_some_and(|at| at > now) {
+                                    "Delayed"
+                                } else {
+                                    "Waiting"
+                                };
+                                tx.execute(
+                                    "UPDATE jobs SET state = ?2, updated_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = ?1",
+                                    rusqlite::params![parent, new_state],
+                                )
+                                .map_err(internal)?;
+                                parent_released = Some(new_state);
+                            }
+                        }
+                    }
+                } else {
+                    // A6a failParentOnFailure. A terminally-failed child with the flag fails its
+                    // parent (parked as Failed even with other pending children), cascading up
+                    // through each ancestor that also sets the flag. Siblings are untouched and keep
+                    // running. Stop at the first ancestor without the flag, the root, or an ancestor
+                    // already terminal (absent from `jobs`). An unflagged terminal failure leaves the
+                    // parent blocked on an unresolved dependency (BullMQ default) — no auto-release.
+                    let mut flag = fail_parent_on_failure == 1;
+                    let mut ancestor = parent_id.clone();
+                    while flag {
+                        let Some(parent) = ancestor.clone() else {
+                            break;
+                        };
+                        let parent_row: Option<(String, i64, Option<String>)> = tx
+                            .query_row(
+                                "SELECT state, fail_parent_on_failure, parent_id FROM jobs WHERE id = ?1",
+                                [&parent],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .optional()
+                            .map_err(internal)?;
+                        let Some((parent_state, parent_flag, grandparent)) = parent_row else {
+                            break;
+                        };
+                        tx.execute(
+                            "INSERT INTO job_history (id, name, state, priority, payload, parent_id, trace_id,
+                             execution_depth, attempts, max_attempts, created_at, finished_at, worker_id, last_error, rate_limit_facet, result, fail_parent_on_failure, tree_id, tree_depth)
+                             SELECT id, name, 'Failed', priority, payload, parent_id, trace_id, execution_depth, attempts,
+                             max_attempts, created_at, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
+                             worker_id, ?2, rate_limit_facet, NULL, fail_parent_on_failure, tree_id, tree_depth
+                             FROM jobs WHERE id = ?1",
+                            rusqlite::params![
+                                parent,
+                                format!("failParentOnFailure: child {id} failed")
+                            ],
+                        )
+                        .map_err(internal)?;
+                        tx.execute("DELETE FROM jobs WHERE id = ?1", [&parent])
+                            .map_err(internal)?;
+                        tx.execute(
+                            "DELETE FROM enqueue_receipts WHERE job_id = ?1 AND release_on_finish = 1",
+                            [&parent],
+                        )
+                        .map_err(internal)?;
+                        flow_parent_failures += 1;
+                        if parent_state == "WaitingChildren" {
+                            flow_parents_left_waiting += 1;
+                        }
+                        flag = parent_flag == 1;
+                        ancestor = grandparent;
+                    }
+                }
             }
             tx.commit().map_err(internal)?;
             metrics.dedup_released(released as u64);
@@ -471,6 +590,19 @@ impl MyQueueService {
             } else {
                 metrics.named.event(&name, if failed { "failed" } else { "completed" });
                 metrics.named.observe_duration(&name, now.saturating_sub(created_at));
+            }
+            // A6a flow effects: flush the deferred gauge/counter deltas only after commit, so a
+            // rolled-back finish never moves them. A released parent leaves WaitingChildren for a
+            // claimable state; each propagated parent failure leaves the gauge (if it was waiting)
+            // and lands in the Failed state.
+            if let Some(new_state) = parent_released {
+                metrics.flow_waiting_children_dec(1);
+                metrics.transition(None, new_state, "flow_released");
+            }
+            metrics.flow_waiting_children_dec(flow_parents_left_waiting);
+            for _ in 0..flow_parent_failures {
+                metrics.flow_parent_failure();
+                metrics.transition(None, "Failed", "flow_parent_failed");
             }
             tracing::info!(job_id = %id, worker_id = %worker_id, attempt = attempts, from = "Active", to = next_state, "job transition");
             Ok(failed && !retry)
@@ -538,6 +670,46 @@ fn parse_max_execution_depth(raw: Option<&str>) -> Result<u32, String> {
             })?;
             if parsed < 1 {
                 return Err(format!("ANVILMQ_MAX_EXECUTION_DEPTH={parsed} must be >= 1"));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Default maximum flow-tree height (root depth 0 to deepest leaf), via `ANVILMQ_MAX_FLOW_DEPTH`.
+const DEFAULT_MAX_FLOW_DEPTH: u32 = 10;
+
+/// Default maximum total node count in one flow tree, via `ANVILMQ_MAX_FLOW_NODES`.
+const DEFAULT_MAX_FLOW_NODES: u32 = 1_000;
+
+/// Parse `ANVILMQ_MAX_FLOW_DEPTH`. Absent -> default; present must be an integer >= 1.
+fn parse_max_flow_depth(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(DEFAULT_MAX_FLOW_DEPTH),
+        Some(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("ANVILMQ_MAX_FLOW_DEPTH must be an integer, got {value:?}"))?;
+            if parsed < 1 {
+                return Err(format!("ANVILMQ_MAX_FLOW_DEPTH={parsed} must be >= 1"));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Parse `ANVILMQ_MAX_FLOW_NODES`. Absent -> default; present must be an integer >= 1.
+fn parse_max_flow_nodes(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(DEFAULT_MAX_FLOW_NODES),
+        Some(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("ANVILMQ_MAX_FLOW_NODES must be an integer, got {value:?}"))?;
+            if parsed < 1 {
+                return Err(format!("ANVILMQ_MAX_FLOW_NODES={parsed} must be >= 1"));
             }
             Ok(parsed)
         }
@@ -848,6 +1020,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // A6a flow caps: validated in memory at AddFlow time before any transaction opens.
+    let max_flow_depth =
+        parse_max_flow_depth(std::env::var("ANVILMQ_MAX_FLOW_DEPTH").ok().as_deref())
+            .map_err(std::io::Error::other)?;
+    let max_flow_nodes =
+        parse_max_flow_nodes(std::env::var("ANVILMQ_MAX_FLOW_NODES").ok().as_deref())
+            .map_err(std::io::Error::other)?;
+    tracing::info!(max_flow_depth, max_flow_nodes, "flow caps configured");
+
     let shutdown_db = db_manager.clone();
     let service = MyQueueService {
         db_manager,
@@ -855,6 +1036,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_chain_size,      // Runaway-chain quarantine cap; 0 disables
         fairness_enabled,    // Equal round-robin tenant fairness; off = identical to legacy
         lease_duration_ms,   // Worker lease TTL; ANVILMQ_LEASE_DURATION_MS (default 30s)
+        max_flow_depth,      // Max flow-tree height; ANVILMQ_MAX_FLOW_DEPTH (default 10)
+        max_flow_nodes,      // Max flow-tree node count; ANVILMQ_MAX_FLOW_NODES (default 1000)
     };
 
     tracing::info!(%addr, %http_addr, "AnvilMQ daemon listening");
@@ -960,6 +1143,8 @@ mod tests {
             max_chain_size: 0,
             fairness_enabled: false,
             lease_duration_ms,
+            max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
+            max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
         };
         // Seed the ancestry parent referenced by the enqueue helper so that supplied
         // parent_id/execution_depth pass ancestry validation. Parked in job_history so it
@@ -1072,6 +1257,26 @@ mod tests {
         assert!(parse_max_execution_depth(Some("0")).is_err());
         assert!(parse_max_execution_depth(Some("-1")).is_err());
         assert!(parse_max_execution_depth(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn max_flow_depth_parses_defaults_and_rejects_invalid() {
+        assert_eq!(parse_max_flow_depth(None).unwrap(), DEFAULT_MAX_FLOW_DEPTH);
+        assert_eq!(parse_max_flow_depth(Some("25")).unwrap(), 25);
+        assert_eq!(parse_max_flow_depth(Some(" 5 ")).unwrap(), 5);
+        assert!(parse_max_flow_depth(Some("0")).is_err());
+        assert!(parse_max_flow_depth(Some("-1")).is_err());
+        assert!(parse_max_flow_depth(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn max_flow_nodes_parses_defaults_and_rejects_invalid() {
+        assert_eq!(parse_max_flow_nodes(None).unwrap(), DEFAULT_MAX_FLOW_NODES);
+        assert_eq!(parse_max_flow_nodes(Some("5000")).unwrap(), 5000);
+        assert_eq!(parse_max_flow_nodes(Some(" 42 ")).unwrap(), 42);
+        assert!(parse_max_flow_nodes(Some("0")).is_err());
+        assert!(parse_max_flow_nodes(Some("-1")).is_err());
+        assert!(parse_max_flow_nodes(Some("nope")).is_err());
     }
 
     #[test]

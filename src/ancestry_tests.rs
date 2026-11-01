@@ -7,6 +7,8 @@ async fn service_with(path: &str, max_chain_size: u64) -> MyQueueService {
         max_chain_size,
         fairness_enabled: false,
         lease_duration_ms: leases::LEASE_DURATION_MS,
+        max_flow_depth: DEFAULT_MAX_FLOW_DEPTH,
+        max_flow_nodes: DEFAULT_MAX_FLOW_NODES,
     }
 }
 
