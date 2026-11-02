@@ -1,9 +1,11 @@
 # BullMQ feature parity roadmap
 
-Status: **Milestone 1 delivered.** The broker features that bring AnvilMQ to
-functional parity with the BullMQ capabilities a typical cron-and-bulk workload
-relies on — **A1, A2, A3, A4, A5, and A7** — have merged (PRs #51–#56). Only
-**A6 (flows)** remains, deferred to Milestone 2.
+Status: **BullMQ parity complete.** Both milestones have landed. **Milestone 1**
+— the broker features that bring AnvilMQ to functional parity with the BullMQ
+capabilities a typical cron-and-bulk workload relies on (**A1, A2, A3, A4, A5,
+and A7**) — merged in PRs #51–#56. **Milestone 2** — **A6 (flows)** — then merged
+in two parts: A6a (#60, core flows) and A6b (#61, bulk flow creation + flow
+merge).
 
 This document tracks AnvilMQ's parity with [BullMQ](https://docs.bullmq.io/)'s
 job-queue feature set. The scope is derived from the BullMQ features a
@@ -16,12 +18,13 @@ capability is absent from the broker contract, not merely undocumented.
 Parity is organized around the BullMQ capabilities common to cron-and-bulk
 workloads: timezone-aware cron schedulers, bulk enqueue, idempotent/singleton
 enqueue, non-retryable failures, backoff jitter, and job result storage. Flows
-(parent/child dependency trees) are a larger, separable capability tracked as
-Milestone 2.
+(parent/child dependency trees) are a larger, separable capability that was
+tracked and delivered as Milestone 2.
 
 A feature only needs to be built if it is on the critical path to running a
 representative cron-and-bulk workload. Flows are the one commonly-used BullMQ
-capability deliberately sequenced after Milestone 1.
+capability deliberately sequenced after Milestone 1, then delivered in
+Milestone 2.
 
 ## Classification: broker vs. client
 
@@ -29,7 +32,7 @@ Each BullMQ feature falls into one of three buckets: a **broker gap** (the wire
 contract must change), **client-library parity** (the client wraps existing
 broker behavior), or **deferred**.
 
-### A. Broker gaps — A1–A5 + A7 **delivered** (Milestone 1); A6 is Milestone 2
+### A. Broker gaps — A1–A5 + A7 **delivered** (Milestone 1); A6 **delivered** (Milestone 2)
 
 | ID | Feature | Prior reality | Size | Status |
 |----|---------|---------------|------|--------|
@@ -38,14 +41,15 @@ broker behavior), or **deferred**.
 | A3 | **Bulk enqueue** (`addBulk`) | Single `AddJob` only; no atomic batch | S/M | ✅ Delivered (#52) |
 | A4 | **Release-on-finish dedup** | `idempotency_key` exists but receipts are permanent; no release/lookup/delete by key | S | ✅ Delivered (#53) |
 | A5 | **Scheduler / cron** (tz-aware) | No scheduler, cron, timezone, or declarative reconcile exists | **L** | ✅ Delivered (#55 + #56) |
-| A6 | **Flows** (parent waits for children) | `parent_id` is lineage metadata only; dequeue has no dependency gate | **XL** | ⬜ Milestone 2 |
+| A6 | **Flows** (parent waits for children) | `parent_id` was lineage metadata only; dequeue had no dependency gate | **XL** | ✅ Delivered (#60 + #61) |
 | A7 | **Job result storage** | `CompleteJob` stores no result; BullMQ retains the return value for *all* jobs (debugging use outside flows; child values inside) | XS/S | ✅ Delivered (#54) |
 
 **A5 (cron) was the critical path for Milestone 1** — timezone-aware declarative
 schedulers, which cron-heavy workloads lean on most — and shipped across #55
-(CRUD + tz-aware cron) and #56 (the background producer loop). **A6 (flows) moves
-to Milestone 2** as the largest, most invasive change. A1–A4 and A7 landed as
-small correctness/realism items alongside cron.
+(CRUD + tz-aware cron) and #56 (the background producer loop). **A6 (flows)
+shipped as Milestone 2**, the largest, most invasive change, across #60 (core)
+and #61 (bulk + merge). A1–A4 and A7 landed as small correctness/realism items
+alongside cron.
 
 #### A4 note — the dedup semantics gap
 
@@ -64,27 +68,31 @@ coordination. This shipped as the `AddJobRequest.release_on_finish` flag
 default. It is small and server-side, and it subsumes the "fetch/remove by key"
 ask for the common case.
 
-#### A6 note — flows is the largest single item (Milestone 2)
+#### A6 note — flows is the largest single item (Milestone 2, delivered)
 
-Flows are **deferred to Milestone 2** as the largest, most invasive change. When
-built, delivering flows means, at minimum:
-- a **dependency gate** in dequeue so a parent is not claimable until all children
-  are terminal;
-- **child return values** — a parent reads its children's results
-  (`GetChildrenValues` equivalent), built on the general result field from **A7**
-  (result storage is *not* flow-specific — BullMQ stores results for all jobs);
-- **`failParentOnFailure`** — propagate a child's final failure up to ancestors
-  while allowing siblings to continue (BullMQ's behavior);
-- **bulk flow creation** (`FlowProducer.addBulk`) building parent/child trees in
-  one atomic call (shares machinery with A3);
-- **flow merge by jobId** — re-sending a flow structure attaches new jobs to an
-  existing flow via parent references (depends on A4/custom-key semantics);
+Flows were **delivered in Milestone 2** as the largest, most invasive change —
+A6a (#60) shipped the core and A6b (#61) shipped bulk creation + merge. What
+shipped:
+- a **dependency gate** in dequeue so a parent (parked in `WaitingChildren`) is
+  not claimable until all children are terminal;
+- **child return values** — a parent reads its children's results via
+  `GetChildrenValues`, built on the general result field from **A7** (result
+  storage is *not* flow-specific — BullMQ stores results for all jobs);
+- **`failParentOnFailure`** — propagate a child's final failure up to flagged
+  ancestors while allowing siblings to continue (BullMQ's behavior);
+- **bulk flow creation** (`AddFlowBulk`, parity with `FlowProducer.addBulk`)
+  building multiple parent/child trees in one atomic all-or-nothing call (shares
+  machinery with A3);
+- **flow merge by jobId** (`AddFlowMerge`) — attach new child subtrees under an
+  existing flow node identified by `name` + `idempotency_key`, re-gating the
+  existing target;
 - **per-tree depth + tree-size cap** — a flow tree is created in one atomic action
   and is finite, so every node shares a single tree depth rather than per-node
-  ancestry accumulation; cap **tree size** (node count) the way bulk fan-outs are
-  capped, to bound runaway trees.
+  ancestry accumulation; `ANVILMQ_MAX_FLOW_DEPTH` (default 10) bounds height and
+  `ANVILMQ_MAX_FLOW_NODES` (default 1000) bounds node count, both validated
+  atomically so an oversized tree is rejected with nothing written.
 
-This naturally **subsumes Phase 3's "validate ancestry and quarantine runaway
+This naturally **subsumed Phase 3's "validate ancestry and quarantine runaway
 chains"** — real dependencies are a superset of ancestry validation.
 
 ### B. Client-library parity (build in the client, not the broker)
@@ -123,8 +131,9 @@ backup should treat HA/Raft (Phase 5) as a prerequisite.
 
 ## Sequencing
 
-Work splits into two milestones. **Milestone 1 delivers functional parity for
-cron + bulk workloads without flows**; Milestone 2 adds flows.
+Work split into two milestones. **Milestone 1 delivered functional parity for
+cron + bulk workloads without flows**; Milestone 2 added flows. Both are
+delivered.
 
 ### Milestone 1 — cron + bulk parity (no flows) — **delivered**
 
@@ -139,11 +148,12 @@ item, across #55 (CRUD + tz-aware cron) and #56 (background producer loop). The
 broker track is complete; the client stays **thin** while validating (B3 is a
 compatibility shim, not a rewrite).
 
-### Milestone 2 — flows
+### Milestone 2 — flows — **delivered**
 
 **A6 (flows)** — the largest, most invasive change — plus a flow-aware client
-surface. Built with the per-tree depth + tree-size-cap design above, and A7
-(result storage) already in place as the foundation for child return values.
+surface, shipped as A6a (#60, core flows) + A6b (#61, bulk + merge). It was built
+on the per-tree depth + tree-size-cap design above, with A7 (result storage)
+already in place as the foundation for child return values.
 
 ## Relationship to the existing README roadmap
 
@@ -151,7 +161,7 @@ surface. Built with the per-tree depth + tree-size-cap design above, and A7
 |--------------|-----------------------------|
 | Phase 1 — Core plumbing | Unchanged (libSQL migration still open, independent of parity) |
 | Phase 2 — Transactional lifecycle | Largely complete; the parity track builds on it |
-| Phase 3 — Safety controls | **Ancestry validation merges into A6 (flows), now Milestone 2**; ingress velocity stays. Flows ship a per-tree depth + tree-size cap as the bound |
+| Phase 3 — Safety controls | **Ancestry validation merged into A6 (flows), delivered in Milestone 2**; ingress velocity stays. Flows ship a per-tree depth + tree-size cap as the bound |
 | Phase 4 — Faceted rate limiting | Unchanged; fairness still open |
 | **Phase 5 — Regional HA (Raft)** | **Stays deferred.** Mitigated by NORMAL durability + client outbox + WAL backup; multi-node consensus is future work |
 | Phase 6 — Observability | Largely complete |
@@ -167,11 +177,13 @@ surface. Built with the per-tree depth + tree-size-cap design above, and A7
 ## Resolved (from review)
 
 - **Flows are not required for Milestone 1.** Cron + bulk + dedup (A1–A5, A7)
-  deliver parity for cron-and-bulk workloads; **A6 (flows) defers to Milestone 2.**
+  delivered parity for cron-and-bulk workloads; **A6 (flows) was sequenced into
+  Milestone 2 and has since been delivered** (#60 + #61).
 - **Keep the client thin while validating.** B3 is a thin BullMQ-compatible shim,
   not a fuller rewrite, until the direction is proven.
 - **Result storage is general, not flow-specific** (A7): BullMQ retains the return
   value for all jobs (debugging outside flows), so it lands in Milestone 1
   independent of flows and is the foundation for flow child values later.
 - **Flow trees get a per-tree depth + tree-size cap** (atomic, finite trees share
-  one depth) rather than per-node ancestry accumulation, when A6 is built.
+  one depth) rather than per-node ancestry accumulation — now implemented in A6
+  (`ANVILMQ_MAX_FLOW_DEPTH` default 10, `ANVILMQ_MAX_FLOW_NODES` default 1000).
