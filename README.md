@@ -191,6 +191,14 @@ Two startup-validated env knobs tune the loop, consistent with the recovery knob
 
 The loop exposes three metrics on `/metrics`: `anvilmq_scheduler_jobs_produced_total`, `anvilmq_scheduler_errors_total`, and `anvilmq_schedulers_active` (see [Observability](#observability)).
 
+### Flows (parent/child dependency trees)
+
+`AddFlow` atomically creates one parent/child dependency tree (parity with BullMQ `FlowProducer.add`). The whole tree is persisted in a single transaction: leaf nodes enter `Waiting` (or `Delayed`) and are immediately claimable, while internal nodes park in a new `WaitingChildren` state. The **dependency gate** is enforced at dequeue — a parent in `WaitingChildren` is not claimable until every child reaches a terminal state. Each child completion decrements the parent's `pending_children`, and the parent flips to runnable when it hits `0`. `GetChildrenValues` reads a flow parent's completed direct children's return values (built on the `result` field from job result storage; children whose result is `NULL` are omitted). `failParentOnFailure` propagates a child's terminal failure up through flagged ancestors — siblings continue, and unflagged ancestors are unaffected.
+
+`AddFlowBulk` creates multiple independent flow trees in ONE atomic, all-or-nothing transaction (parity with BullMQ `FlowProducer.addBulk`), returning one index-aligned response per tree; it is bounded by `ANVILMQ_MAX_FLOW_BULK` (default `100` trees). `AddFlowMerge` attaches new child subtrees under an **existing** flow node, identified by the request root's `name` + `idempotency_key` (AnvilMQ's native "jobId"). The existing target is re-gated: its `pending_children` is bumped and a runnable `Waiting`/`Delayed` target flips back to `WaitingChildren`; attaching to an `Active` or already-terminal target is rejected. Merge is a dedicated, explicit RPC — `AddFlow` still rejects a reused `idempotency_key`, since it only creates fresh trees.
+
+Each tree is bounded by two per-tree caps, validated atomically so an oversized tree is rejected with nothing written: `ANVILMQ_MAX_FLOW_DEPTH` (default `10`) bounds tree height, and `ANVILMQ_MAX_FLOW_NODES` (default `1000`) bounds node count. `AddFlowMerge` enforces both on the merged tree. Flow activity is observable via `anvilmq_flows_created_total`, `anvilmq_flow_nodes_created_total`, `anvilmq_flow_waiting_children`, `anvilmq_flow_parent_failures_total`, `anvilmq_flows_rejected_total`, `anvilmq_flow_merges_total`, and `anvilmq_flow_merge_nodes_total` (see [Observability](#observability)).
+
 ## Known limitations
 
 - Legacy Delayed jobs created before persisted scheduling have unknown due times and remain unscheduled. Inspect and explicitly reschedule them; the migration does not guess their original delay.
@@ -200,7 +208,7 @@ The loop exposes three metrics on `/metrics`: `anvilmq_scheduler_jobs_produced_t
 
 ## Roadmap
 
-For AnvilMQ's feature-parity tracking against BullMQ, see the [BullMQ feature parity roadmap](docs/bullmq-parity-roadmap.md) (Milestone 1 — non-retryable failure, backoff jitter, bulk enqueue, release-on-finish dedup, cron schedulers, and job result storage — delivered; flows deferred to Milestone 2).
+For AnvilMQ's feature-parity tracking against BullMQ, see the [BullMQ feature parity roadmap](docs/bullmq-parity-roadmap.md) (Milestone 1 — non-retryable failure, backoff jitter, bulk enqueue, release-on-finish dedup, cron schedulers, and job result storage — and Milestone 2 (flows) both delivered).
 
 ### Phase 1: Core plumbing
 
@@ -223,7 +231,7 @@ For AnvilMQ's feature-parity tracking against BullMQ, see the [BullMQ feature pa
 ### Phase 3: Safety controls
 
 - [x] Persist metadata and reject supplied execution depth above the limit.
-- [x] Validate ancestry and quarantine runaway chains.
+- [x] Validate ancestry and quarantine runaway chains (now subsumed by delivered flows, which model real parent/child dependencies with per-tree depth + tree-size caps).
 - [x] Built-in parentage: the server derives `execution_depth` from the resolved parent when unset and validates a supplied non-zero depth against it, and the client exposes an `enqueueChild` helper that propagates the parent's lineage.
 - [x] Sliding-window ingress velocity controls.
 

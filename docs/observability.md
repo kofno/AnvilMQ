@@ -43,6 +43,13 @@ Allowlisted names (`ANVILMQ_METRICS_QUEUES`) are pre-seeded up front in `all` mo
 | `anvilmq_scheduler_jobs_produced_total` | Jobs produced by the declarative scheduler loop since process start. |
 | `anvilmq_scheduler_errors_total` | Scheduler fires that failed and will retry next tick. |
 | `anvilmq_schedulers_active` | Declarative schedulers with a pending next run. |
+| `anvilmq_flows_created_total` | Flow trees created (`AddFlow` / `AddFlowBulk`) since process start. |
+| `anvilmq_flow_nodes_created_total` | Flow nodes created since process start. |
+| `anvilmq_flow_waiting_children` | Gauge: flow nodes currently parked in `WaitingChildren`. |
+| `anvilmq_flow_parent_failures_total` | `failParentOnFailure` propagations applied to a parent since process start. |
+| `anvilmq_flows_rejected_total` | Flow calls rejected by a depth/size cap or validation since process start. |
+| `anvilmq_flow_merges_total` | `AddFlowMerge` calls that attached children to an existing node since process start. |
+| `anvilmq_flow_merge_nodes_total` | Nodes attached by `AddFlowMerge` since process start. |
 
 `scope="all",queue=""` is the aggregate; `scope="queue"` identifies allowlisted queues. Do not sum both scopes. Named queues remain present at zero after they drain. Histograms and lifecycle event rates are broker-wide in this increment, not per queue. Counters/histograms reset on restart; use `rate`/`increase`, not subtraction across restarts.
 
